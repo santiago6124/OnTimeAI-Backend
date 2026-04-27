@@ -1,0 +1,19 @@
+{
+  "label": "Live AviationStack 25-26/04/2026 (no lineage backfill)",
+  "n": 450,
+  "positive_rate_truth": 0.43777777777777777,
+  "positive_rate_pred": 0.9977777777777778,
+  "accuracy": 0.44,
+  "precision": 0.43875278396436523,
+  "recall": 1.0,
+  "f1": 0.6099071207430341,
+  "roc_auc": 0.46313276218374433,
+  "brier": 0.5275482819758712,
+  "log_loss": 2.561296486813821,
+  "confusion_matrix": {
+    "tn": 1,
+    "fp": 252,
+    "fn": 0,
+    "tp": 197
+  }
+}
