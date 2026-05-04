@@ -20,6 +20,7 @@ from ontimeai.live import (
     aeroapi_to_flight_row, upsert_flights, upsert_actuals_from_aeroapi, upsert_weather,
     build_inference_frame, chain_walk_inbound, AIRPORTS,
 )
+from ontimeai.lineage_fallback import load_lookups
 from ontimeai.model import load_artifact, predict_label, predict_proba, quantile_threshold
 from predict import prepare_inference_frame
 from ontimeai.config import ARTIFACTS_DIR
@@ -172,7 +173,14 @@ def main() -> int:
     print(f"   {target_mask.sum()} target rows | {(~target_mask).sum()} history rows for lineage")
 
     meta = load_artifact(args.artifact)
-    X = prepare_inference_frame(df, meta["feature_cols"], meta["cat_mapping"])
+
+    fallback_path = ARTIFACTS_DIR / "lineage_fallback.joblib"
+    fallback = load_lookups(fallback_path) if fallback_path.exists() else None
+    if fallback is not None:
+        print(f"   loaded cold-deck fallback ({fallback_path.name})")
+    X = prepare_inference_frame(
+        df, meta["feature_cols"], meta["cat_mapping"], fallback_lookup=fallback,
+    )
     # Coerce non-categorical object columns to numeric (live path may have all-NaN
     # weather columns that pd.NA leaves as object, which LightGBM rejects).
     cat_cols_set = set(meta.get("cat_cols", []))

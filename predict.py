@@ -22,6 +22,7 @@ from ontimeai.lineage import (
     add_origin_rolling_features,
     add_tail_lineage_features,
 )
+from ontimeai.lineage_fallback import apply_lineage_fallback, load_lookups
 from ontimeai.model import load_artifact, predict_label, predict_proba
 
 
@@ -29,6 +30,7 @@ def prepare_inference_frame(
     df_raw: pd.DataFrame,
     feature_cols: list[str],
     cat_mapping: dict[str, list],
+    fallback_lookup: dict | None = None,
 ) -> pd.DataFrame:
     df = df_raw.copy()
     has_history = (
@@ -44,6 +46,9 @@ def prepare_inference_frame(
         df = add_carrier_rolling_features(df)
         df = add_origin_rolling_features(df)
         df = drop_leaky_target_columns(df)
+
+    if fallback_lookup is not None:
+        df = apply_lineage_fallback(df, fallback_lookup)
 
     df = normalize_weather_flags(df)
     df = add_cyclical_features(df)
@@ -62,11 +67,24 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--artifact", type=Path, default=ARTIFACTS_DIR)
     p.add_argument("--input", type=Path, required=True, help="CSV of flights to score.")
     p.add_argument("--output", type=Path, default=Path("predictions.csv"))
+    p.add_argument(
+        "--fallback-lookup",
+        type=Path,
+        default=ARTIFACTS_DIR / "lineage_fallback.joblib",
+        help="Path to cold-deck lookup joblib (built by build_lineage_fallback.py). "
+             "Skipped silently if file does not exist.",
+    )
     args = p.parse_args(argv)
 
     meta = load_artifact(args.artifact)
     df_raw = pd.read_csv(args.input, parse_dates=["FL_DATE"], low_memory=False)
-    X = prepare_inference_frame(df_raw, meta["feature_cols"], meta["cat_mapping"])
+
+    fallback = load_lookups(args.fallback_lookup) if args.fallback_lookup.exists() else None
+    if fallback is not None:
+        print(f"Loaded cold-deck fallback from {args.fallback_lookup}")
+    X = prepare_inference_frame(
+        df_raw, meta["feature_cols"], meta["cat_mapping"], fallback_lookup=fallback,
+    )
 
     proba = predict_proba(meta["booster"], X)
     if meta.get("calibrator") is not None and meta["target"] == "binary":
