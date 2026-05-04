@@ -84,6 +84,23 @@ def tune_threshold(
     raise ValueError(f"Unknown metric: {metric}")
 
 
+def quantile_threshold(proba: np.ndarray, target_pos_rate: float) -> float:
+    """Pick a binary threshold so the predicted positive rate matches a target.
+
+    Robust to monotone shifts in the raw probability distribution (the typical
+    failure mode in production cold-start). Requires no ground-truth labels —
+    only the proba distribution of the batch being scored.
+    """
+    if proba.ndim != 1:
+        raise ValueError("quantile_threshold expects 1-D probability array")
+    if not 0.0 < target_pos_rate < 1.0:
+        raise ValueError("target_pos_rate must be in (0, 1)")
+    finite = proba[np.isfinite(proba)]
+    if finite.size == 0:
+        return 0.5
+    return float(np.quantile(finite, 1.0 - target_pos_rate))
+
+
 def predict_proba(booster: lgb.Booster, X: pd.DataFrame) -> np.ndarray:
     return booster.predict(X, num_iteration=booster.best_iteration or None)
 

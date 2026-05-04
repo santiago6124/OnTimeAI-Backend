@@ -18,9 +18,9 @@ import pandas as pd
 from ontimeai.live import (
     open_db, fetch_airport_flights, fetch_iem_obs,
     aeroapi_to_flight_row, upsert_flights, upsert_actuals_from_aeroapi, upsert_weather,
-    build_inference_frame, AIRPORTS,
+    build_inference_frame, chain_walk_inbound, AIRPORTS,
 )
-from ontimeai.model import load_artifact, predict_label, predict_proba
+from ontimeai.model import load_artifact, predict_label, predict_proba, quantile_threshold
 from predict import prepare_inference_frame
 from ontimeai.config import ARTIFACTS_DIR
 
@@ -45,6 +45,25 @@ def main() -> int:
                    help="Skip the arrivals endpoint (saves API calls)")
     p.add_argument("--no-weather", action="store_true")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--chain-walk-max",
+        type=int,
+        default=20,
+        help=(
+            "Max AeroAPI calls per tick to chain-walk `inbound_fa_flight_id` "
+            "→ hydrates prev_arr_delay_tail without waiting for backfill. "
+            "Set to 0 to disable. Each call costs ~$0.005."
+        ),
+    )
+    p.add_argument(
+        "--target-pos-rate",
+        type=float,
+        default=0.26,
+        help=(
+            "Target predicted-positive rate for quantile threshold (default 0.26, "
+            "matches v3_full test base rate). Set to 0 to fall back to artifact threshold."
+        ),
+    )
     args = p.parse_args()
 
     now = datetime.now(timezone.utc)
@@ -105,6 +124,23 @@ def main() -> int:
         print("\n[3] (skipped actuals)")
         arrived = []
 
+    # ---- 3b. chain-walk inbound_fa_flight_id → hydrate lineage on demand ----
+    n_chain_calls = 0
+    n_chain_actuals = 0
+    if args.chain_walk_max > 0:
+        print("\n[3b] Chain-walk inbound_fa_flight_id...")
+        n_chain_calls, n_chain_actuals = chain_walk_inbound(
+            conn,
+            sched_rows + arr_sched_rows,
+            max_calls=args.chain_walk_max,
+        )
+        print(
+            f"   chain-walk: {n_chain_calls} AeroAPI calls "
+            f"(~${n_chain_calls * 0.005:.2f} USD), {n_chain_actuals} actuals hydrated"
+        )
+    else:
+        print("\n[3b] (chain-walk disabled)")
+
     # ---- 4. weather ----
     n_wx = 0
     if not args.no_weather:
@@ -148,18 +184,39 @@ def main() -> int:
     proba = predict_proba(meta["booster"], X)
     if meta.get("calibrator") is not None and meta["target"] == "binary":
         proba = meta["calibrator"].transform(proba)
-    labels = predict_label(proba, meta["threshold"], "binary")
+
+    # Threshold strategy: quantile-target on the target subset (robust to live
+    # distribution shift); fall back to the artifact's static threshold when
+    # --target-pos-rate=0 or when the target batch is too small to estimate.
+    target_proba = proba[target_mask.to_numpy()]
+    if args.target_pos_rate > 0 and target_proba.size >= 5:
+        threshold_used = quantile_threshold(target_proba, args.target_pos_rate)
+        threshold_strategy = f"quantile@{args.target_pos_rate:.2f}"
+    else:
+        threshold_used = float(meta["threshold"])
+        threshold_strategy = "artifact"
+    labels = predict_label(proba, threshold_used, "binary")
+    print(
+        f"   threshold strategy={threshold_strategy} value={threshold_used:.4f} "
+        f"| proba_target n={target_proba.size} mean={target_proba.mean():.3f} "
+        f"std={target_proba.std():.3f} pos_pred_rate="
+        f"{(target_proba >= threshold_used).mean():.3f}"
+        if target_proba.size > 0
+        else f"   threshold strategy={threshold_strategy} value={threshold_used:.4f} (no targets)"
+    )
 
     # Persist only target predictions
     pred_now = datetime.now(timezone.utc).isoformat()
     pred_rows = [
-        (df.loc[i, "fa_flight_id"], pred_now, float(proba[i]), int(labels[i]))
+        (df.loc[i, "fa_flight_id"], pred_now, float(proba[i]), int(labels[i]),
+         float(threshold_used), threshold_strategy)
         for i in df.index[target_mask]
     ]
     conn.executemany(
         """INSERT OR REPLACE INTO predictions
-           (fa_flight_id, predicted_at_utc, proba_delay, predicted_delay)
-           VALUES (?,?,?,?)""",
+           (fa_flight_id, predicted_at_utc, proba_delay, predicted_delay,
+            threshold_used, threshold_strategy)
+           VALUES (?,?,?,?,?,?)""",
         pred_rows,
     )
     conn.commit()

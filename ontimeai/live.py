@@ -99,6 +99,8 @@ CREATE TABLE IF NOT EXISTS predictions (
     predicted_at_utc TEXT NOT NULL,
     proba_delay REAL NOT NULL,
     predicted_delay INTEGER NOT NULL,
+    threshold_used REAL,
+    threshold_strategy TEXT,
     PRIMARY KEY (fa_flight_id, predicted_at_utc)
 );
 
@@ -141,8 +143,18 @@ CREATE TABLE IF NOT EXISTS runs (
 def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.executescript(SCHEMA)
+    _migrate_predictions_threshold(conn)
     conn.commit()
     return conn
+
+
+def _migrate_predictions_threshold(conn: sqlite3.Connection) -> None:
+    """Add threshold_used / threshold_strategy columns to existing predictions tables."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(predictions)").fetchall()}
+    if "threshold_used" not in cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN threshold_used REAL")
+    if "threshold_strategy" not in cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN threshold_strategy TEXT")
 
 
 # ----------------------------- aeroapi client -----------------------------
@@ -270,18 +282,25 @@ def _f(v):
 
 # ----------------------------- aeroapi → schema ---------------------------
 
-def aeroapi_to_flight_row(rec: dict) -> dict | None:
-    """Map an AeroAPI flight record to our flights-table schema."""
+def aeroapi_to_flight_row(rec: dict, *, strict_airport_filter: bool = True) -> dict | None:
+    """Map an AeroAPI flight record to our flights-table schema.
+
+    `strict_airport_filter=True` (default) restricts to ATL-touching flights
+    between the 16 known airports — the right policy for schedule pulls.
+    Set to False for chain-walked inbound flights, whose origin may be
+    outside the tracked network but whose ARR_DELAY still feeds lineage.
+    """
     origin = (rec.get("origin") or {}).get("code_iata") or ""
     dest = (rec.get("destination") or {}).get("code_iata") or ""
     origin = origin.upper()
     dest = dest.upper()
     if not origin or not dest:
         return None
-    if origin not in AIRPORTS or dest not in AIRPORTS:
-        return None
-    if not (origin == "ATL" or dest == "ATL"):
-        return None
+    if strict_airport_filter:
+        if origin not in AIRPORTS or dest not in AIRPORTS:
+            return None
+        if not (origin == "ATL" or dest == "ATL"):
+            return None
 
     sched_out = rec.get("scheduled_out")
     if not sched_out:
@@ -354,6 +373,72 @@ def upsert_flights(conn: sqlite3.Connection, rows: list[dict]) -> int:
     )
     conn.commit()
     return len(payload)
+
+
+def fetch_flight_by_id(fa_flight_id: str, key: str | None = None) -> list[dict]:
+    """Fetch a single AeroAPI flight by its `fa_flight_id`.
+
+    Returns the `flights` array from `/flights/{id}` (typically 1 element).
+    Raises RuntimeError on non-2xx after retries.
+    """
+    payload = _api_get(f"/flights/{fa_flight_id}", key=key)
+    return payload.get("flights") or []
+
+
+def chain_walk_inbound(
+    conn: sqlite3.Connection,
+    target_rows: list[dict],
+    *,
+    key: str | None = None,
+    max_calls: int = 20,
+) -> tuple[int, int]:
+    """For each target with an `inbound_fa_flight_id` not yet in `actuals`,
+    fetch the inbound flight and persist it (flights + actuals).
+
+    This is the high-ROI path that hydrates `prev_arr_delay_tail` without
+    waiting for a 24-48h history backfill. Caller is expected to pass a
+    dedup'd list of target flight rows (post `aeroapi_to_flight_row`).
+
+    Returns (calls_made, actuals_written). Hard caps at `max_calls` to
+    protect the AeroAPI budget.
+    """
+    inbound_ids: list[str] = []
+    seen: set[str] = set()
+    for r in target_rows:
+        inbound = r.get("inbound_fa_flight_id")
+        if not inbound or inbound in seen:
+            continue
+        seen.add(inbound)
+        cur = conn.execute(
+            "SELECT actual_in_utc FROM actuals WHERE fa_flight_id = ?",
+            (inbound,),
+        )
+        existing = cur.fetchone()
+        if existing and existing[0]:
+            continue  # already settled
+        inbound_ids.append(inbound)
+        if len(inbound_ids) >= max_calls:
+            break
+
+    calls = 0
+    actuals_written = 0
+    for inb_id in inbound_ids:
+        try:
+            flights = fetch_flight_by_id(inb_id, key=key)
+            calls += 1
+        except RuntimeError as e:
+            print(f"  chain-walk: failed for {inb_id}: {e}")
+            continue
+        for flight in flights:
+            row = aeroapi_to_flight_row(flight, strict_airport_filter=False)
+            if row:
+                upsert_flights(conn, [row])
+            if flight.get("actual_in"):
+                upsert_actuals_from_aeroapi(conn, [flight])
+                actuals_written += 1
+        time.sleep(2.0)  # respect AeroAPI rate limits
+
+    return calls, actuals_written
 
 
 def upsert_actuals_from_aeroapi(conn: sqlite3.Connection, recs: list[dict]) -> int:
