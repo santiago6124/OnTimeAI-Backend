@@ -43,3 +43,9 @@ Thumbs.db
 .env
 .env.*
 !.env.example
+
+# Cron / live runtime state (per-machine, regenerated each tick)
+.last_tick_utc
+.cron_tick.lock
+.cron_disabled
+logs/

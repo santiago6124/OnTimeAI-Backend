@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ontimeai.tick</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/scripts/cron_tick.sh</string>
+    </array>
+
+    <!-- Fire every 2h (7200s). The wrapper gates on UTC active hours,
+         min interval since last tick, and a kill-switch flag, so off-hours
+         and post-sleep catch-up fires become no-ops. -->
+    <key>StartInterval</key>
+    <integer>7200</integer>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/logs/launchd_tick.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/logs/launchd_tick.err</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend</string>
+</dict>
+</plist>
