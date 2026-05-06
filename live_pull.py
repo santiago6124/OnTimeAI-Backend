@@ -18,7 +18,7 @@ import pandas as pd
 from ontimeai.live import (
     open_db, fetch_airport_flights, fetch_iem_obs,
     aeroapi_to_flight_row, upsert_flights, upsert_actuals_from_aeroapi, upsert_weather,
-    build_inference_frame, chain_walk_inbound, AIRPORTS,
+    build_inference_frame, chain_walk_inbound, AIRPORTS, stable_id,
 )
 from ontimeai.lineage_fallback import load_lookups
 from ontimeai.model import load_artifact, predict_label, predict_proba, quantile_threshold
@@ -113,14 +113,26 @@ def main() -> int:
 
     n_act = 0
     if not args.skip_actuals:
-        # ---- 3. completed arrivals → actuals ----
-        print("\n[3] AeroAPI arrivals (completed)...")
+        # ---- 3. completed arrivals to KATL → actuals (settles ARR_TO_ATL preds) ----
+        print("\n[3] AeroAPI arrivals (completed at KATL)...")
         arrived = fetch_airport_flights(args.airport, "arrivals",
                                         _iso(arr_start), _iso(arr_end), args.max_pages)
         print(f"   pulled {len(arrived)} arrivals")
         arrived_filt = [r for r in arrived if r.get("actual_in")]
-        n_act = upsert_actuals_from_aeroapi(conn, arrived_filt)
-        print(f"   wrote {n_act} actuals")
+        n_act_arr = upsert_actuals_from_aeroapi(conn, arrived_filt)
+        print(f"   wrote {n_act_arr} actuals")
+
+        # ---- 3a. completed departures from KATL → actuals (settles DEP_FROM_ATL preds)
+        # Crucially, AeroAPI's Flight schema includes actual_in + arrival_delay
+        # in the departures payload IF the flight has already landed at destination.
+        print("\n[3a] AeroAPI departures (completed from KATL)...")
+        departed = fetch_airport_flights(args.airport, "departures",
+                                         _iso(arr_start), _iso(arr_end), args.max_pages)
+        landed = [r for r in departed if r.get("actual_in")]
+        print(f"   pulled {len(departed)} departures, {len(landed)} have landed at destination")
+        n_act_dep = upsert_actuals_from_aeroapi(conn, landed)
+        print(f"   wrote {n_act_dep} actuals")
+        n_act = n_act_arr + n_act_dep
     else:
         print("\n[3] (skipped actuals)")
         arrived = []
@@ -216,15 +228,16 @@ def main() -> int:
     # Persist only target predictions
     pred_now = datetime.now(timezone.utc).isoformat()
     pred_rows = [
-        (df.loc[i, "fa_flight_id"], pred_now, float(proba[i]), int(labels[i]),
+        (df.loc[i, "fa_flight_id"], stable_id(df.loc[i, "fa_flight_id"]),
+         pred_now, float(proba[i]), int(labels[i]),
          float(threshold_used), threshold_strategy)
         for i in df.index[target_mask]
     ]
     conn.executemany(
         """INSERT OR REPLACE INTO predictions
-           (fa_flight_id, predicted_at_utc, proba_delay, predicted_delay,
+           (fa_flight_id, stable_id, predicted_at_utc, proba_delay, predicted_delay,
             threshold_used, threshold_strategy)
-           VALUES (?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?)""",
         pred_rows,
     )
     conn.commit()

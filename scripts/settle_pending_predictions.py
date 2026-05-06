@@ -45,10 +45,11 @@ def main() -> int:
     print(f"Settling predictions from {_iso(start)} → {_iso(now)}")
     conn = open_db()
 
-    # Show the gap before
+    # Show the gap before — match by stable_id (fa_flight_id has unstable suffix
+    # between /scheduled_* and /departures-/arrivals endpoints).
     pre = conn.execute(
         "SELECT COUNT(*) FROM predictions p "
-        "LEFT JOIN actuals a ON a.fa_flight_id = p.fa_flight_id "
+        "LEFT JOIN actuals a ON a.stable_id = p.stable_id "
         "WHERE a.actual_in_utc IS NULL OR a.arr_delay_min IS NULL"
     ).fetchone()[0]
     total = conn.execute("SELECT COUNT(*) FROM predictions").fetchone()[0]
@@ -81,16 +82,17 @@ def main() -> int:
     print(f"   wrote {n} actuals (DEP_FROM_ATL settled)")
     n_actuals += n
 
-    # Show the gap after
+    # Show the gap after — same stable_id-based match.
     post = conn.execute(
         "SELECT COUNT(*) FROM predictions p "
-        "LEFT JOIN actuals a ON a.fa_flight_id = p.fa_flight_id "
+        "LEFT JOIN actuals a ON a.stable_id = p.stable_id "
         "WHERE a.actual_in_utc IS NULL OR a.arr_delay_min IS NULL"
     ).fetchone()[0]
     settled = conn.execute(
         "SELECT COUNT(*) FROM predictions p "
-        "INNER JOIN actuals a ON a.fa_flight_id = p.fa_flight_id "
-        "WHERE a.actual_in_utc IS NOT NULL "
+        "INNER JOIN actuals a ON a.stable_id = p.stable_id "
+        "WHERE p.stable_id IS NOT NULL "
+        "  AND a.actual_in_utc IS NOT NULL "
         "  AND a.arr_delay_min IS NOT NULL "
         "  AND COALESCE(a.cancelled,0)=0 AND COALESCE(a.diverted,0)=0"
     ).fetchone()[0]

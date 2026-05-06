@@ -27,11 +27,14 @@ DISTANCE_LOOKUP = PROJECT_ROOT / "artifacts" / "distance_lookup.csv"
 
 AEROAPI_BASE = "https://aeroapi.flightaware.com/aeroapi"
 
-AIRPORTS = {
+# Load airport universe from CSV at import time. Falls back to the legacy
+# 16-airport hub-spoke set if the CSV doesn't exist (e.g. fresh checkout
+# before running build_airports_universe.py).
+_LEGACY_AIRPORTS = {
     "ATL", "LGA", "MCO", "FLL", "MIA", "DFW", "DCA", "EWR",
     "TPA", "ORD", "PHL", "DEN", "LAX", "BWI", "LAS", "BOS",
 }
-TZ_BY_AIRPORT = {
+_LEGACY_TZ = {
     "ATL": "America/New_York", "LGA": "America/New_York",
     "MCO": "America/New_York", "FLL": "America/New_York",
     "MIA": "America/New_York", "DFW": "America/Chicago",
@@ -41,12 +44,31 @@ TZ_BY_AIRPORT = {
     "LAX": "America/Los_Angeles", "BWI": "America/New_York",
     "LAS": "America/Los_Angeles", "BOS": "America/New_York",
 }
-NETWORK_BY_AIRPORT = {
+_LEGACY_NETWORK = {
     "ATL": "GA_ASOS", "LGA": "NY_ASOS", "MCO": "FL_ASOS", "FLL": "FL_ASOS",
     "MIA": "FL_ASOS", "DFW": "TX_ASOS", "DCA": "DC_ASOS", "EWR": "NJ_ASOS",
     "TPA": "FL_ASOS", "ORD": "IL_ASOS", "PHL": "PA_ASOS", "DEN": "CO_ASOS",
     "LAX": "CA_ASOS", "BWI": "MD_ASOS", "LAS": "NV_ASOS", "BOS": "MA_ASOS",
 }
+
+
+def _load_airports_universe() -> tuple[set[str], dict[str, str], dict[str, str]]:
+    """Returns (AIRPORTS set, TZ_BY_AIRPORT, NETWORK_BY_AIRPORT) from CSV.
+
+    Falls back to the 16-hub legacy set if the universe CSV is missing.
+    """
+    universe_path = PROJECT_ROOT / "airports_universe.csv"
+    if not universe_path.exists():
+        return _LEGACY_AIRPORTS, dict(_LEGACY_TZ), dict(_LEGACY_NETWORK)
+    df = pd.read_csv(universe_path)
+    df["iata"] = df["iata"].astype(str).str.strip().str.upper()
+    airports = set(df["iata"].tolist())
+    tz_by = dict(zip(df["iata"], df["timezone"], strict=False))
+    net_by = dict(zip(df["iata"], df["iem_network"], strict=False))
+    return airports, tz_by, net_by
+
+
+AIRPORTS, TZ_BY_AIRPORT, NETWORK_BY_AIRPORT = _load_airports_universe()
 WX_VARS = ["tmpc", "dwpc", "relh", "drct", "sknt", "alti", "p01m", "vsby", "gust", "wxcodes"]
 
 
@@ -69,6 +91,7 @@ def load_aeroapi_key() -> str:
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS flights (
     fa_flight_id TEXT PRIMARY KEY,
+    stable_id TEXT,
     ident_iata TEXT,
     op_carrier TEXT,
     flight_number TEXT,
@@ -93,9 +116,12 @@ CREATE TABLE IF NOT EXISTS flights (
 CREATE INDEX IF NOT EXISTS idx_flights_date_dep ON flights(fl_date, scheduled_off_utc);
 CREATE INDEX IF NOT EXISTS idx_flights_tail ON flights(tail_num, scheduled_off_utc);
 CREATE INDEX IF NOT EXISTS idx_flights_carrier ON flights(op_carrier, scheduled_off_utc);
+-- idx_flights_stable created in _migrate_stable_ids() since the column may
+-- not yet exist on legacy databases.
 
 CREATE TABLE IF NOT EXISTS predictions (
     fa_flight_id TEXT NOT NULL,
+    stable_id TEXT,
     predicted_at_utc TEXT NOT NULL,
     proba_delay REAL NOT NULL,
     predicted_delay INTEGER NOT NULL,
@@ -103,9 +129,11 @@ CREATE TABLE IF NOT EXISTS predictions (
     threshold_strategy TEXT,
     PRIMARY KEY (fa_flight_id, predicted_at_utc)
 );
+-- idx_predictions_stable created in _migrate_stable_ids().
 
 CREATE TABLE IF NOT EXISTS actuals (
     fa_flight_id TEXT PRIMARY KEY,
+    stable_id TEXT,
     actual_out_utc TEXT,
     actual_off_utc TEXT,
     actual_on_utc TEXT,
@@ -116,6 +144,7 @@ CREATE TABLE IF NOT EXISTS actuals (
     diverted INTEGER,
     settled_at_utc TEXT NOT NULL
 );
+-- idx_actuals_stable created in _migrate_stable_ids().
 
 CREATE TABLE IF NOT EXISTS weather_obs (
     station TEXT NOT NULL,
@@ -140,10 +169,32 @@ CREATE TABLE IF NOT EXISTS runs (
 """
 
 
+def stable_id(fa_flight_id: str | None) -> str | None:
+    """Strip AeroAPI's unstable trailing suffix from `fa_flight_id`.
+
+    AeroAPI's IDs follow `<IDENT>-<UNIX_TS>-<source>-<suffix>`. The suffix
+    differs between `/scheduled_*` and `/departures` / `/arrivals` for the
+    same physical flight. The first two parts (IDENT + timestamp) are stable
+    and uniquely identify a flight instance.
+
+    Example:
+        scheduled: AAL1811-1777701683-airline-1446p
+        departed:  AAL1811-1777701683-airline-1447p
+        stable:    AAL1811-1777701683
+    """
+    if not fa_flight_id:
+        return None
+    parts = str(fa_flight_id).split("-")
+    if len(parts) >= 2:
+        return f"{parts[0]}-{parts[1]}"
+    return fa_flight_id
+
+
 def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(str(path))
     conn.executescript(SCHEMA)
     _migrate_predictions_threshold(conn)
+    _migrate_stable_ids(conn)
     conn.commit()
     return conn
 
@@ -155,6 +206,29 @@ def _migrate_predictions_threshold(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE predictions ADD COLUMN threshold_used REAL")
     if "threshold_strategy" not in cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN threshold_strategy TEXT")
+
+
+def _migrate_stable_ids(conn: sqlite3.Connection) -> None:
+    """Add and backfill `stable_id` columns on flights / predictions / actuals.
+
+    Without this, joins by `fa_flight_id` miss matches because AeroAPI returns
+    different suffixes for the same flight from /scheduled_* vs /departures.
+    """
+    for table in ("flights", "predictions", "actuals"):
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "stable_id" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN stable_id TEXT")
+            conn.execute(
+                f"CREATE INDEX IF NOT EXISTS idx_{table}_stable ON {table}(stable_id)"
+            )
+            # Backfill existing rows
+            rows = conn.execute(f"SELECT fa_flight_id FROM {table}").fetchall()
+            updates = [(stable_id(r[0]), r[0]) for r in rows if r[0]]
+            if updates:
+                conn.executemany(
+                    f"UPDATE {table} SET stable_id = ? WHERE fa_flight_id = ?",
+                    updates,
+                )
 
 
 # ----------------------------- aeroapi client -----------------------------
@@ -343,7 +417,8 @@ def upsert_flights(conn: sqlite3.Connection, rows: list[dict]) -> int:
         return 0
     now = datetime.now(timezone.utc).isoformat()
     payload = [
-        (r["fa_flight_id"], r["ident_iata"], r["op_carrier"], r["flight_number"],
+        (r["fa_flight_id"], stable_id(r["fa_flight_id"]),
+         r["ident_iata"], r["op_carrier"], r["flight_number"],
          r["tail_num"], r["origin"], r["dest"], r["inbound_fa_flight_id"],
          r["fl_date"], r["crs_dep_min"],
          r["scheduled_out_utc"], r["scheduled_off_utc"], r["scheduled_on_utc"], r["scheduled_in_utc"],
@@ -353,13 +428,14 @@ def upsert_flights(conn: sqlite3.Connection, rows: list[dict]) -> int:
     ]
     conn.executemany(
         """INSERT INTO flights
-           (fa_flight_id, ident_iata, op_carrier, flight_number, tail_num,
+           (fa_flight_id, stable_id, ident_iata, op_carrier, flight_number, tail_num,
             origin, dest, inbound_fa_flight_id, fl_date, crs_dep_min,
             scheduled_out_utc, scheduled_off_utc, scheduled_on_utc, scheduled_in_utc,
             crs_elapsed_min, distance, aircraft_type, cancelled, diverted,
             first_seen_utc, last_updated_utc)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(fa_flight_id) DO UPDATE SET
+             stable_id=excluded.stable_id,
              tail_num=excluded.tail_num,
              scheduled_out_utc=excluded.scheduled_out_utc,
              scheduled_off_utc=excluded.scheduled_off_utc,
@@ -409,9 +485,12 @@ def chain_walk_inbound(
         if not inbound or inbound in seen:
             continue
         seen.add(inbound)
+        # Skip if EITHER the literal fa_flight_id OR the stable_id is already
+        # settled — covers both pre-stable-id rows and the post-fix layout.
         cur = conn.execute(
-            "SELECT actual_in_utc FROM actuals WHERE fa_flight_id = ?",
-            (inbound,),
+            "SELECT actual_in_utc FROM actuals "
+            "WHERE fa_flight_id = ? OR stable_id = ? LIMIT 1",
+            (inbound, stable_id(inbound)),
         )
         existing = cur.fetchone()
         if existing and existing[0]:
@@ -459,6 +538,7 @@ def upsert_actuals_from_aeroapi(conn: sqlite3.Connection, recs: list[dict]) -> i
 
         rows.append((
             r["fa_flight_id"],
+            stable_id(r["fa_flight_id"]),
             r.get("actual_out"),
             r.get("actual_off"),
             r.get("actual_on"),
@@ -471,9 +551,10 @@ def upsert_actuals_from_aeroapi(conn: sqlite3.Connection, recs: list[dict]) -> i
         ))
     conn.executemany(
         """INSERT OR REPLACE INTO actuals
-           (fa_flight_id, actual_out_utc, actual_off_utc, actual_on_utc, actual_in_utc,
+           (fa_flight_id, stable_id,
+            actual_out_utc, actual_off_utc, actual_on_utc, actual_in_utc,
             arr_delay_min, departure_delay_min, cancelled, diverted, settled_at_utc)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
         rows,
     )
     conn.commit()

@@ -94,12 +94,13 @@ def _ar(rec: dict) -> dict:
 
 
 def test_aeroapi_to_flight_row_relaxed_filter_accepts_unknown_origin() -> None:
-    rec = _ar({"origin": {"code_iata": "SFO"}, "destination": {"code_iata": "ATL"}})
-    # SFO is NOT in our 16-airport AIRPORTS set
+    # Use a fake IATA guaranteed not in any universe — international Buenos
+    # Aires (EZE) is not in the US-only BTS universe.
+    rec = _ar({"origin": {"code_iata": "EZE"}, "destination": {"code_iata": "ATL"}})
     assert aeroapi_to_flight_row(rec, strict_airport_filter=True) is None
     row = aeroapi_to_flight_row(rec, strict_airport_filter=False)
     assert row is not None
-    assert row["origin"] == "SFO"
+    assert row["origin"] == "EZE"
     assert row["dest"] == "ATL"
 
 

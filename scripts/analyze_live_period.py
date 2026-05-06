@@ -51,18 +51,24 @@ N_CALIBRATION_BINS = 10
 
 
 def load_from_db(conn: sqlite3.Connection, since_iso: str, until_iso: str) -> pd.DataFrame:
-    """Predictions joined with actuals; only settled, non-cancelled, non-diverted."""
+    """Predictions joined with actuals; only settled, non-cancelled, non-diverted.
+
+    Uses `stable_id` for the join because AeroAPI returns slightly different
+    `fa_flight_id` suffixes from `/scheduled_*` (predictions) vs `/departures` /
+    `/arrivals` (actuals) for the same physical flight.
+    """
     return pd.read_sql_query(
         """SELECT
-              p.fa_flight_id, p.predicted_at_utc, p.proba_delay,
+              p.fa_flight_id, p.stable_id, p.predicted_at_utc, p.proba_delay,
               p.predicted_delay, p.threshold_used, p.threshold_strategy,
               a.actual_in_utc, a.arr_delay_min,
               f.scheduled_in_utc, f.op_carrier, f.origin, f.dest, f.tail_num
            FROM predictions p
-           INNER JOIN actuals a ON a.fa_flight_id = p.fa_flight_id
+           INNER JOIN actuals a ON a.stable_id = p.stable_id
            LEFT JOIN flights f ON f.fa_flight_id = p.fa_flight_id
            WHERE p.predicted_at_utc >= ?
              AND p.predicted_at_utc <= ?
+             AND p.stable_id IS NOT NULL
              AND a.actual_in_utc IS NOT NULL
              AND a.arr_delay_min IS NOT NULL
              AND COALESCE(a.cancelled, 0) = 0

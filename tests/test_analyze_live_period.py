@@ -154,6 +154,7 @@ def _make_fake_db(path: Path) -> None:
         """
         CREATE TABLE flights (
             fa_flight_id TEXT PRIMARY KEY,
+            stable_id TEXT,
             ident_iata TEXT, op_carrier TEXT, flight_number TEXT,
             tail_num TEXT, origin TEXT, dest TEXT,
             inbound_fa_flight_id TEXT, fl_date TEXT, crs_dep_min INTEGER,
@@ -164,13 +165,14 @@ def _make_fake_db(path: Path) -> None:
             first_seen_utc TEXT, last_updated_utc TEXT
         );
         CREATE TABLE predictions (
-            fa_flight_id TEXT, predicted_at_utc TEXT,
+            fa_flight_id TEXT, stable_id TEXT, predicted_at_utc TEXT,
             proba_delay REAL, predicted_delay INTEGER,
             threshold_used REAL, threshold_strategy TEXT,
             PRIMARY KEY (fa_flight_id, predicted_at_utc)
         );
         CREATE TABLE actuals (
             fa_flight_id TEXT PRIMARY KEY,
+            stable_id TEXT,
             actual_out_utc TEXT, actual_off_utc TEXT,
             actual_on_utc TEXT, actual_in_utc TEXT,
             arr_delay_min REAL, departure_delay_min REAL,
@@ -180,25 +182,26 @@ def _make_fake_db(path: Path) -> None:
     )
     rng = np.random.default_rng(0)
     for i in range(40):
-        fid = f"FA{i:03d}"
+        fid = f"FA{i:03d}-1700000000"
+        sid = "-".join(fid.split("-")[:2])  # stable id matches the join in load_from_db
         conn.execute(
-            "INSERT INTO flights (fa_flight_id, op_carrier, origin, dest, tail_num, "
-            "scheduled_in_utc, first_seen_utc, last_updated_utc) VALUES (?,?,?,?,?,?,?,?)",
-            (fid, ["DL", "AA", "F9"][i % 3], "ATL", "MCO", f"N{i:04d}",
+            "INSERT INTO flights (fa_flight_id, stable_id, op_carrier, origin, dest, tail_num, "
+            "scheduled_in_utc, first_seen_utc, last_updated_utc) VALUES (?,?,?,?,?,?,?,?,?)",
+            (fid, sid, ["DL", "AA", "F9"][i % 3], "ATL", "MCO", f"N{i:04d}",
              "2026-05-05T18:00:00", "now", "now"),
         )
         proba = float(rng.uniform(0.0, 1.0))
         conn.execute(
-            "INSERT INTO predictions VALUES (?,?,?,?,?,?)",
-            (fid, "2026-05-05T14:00:00+00:00", proba, int(proba >= 0.5),
+            "INSERT INTO predictions VALUES (?,?,?,?,?,?,?)",
+            (fid, sid, "2026-05-05T14:00:00+00:00", proba, int(proba >= 0.5),
              0.5, "quantile@0.26"),
         )
         # Some are settled, some not; arr_delay correlated with proba so AUC > 0.5
         if i < 35:
             arr_delay = float(np.random.normal(15 if proba > 0.5 else -10, 10))
             conn.execute(
-                "INSERT INTO actuals VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (fid, "2026-05-05T17:55:00", "2026-05-05T14:05:00",
+                "INSERT INTO actuals VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (fid, sid, "2026-05-05T17:55:00", "2026-05-05T14:05:00",
                  "2026-05-05T17:50:00", "2026-05-05T18:00:00",
                  arr_delay, 0.0, 0, 0, "now"),
             )
