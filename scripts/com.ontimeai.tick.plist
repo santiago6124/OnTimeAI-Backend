@@ -11,11 +11,11 @@
         <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/scripts/cron_tick.sh</string>
     </array>
 
-    <!-- Fire every 2h (7200s). The wrapper gates on UTC active hours,
-         min interval since last tick, and a kill-switch flag, so off-hours
-         and post-sleep catch-up fires become no-ops. -->
+    <!-- Fire every 90min (5400s). The wrapper gates on UTC active hours,
+         min interval since last tick (80min), and a kill-switch flag, so
+         off-hours and post-sleep catch-up fires become no-ops. -->
     <key>StartInterval</key>
-    <integer>7200</integer>
+    <integer>5400</integer>
 
     <key>RunAtLoad</key>
     <false/>

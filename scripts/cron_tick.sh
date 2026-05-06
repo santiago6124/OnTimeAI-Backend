@@ -9,13 +9,13 @@
 #   - Kill-switch: `touch .cron_disabled` to disable; `rm .cron_disabled` to enable
 #
 # Tunable flags (env-var override):
-#   ONTIMEAI_SCHEDULE_HOURS  (default 2)
-#   ONTIMEAI_MAX_PAGES       (default 2)
-#   ONTIMEAI_CHAIN_WALK_MAX  (default 5)
+#   ONTIMEAI_SCHEDULE_HOURS  (default 3)
+#   ONTIMEAI_MAX_PAGES       (default 3)
+#   ONTIMEAI_CHAIN_WALK_MAX  (default 12)
 #   ONTIMEAI_TARGET_POS_RATE (default 0.26)
-#   ONTIMEAI_MIN_TICK_DELTA  (default 5400 = 90min)
+#   ONTIMEAI_MIN_TICK_DELTA  (default 4800 = 80min, allows 90min cron cadence)
 #
-# Cost target: ~9 AeroAPI calls/tick × 6 active ticks/day ≈ $0.27/day.
+# Cost target (intensive mode): ~21 AeroAPI calls/tick × 9 active ticks/day ≈ $0.95/day.
 
 set -euo pipefail
 
@@ -46,7 +46,7 @@ fi
 
 # ---------- 3. min interval since last tick (avoid catch-up storms after sleep) ----------
 LAST_RUN_FILE="$REPO/.last_tick_utc"
-MIN_DELTA="${ONTIMEAI_MIN_TICK_DELTA:-5400}"
+MIN_DELTA="${ONTIMEAI_MIN_TICK_DELTA:-4800}"
 NOW_S=$(date -u +%s)
 if [ -f "$LAST_RUN_FILE" ]; then
     LAST=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo 0)
@@ -78,16 +78,16 @@ if [ ! -f "$REPO/.env" ]; then
     log "ERROR — no .env file (AEROAPI_KEY=...)"
     exit 1
 fi
-if [ ! -d "$REPO/artifacts/4year_v3_full" ]; then
-    log "ERROR — no model artifact at artifacts/4year_v3_full"
+if [ ! -d "$REPO/artifacts/4year_v4_full" ]; then
+    log "ERROR — no model artifact at artifacts/4year_v4_full"
     exit 1
 fi
 
 # ---------- 6. run ----------
-SCHEDULE_HOURS="${ONTIMEAI_SCHEDULE_HOURS:-2}"
-MAX_PAGES="${ONTIMEAI_MAX_PAGES:-2}"
-CHAIN_WALK_MAX="${ONTIMEAI_CHAIN_WALK_MAX:-5}"
-TARGET_POS_RATE="${ONTIMEAI_TARGET_POS_RATE:-0.26}"
+SCHEDULE_HOURS="${ONTIMEAI_SCHEDULE_HOURS:-3}"
+MAX_PAGES="${ONTIMEAI_MAX_PAGES:-3}"
+CHAIN_WALK_MAX="${ONTIMEAI_CHAIN_WALK_MAX:-12}"
+TARGET_POS_RATE="${ONTIMEAI_TARGET_POS_RATE:-0.22}"
 
 log "starting (schedule=${SCHEDULE_HOURS}h pages=${MAX_PAGES} chain=${CHAIN_WALK_MAX} pos_rate=${TARGET_POS_RATE})"
 
@@ -101,8 +101,7 @@ python live_pull.py \
     --max-pages "$MAX_PAGES" \
     --chain-walk-max "$CHAIN_WALK_MAX" \
     --target-pos-rate "$TARGET_POS_RATE" \
-    --skip-arrivals-sched \
-    --artifact artifacts/4year_v3_full \
+    --artifact artifacts/4year_v4_full \
     >> "$LOG" 2>&1
 EXIT_CODE=$?
 set -e

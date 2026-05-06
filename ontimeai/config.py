@@ -9,7 +9,20 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _default_data_path() -> Path:
-    """Pick the widest-year master CSV available in the project root."""
+    """Pick the widest-coverage master available in the project root.
+
+    Priority order:
+    1. FULL_US parquet (all US airports, post-bias-fix).
+    2. FULL_US CSV.
+    3. ATL multi-year CSV (legacy, 16-airport hub-spoke).
+    4. ATL single-year CSV.
+    """
+    full_parquets = sorted(PROJECT_ROOT.glob("dataset_maestro_FULL_US_*_BTS_IEM.parquet"))
+    if full_parquets:
+        return full_parquets[-1]
+    full_csvs = sorted(PROJECT_ROOT.glob("dataset_maestro_FULL_US_*_BTS_IEM.csv"))
+    if full_csvs:
+        return full_csvs[-1]
     candidates = sorted(PROJECT_ROOT.glob("dataset_maestro_ATL_*_BTS_IEM_ORIG_DEST.csv"))
     if not candidates:
         return PROJECT_ROOT / "dataset_maestro_ATL_2025_BTS_IEM_ORIG_DEST.csv"

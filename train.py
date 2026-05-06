@@ -8,6 +8,7 @@ from pathlib import Path
 import pandas as pd
 
 from ontimeai.config import ARTIFACTS_DIR, DATA_PATH, TrainConfig
+from ontimeai.data import load_master
 from ontimeai.pipeline import run_training
 
 
@@ -47,7 +48,8 @@ def main(argv: list[str] | None = None) -> int:
 
     df_raw = None
     if args.data != DATA_PATH or args.subsample > 0:
-        df_raw = pd.read_csv(args.data, parse_dates=["FL_DATE"], low_memory=False)
+        # `load_master` autodetects parquet vs csv based on extension.
+        df_raw = load_master(args.data)
         if args.subsample > 0:
             df_raw = df_raw.sort_values(["FL_DATE", "CRS_DEP_MIN"]).head(args.subsample).reset_index(drop=True)
 

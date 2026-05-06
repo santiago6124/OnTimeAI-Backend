@@ -21,6 +21,8 @@ data_raw/
 # Large master datasets (>100 MB GitHub limit)
 dataset_maestro_ATL_2022-2024_BTS_IEM_ORIG_DEST.csv
 dataset_maestro_ATL_2022-2025_BTS_IEM_ORIG_DEST.csv
+dataset_maestro_FULL_US_*.csv
+dataset_maestro_FULL_US_*.parquet
 
 # Training / tuning logs
 *.log
