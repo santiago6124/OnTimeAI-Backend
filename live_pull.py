@@ -59,10 +59,10 @@ def main() -> int:
     p.add_argument(
         "--target-pos-rate",
         type=float,
-        default=0.26,
+        default=0.22,
         help=(
-            "Target predicted-positive rate for quantile threshold (default 0.26, "
-            "matches v3_full test base rate). Set to 0 to fall back to artifact threshold."
+            "Target predicted-positive rate for quantile threshold (default 0.22, "
+            "matches v4_full test base rate). Set to 0 to fall back to artifact threshold."
         ),
     )
     args = p.parse_args()

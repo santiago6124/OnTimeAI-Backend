@@ -1,0 +1,136 @@
+{
+  "period": {
+    "since": "2026-05-05",
+    "until": "2026-05-06",
+    "generated_at_utc": "2026-05-06T11:07:43.336370+00:00",
+    "source": "db"
+  },
+  "n_settled_predictions": 1,
+  "overall": {
+    "n": 1,
+    "positive_rate_truth": 0.0,
+    "positive_rate_pred": 0.0,
+    "accuracy": 1.0,
+    "precision": 0.0,
+    "recall": 0.0,
+    "f1": 0.0,
+    "brier": 0.010751131795984787,
+    "roc_auc": null,
+    "log_loss": null,
+    "confusion_matrix": {
+      "tn": 1,
+      "fp": 0,
+      "fn": 0,
+      "tp": 0
+    }
+  },
+  "calibration": {
+    "bins": [
+      {
+        "bin": 0,
+        "lo": 0.0,
+        "hi": 0.1,
+        "n": 0,
+        "mean_proba": null,
+        "observed_pos_rate": null
+      },
+      {
+        "bin": 1,
+        "lo": 0.1,
+        "hi": 0.2,
+        "n": 1,
+        "mean_proba": 0.10368766462788517,
+        "observed_pos_rate": 0.0
+      },
+      {
+        "bin": 2,
+        "lo": 0.2,
+        "hi": 0.30000000000000004,
+        "n": 0,
+        "mean_proba": null,
+        "observed_pos_rate": null
+      },
+      {
+        "bin": 3,
+        "lo": 0.30000000000000004,
+        "hi": 0.4,
+        "n": 0,
+        "mean_proba": null,
+        "observed_pos_rate": null
+      },
+      {
+        "bin": 4,
+        "lo": 0.4,
+        "hi": 0.5,
+        "n": 0,
+        "mean_proba": null,
+        "observed_pos_rate": null
+      },
+      {
+        "bin": 5,
+        "lo": 0.5,
+        "hi": 0.6000000000000001,
+        "n": 0,
+        "mean_proba": null,
+        "observed_pos_rate": null
+      },
+      {
+        "bin": 6,
+        "lo": 0.6000000000000001,
+        "hi": 0.7000000000000001,
+        "n": 0,
+        "mean_proba": null,
+        "observed_pos_rate": null
+      },
+      {
+        "bin": 7,
+        "lo": 0.7000000000000001,
+        "hi": 0.8,
+        "n": 0,
+        "mean_proba": null,
+        "observed_pos_rate": null
+      },
+      {
+        "bin": 8,
+        "lo": 0.8,
+        "hi": 0.9,
+        "n": 0,
+        "mean_proba": null,
+        "observed_pos_rate": null
+      },
+      {
+        "bin": 9,
+        "lo": 0.9,
+        "hi": 1.0,
+        "n": 0,
+        "mean_proba": null,
+        "observed_pos_rate": null
+      }
+    ],
+    "ece": 0.10368766462788517
+  },
+  "daily": [],
+  "by_strategy": [
+    {
+      "n": 1,
+      "positive_rate_truth": 0.0,
+      "positive_rate_pred": 0.0,
+      "accuracy": 1.0,
+      "precision": 0.0,
+      "recall": 0.0,
+      "f1": 0.0,
+      "brier": 0.010751131795984787,
+      "roc_auc": null,
+      "log_loss": null,
+      "confusion_matrix": {
+        "tn": 1,
+        "fp": 0,
+        "fn": 0,
+        "tp": 0
+      },
+      "strategy": "quantile@0.22"
+    }
+  ],
+  "by_carrier": [],
+  "threshold_by_hour": []
+}

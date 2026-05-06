@@ -35,12 +35,13 @@ if [ -f "$REPO/.cron_disabled" ]; then
     exit 0
 fi
 
-# ---------- 2. UTC active-hours gate (ATL ops 09-23 EDT = 13-03 UTC) ----------
+# ---------- 2. UTC active-hours gate (ATL ops 06-23 EDT ≈ 10-03 UTC) ----------
+# Off-hours window is the strict overnight at ATL: UTC 5..9 = 01..05 EDT.
+# Set FORCE=1 to bypass this gate (e.g. for manual replay outside active hours).
 HOUR_UTC=$(date -u +%H | sed 's/^0//')
 HOUR_UTC=${HOUR_UTC:-0}
-# Active: hours 13..23 and 0..3 (all hours EXCEPT 4..12)
-if [ "$HOUR_UTC" -ge 4 ] && [ "$HOUR_UTC" -le 12 ]; then
-    log "skip — off-hours UTC=$HOUR_UTC"
+if [ "${FORCE:-0}" -ne 1 ] && [ "$HOUR_UTC" -ge 5 ] && [ "$HOUR_UTC" -le 9 ]; then
+    log "skip — off-hours UTC=$HOUR_UTC (set FORCE=1 to bypass)"
     exit 0
 fi
 

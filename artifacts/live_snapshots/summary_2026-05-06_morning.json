@@ -1,0 +1,50 @@
+{
+  "exported_at_utc": "2026-05-06T11:07:32.268979+00:00",
+  "label": "2026-05-06_morning",
+  "counts": {
+    "flights": 121,
+    "predictions": 94,
+    "actuals": 180,
+    "weather_obs": 574,
+    "runs": 5
+  },
+  "predictions_by_strategy": {
+    "artifact": {
+      "n": 4,
+      "mean_proba": 0.4714,
+      "std_proba": 0.1757,
+      "pos_pred_rate": 1.0
+    },
+    "quantile@0.22": {
+      "n": 45,
+      "mean_proba": 0.2023,
+      "std_proba": 0.2308,
+      "pos_pred_rate": 0.2667
+    },
+    "quantile@0.26": {
+      "n": 45,
+      "mean_proba": 0.4,
+      "std_proba": 0.2568,
+      "pos_pred_rate": 0.2889
+    }
+  },
+  "predictions_proba_quantiles": {
+    "0.05": 0.0329,
+    "0.25": 0.0845,
+    "0.5": 0.2547,
+    "0.75": 0.4483,
+    "0.95": 0.7559
+  },
+  "actuals_arr_delay_quantiles": {
+    "0.05": -32.05,
+    "0.25": -22.0,
+    "0.5": -12.0,
+    "0.75": 0.0,
+    "0.95": 97.15
+  },
+  "chain_walk_efficiency": {
+    "predictions_with_inbound": 94,
+    "inbounds_hydrated": 80,
+    "hit_rate": 0.8511
+  }
+}
