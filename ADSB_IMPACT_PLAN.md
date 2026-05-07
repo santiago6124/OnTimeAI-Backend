@@ -202,6 +202,72 @@ SOCIAL
 
 ---
 
+## Part 5: Data Volume & Storage Strategy
+
+### The problem with raw ADS-B
+
+Full US airspace ADS-B at native resolution is impractical:
+
+| Metric | Value |
+|---|---|
+| Concurrent aircraft in US airspace | ~5,000 |
+| ADS-B broadcast rate | 1 update/second/aircraft |
+| State vector size | ~100 bytes (lat, lon, alt, speed, heading, timestamp) |
+| **Daily raw volume** | **~43 GB/day** |
+| **Annual raw volume** | **~15.7 TB/year** |
+
+### Our approach: targeted polling
+
+OnTimeAI does **not** need every aircraft in America. We only need the **inbound aircraft** of flights we're predicting at ATL. This allows three aggressive filters:
+
+1. **Scope filter**: Only ATL-touching flights (~800/day) → only their inbound tails (~400 unique aircraft/day)
+2. **Temporal filter**: Only poll during the relevant window (T−3h to T−0 per flight), not 24h
+3. **Resolution filter**: Poll every 5 minutes instead of every second (300× reduction). One snapshot is sufficient to compute `inbound_eta_delta_min` = distance ÷ ground speed
+
+### Storage comparison
+
+| Approach | Rows/day | Size/day | Size/year | Feasible in SQLite? |
+|---|---|---|---|---|
+| Full US ADS-B (1s, all flights) | ~432M | 43 GB | 15.7 TB | ❌ |
+| ATL inbounds only, 1s | ~1.4M | 140 MB | 51 GB | ❌ |
+| **ATL inbounds only, 5-min polls** | **~115K** | **~12 MB** | **~4.3 GB** | **✅** |
+| Ultra-light (15-min polls, last position only) | ~38K | ~4 MB | ~1.5 GB | ✅ |
+
+**Reduction factor**: 3,600× vs raw ADS-B.
+
+### What 5-minute resolution provides
+
+- A 2-hour inbound flight yields **~24 position snapshots** — sufficient to:
+  - Compute ETA delta (distance ÷ ground speed) from **a single snapshot**
+  - Detect holding patterns (heading variance across 3+ consecutive snapshots)
+  - Track descent profile (altitude vs. expected altitude)
+  - Measure speed anomalies (ground speed vs. historical average for that route segment)
+- The key feature `inbound_eta_delta_min` requires only **1 observation** at any given time
+
+### Proposed SQLite schema
+
+```sql
+CREATE TABLE IF NOT EXISTS adsb_positions (
+    tail_num TEXT NOT NULL,
+    observed_utc TEXT NOT NULL,
+    latitude REAL,
+    longitude REAL,
+    altitude_ft REAL,
+    ground_speed_kts REAL,
+    heading REAL,
+    vertical_rate_fpm REAL,
+    distance_to_dest_nm REAL,    -- precomputed great-circle
+    eta_delta_min REAL,          -- precomputed: (dist/speed) - scheduled
+    source TEXT DEFAULT 'opensky',
+    PRIMARY KEY (tail_num, observed_utc)
+);
+CREATE INDEX IF NOT EXISTS idx_adsb_tail_time ON adsb_positions(tail_num, observed_utc);
+```
+
+Estimated table size: **~12 MB/day** → compatible with the existing `live_data.db` SQLite database alongside `flights`, `weather_obs`, `predictions`, and `actuals` tables.
+
+---
+
 ## References
 
 - FAA. (2023). *The Economic Cost of Delay to Air Carriers*. Federal Aviation Administration.
