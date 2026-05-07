@@ -164,6 +164,22 @@ Construido por `construir_dataset_maestro_atl_2025.py`, que hace:
 | **Post-hoc (leakage)** | `DEP_TIME`, `ARR_TIME`, `DEP_DELAY`, `ARR_DELAY`, `ACTUAL_ELAPSED_TIME`, `AIR_TIME`, `CARRIER_DELAY`, `WEATHER_DELAY`, `NAS_DELAY`, `SECURITY_DELAY`, `LATE_AIRCRAFT_DELAY` | **Target (ARR_DELAY) o removidas** |
 | Flags de filtro | `CANCELLED`, `DIVERTED` | Excluidos del entrenamiento |
 
+### Tipo de predicción: Clasificación supervisada (no regresión)
+
+El modelo realiza **clasificación supervisada**, no regresión. En lugar de predecir los minutos exactos de retraso (regresión), el modelo predice la **probabilidad de que un vuelo pertenezca a una categoría de retraso**.
+
+| Aspecto | Clasificación (lo que usamos) | Regresión (alternativa descartada) |
+|---|---|---|
+| **Output** | Probabilidad de retraso (0.0 – 1.0) + etiqueta binaria/multiclase | Minutos de retraso estimados |
+| **Función de pérdida** | Binary log-loss / cross-entropy | MSE / MAE |
+| **Métrica principal** | ROC AUC (capacidad de ranking) | RMSE / MAE |
+| **Justificación** | Alineado con el estándar FAA de "on-time" (≤ 15 min); la decisión operacional es binaria (retraso sí/no); más robusto ante outliers extremos (vuelos con +300 min de delay) | Requeriría modelar la distribución completa de delays, muy sesgada (heavy-tail) |
+
+**¿Por qué clasificación y no regresión?**
+1. La distribución de `ARR_DELAY` es altamente sesgada (heavy-tailed): la mayoría de los vuelos llegan a tiempo, pero los outliers tienen +300 min de delay. La regresión se distorsiona con estos extremos.
+2. La decisión operacional es fundamentalmente categórica: un pasajero necesita saber "¿se retrasa o no?", no "se retrasará 17.3 minutos".
+3. El output probabilístico (`proba_delay`) ya codifica la incertidumbre del modelo — funciona como un "termómetro" continuo entre 0 y 1.
+
 ### Target
 
 Configurable via `TrainConfig.target`:
