@@ -1,0 +1,130 @@
+{
+  "A_standard_multiclass": {
+    "accuracy": 0.8481,
+    "f1_macro": 0.3732,
+    "f1_weighted": 0.7974,
+    "roc_auc_macro_ovr": 0.7644,
+    "log_loss": 0.5317,
+    "f1_per_class": {
+      "C0": 0.9237,
+      "C1": 0.0234,
+      "C2": 0.0835,
+      "C3": 0.462
+    },
+    "confusion_matrix": {
+      "true_0": {
+        "pred_0": 45403,
+        "pred_1": 37,
+        "pred_2": 66,
+        "pred_3": 137
+      },
+      "true_1": {
+        "pred_0": 3176,
+        "pred_1": 42,
+        "pred_2": 74,
+        "pred_3": 115
+      },
+      "true_2": {
+        "pred_0": 2208,
+        "pred_1": 81,
+        "pred_2": 137,
+        "pred_3": 454
+      },
+      "true_3": {
+        "pred_0": 1877,
+        "pred_1": 27,
+        "pred_2": 124,
+        "pred_3": 1174
+      }
+    },
+    "elapsed_s": 27.2
+  },
+  "B_multiclass_stacking": {
+    "accuracy": 0.8468,
+    "f1_macro": 0.3892,
+    "f1_weighted": 0.8018,
+    "roc_auc_macro_ovr": 0.7745,
+    "log_loss": 0.5278,
+    "f1_per_class": {
+      "C0": 0.9255,
+      "C1": 0.0479,
+      "C2": 0.2106,
+      "C3": 0.3728
+    },
+    "confusion_matrix": {
+      "true_0": {
+        "pred_0": 45328,
+        "pred_1": 82,
+        "pred_2": 164,
+        "pred_3": 69
+      },
+      "true_1": {
+        "pred_0": 3034,
+        "pred_1": 88,
+        "pred_2": 223,
+        "pred_3": 62
+      },
+      "true_2": {
+        "pred_0": 2081,
+        "pred_1": 73,
+        "pred_2": 441,
+        "pred_3": 285
+      },
+      "true_3": {
+        "pred_0": 1871,
+        "pred_1": 21,
+        "pred_2": 481,
+        "pred_3": 829
+      }
+    },
+    "elapsed_s": 287.8
+  },
+  "C_chained_binary": {
+    "accuracy": 0.85,
+    "f1_macro": 0.3857,
+    "f1_weighted": 0.8012,
+    "roc_auc_macro_ovr": 0.7703,
+    "log_loss": 0.5712,
+    "f1_per_class": {
+      "C0": 0.9249,
+      "C1": 0.0407,
+      "C2": 0.1021,
+      "C3": 0.4751
+    },
+    "confusion_matrix": {
+      "true_0": {
+        "pred_0": 45404,
+        "pred_1": 68,
+        "pred_2": 43,
+        "pred_3": 128
+      },
+      "true_1": {
+        "pred_0": 3135,
+        "pred_1": 75,
+        "pred_2": 81,
+        "pred_3": 116
+      },
+      "true_2": {
+        "pred_0": 2159,
+        "pred_1": 91,
+        "pred_2": 167,
+        "pred_3": 463
+      },
+      "true_3": {
+        "pred_0": 1839,
+        "pred_1": 44,
+        "pred_2": 101,
+        "pred_3": 1218
+      }
+    },
+    "elapsed_s": 17.6
+  },
+  "config": {
+    "subsample": 300000,
+    "num_boost_round": 1500,
+    "train_size": 165391,
+    "val_size": 55130,
+    "test_size": 55132,
+    "n_features": 61
+  }
+}
