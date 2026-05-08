@@ -79,8 +79,8 @@ if [ ! -f "$REPO/.env" ]; then
     log "ERROR — no .env file (AEROAPI_KEY=...)"
     exit 1
 fi
-if [ ! -d "$REPO/artifacts/4year_v5_lineage_fixed" ]; then
-    log "ERROR — no model artifact at artifacts/4year_v5_lineage_fixed"
+if [ ! -d "$REPO/artifacts/4year_v4_full" ]; then
+    log "ERROR — no model artifact at artifacts/4year_v4_full"
     exit 1
 fi
 
@@ -102,7 +102,7 @@ python live_pull.py \
     --max-pages "$MAX_PAGES" \
     --chain-walk-max "$CHAIN_WALK_MAX" \
     --target-pos-rate "$TARGET_POS_RATE" \
-    --artifact artifacts/4year_v5_lineage_fixed \
+    --artifact artifacts/4year_v4_full \
     >> "$LOG" 2>&1
 EXIT_CODE=$?
 set -e
