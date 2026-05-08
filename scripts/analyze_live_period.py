@@ -99,7 +99,9 @@ def load_from_snapshots(snapshot_dir: Path, since_iso: str, until_iso: str) -> p
     if "diverted" in df.columns:
         df = df[pd.to_numeric(df["diverted"], errors="coerce").fillna(0).astype(int) == 0]
 
-    df["predicted_at_utc"] = pd.to_datetime(df["predicted_at_utc"], utc=True, errors="coerce")
+    df["predicted_at_utc"] = pd.to_datetime(
+        df["predicted_at_utc"], utc=True, errors="coerce", format="ISO8601",
+    )
     since_ts = pd.to_datetime(since_iso, utc=True)
     until_ts = pd.to_datetime(until_iso, utc=True)
     return df[(df["predicted_at_utc"] >= since_ts) & (df["predicted_at_utc"] <= until_ts)]
@@ -166,7 +168,7 @@ def compute_calibration(y_true: np.ndarray, y_proba: np.ndarray,
 
 def threshold_by_hour(df: pd.DataFrame) -> list[dict[str, Any]]:
     df = df.copy()
-    df["hour_utc"] = pd.to_datetime(df["predicted_at_utc"], utc=True).dt.hour
+    df["hour_utc"] = pd.to_datetime(df["predicted_at_utc"], utc=True, format="ISO8601").dt.hour
     rows = []
     for h, sub in df.groupby("hour_utc"):
         if len(sub) < MIN_HOUR_N:
@@ -200,7 +202,7 @@ def per_carrier(df: pd.DataFrame) -> list[dict[str, Any]]:
 
 def per_day(df: pd.DataFrame) -> list[dict[str, Any]]:
     df = df.copy()
-    df["date"] = pd.to_datetime(df["predicted_at_utc"], utc=True).dt.date
+    df["date"] = pd.to_datetime(df["predicted_at_utc"], utc=True, format="ISO8601").dt.date
     out = []
     for date, sub in df.groupby("date"):
         if len(sub) < MIN_DAILY_N:

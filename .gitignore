@@ -51,3 +51,4 @@ Thumbs.db
 .cron_tick.lock
 .cron_disabled
 logs/
+dataset_prepared_v4.parquet
