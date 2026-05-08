@@ -581,14 +581,18 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
     if target.empty:
         return pd.DataFrame()
 
-    # Pull history: completed flights (have actuals) within the last N days
+    # Pull history: completed flights (have actuals) within the last N days.
+    # JOIN by stable_id (not fa_flight_id) because AeroAPI returns slightly
+    # different fa_flight_id suffixes from /scheduled_* vs /departures-/arrivals
+    # endpoints — the actuals could be orphaned from their flight rows otherwise.
     earliest = (datetime.now(timezone.utc) - timedelta(days=history_days)).isoformat()
     history = pd.read_sql_query(
         """SELECT f.*, a.arr_delay_min, a.departure_delay_min, a.cancelled AS act_cancelled,
                   a.diverted AS act_diverted
            FROM flights f
-           JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
-           WHERE f.scheduled_off_utc >= ?""",
+           JOIN actuals a ON a.stable_id = f.stable_id
+           WHERE f.scheduled_off_utc >= ?
+             AND f.stable_id IS NOT NULL""",
         conn, params=(earliest,),
     )
 

@@ -56,33 +56,40 @@ def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
-def _backfill_day(conn, airport: str, day_start: datetime, max_pages: int) -> tuple[int, int, int]:
-    """Pull departures + arrivals for one day. Returns (n_flights, n_actuals, n_calls_est)."""
+def _backfill_day(
+    conn, airports: list[str], day_start: datetime, max_pages: int,
+) -> tuple[int, int, int]:
+    """Pull departures + arrivals for one day from each airport in `airports`.
+
+    Returns (n_flights, n_actuals, n_calls_est).
+    """
     day_end = day_start + timedelta(days=1)
     n_flights = 0
     n_actuals = 0
     n_calls = 0
-    for kind in ("departures", "arrivals"):
-        flights = fetch_airport_flights(
-            airport, kind, _iso(day_start), _iso(day_end), max_pages,
-        )
-        n_calls += min(max_pages, (len(flights) + 14) // 15) or 1
+    for airport in airports:
+        for kind in ("departures", "arrivals"):
+            try:
+                flights = fetch_airport_flights(
+                    airport, kind, _iso(day_start), _iso(day_end), max_pages,
+                )
+            except Exception as e:
+                print(f"      {airport} {kind}: FAIL ({e})")
+                continue
+            n_calls += min(max_pages, (len(flights) + 14) // 15) or 1
 
-        # Insert flight rows (relaxed filter to capture inbound paths from non-tracked
-        # airports — these still feed lineage indirectly).
-        rows = [
-            r for r in (aeroapi_to_flight_row(f, strict_airport_filter=False)
-                        for f in flights) if r
-        ]
-        upsert_flights(conn, rows)
-        n_flights += len(rows)
+            rows = [
+                r for r in (aeroapi_to_flight_row(f, strict_airport_filter=False)
+                            for f in flights) if r
+            ]
+            upsert_flights(conn, rows)
+            n_flights += len(rows)
 
-        # Insert actuals (only flights with actual_in populated)
-        landed = [f for f in flights if f.get("actual_in")]
-        upsert_actuals_from_aeroapi(conn, landed)
-        n_actuals += len(landed)
+            landed = [f for f in flights if f.get("actual_in")]
+            upsert_actuals_from_aeroapi(conn, landed)
+            n_actuals += len(landed)
 
-        time.sleep(2)  # be kind to AeroAPI
+            time.sleep(1.5)  # be kind to AeroAPI
     return n_flights, n_actuals, n_calls
 
 
@@ -174,7 +181,12 @@ def main() -> int:
                    help="Days of history to backfill before --start (default 7)")
     p.add_argument("--max-pages", type=int, default=25,
                    help="AeroAPI cursor pagination cap per endpoint (default 25)")
-    p.add_argument("--airport", default="KATL")
+    p.add_argument("--airport", default="KATL",
+                   help="Target airport for predictions (default KATL)")
+    p.add_argument("--backfill-airports",
+                   default="KATL,KDFW,KCLT,KORD,KDEN,KMIA,KJFK,KLGA,KBOS,KFLL,KMCO,KLAX,KIAH,KEWR,KPHX",
+                   help="Comma-separated ICAO codes to backfill (default top-15 US hubs). "
+                        "Wider coverage = better lineage features for multi-hub carriers.")
     p.add_argument("--artifact", default=str(ARTIFACTS_DIR / "4year_v4_full"))
     p.add_argument("--target-pos-rate", type=float, default=0.22)
     p.add_argument("--skip-backfill", action="store_true",
@@ -208,17 +220,21 @@ def main() -> int:
     total_flights = 0
     total_actuals = 0
 
+    backfill_airports = [a.strip().upper() for a in args.backfill_airports.split(",") if a.strip()]
     if not args.skip_backfill:
-        print("\n=== Phase 1: backfilling history (AeroAPI) ===")
+        print(f"\n=== Phase 1: backfilling history from {len(backfill_airports)} airports ===")
+        print(f"  Airports: {', '.join(backfill_airports)}")
         cur = history_start
         while cur < end + timedelta(days=1):
-            print(f"  {cur.date()}: ", end="", flush=True)
+            print(f"\n  {cur.date()}:")
             t0 = time.time()
-            n_f, n_a, n_c = _backfill_day(conn, args.airport, cur, args.max_pages)
+            n_f, n_a, n_c = _backfill_day(conn, backfill_airports, cur, args.max_pages)
             total_flights += n_f
             total_actuals += n_a
             total_calls += n_c
-            print(f"{n_f} flights, {n_a} actuals  ({n_c} API calls, {time.time() - t0:.0f}s)")
+            print(f"    total: {n_f} flights, {n_a} actuals  "
+                  f"({n_c} API calls, {time.time() - t0:.0f}s, "
+                  f"running cost ~${total_calls * 0.005:.2f})")
             cur += timedelta(days=1)
         print(f"\nTotal Phase 1: {total_flights:,} flights, {total_actuals:,} actuals")
         print(f"Estimated cost: ~${total_calls * 0.005:.2f} USD")

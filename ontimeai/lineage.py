@@ -28,35 +28,89 @@ DELAY_THRESHOLD_MIN = 15.0
 
 
 def add_tail_lineage_features(df: pd.DataFrame) -> pd.DataFrame:
-    required = {"TAIL_NUM", "FL_DATE", "EVENT_ORIGIN_UTC", "EVENT_DEST_UTC", ARR_DELAY_COL}
+    """Compute prev_arr_delay_tail / prev_turnaround / tail_flights_today_prior.
+
+    Groups by TAIL_NUM only (across days) and uses a 24h UTC window to identify
+    the prior leg. The previous implementation grouped by (TAIL_NUM, FL_DATE)
+    where FL_DATE is local-tz, which silently dropped overnight rotations
+    (target's local date != prior's local date when crossing midnight at any
+    timezone). With ATL EDT vs e.g. LAX PDT, even within-tz rotations could
+    miss when scheduled_off straddled midnight.
+
+    The 24h window keeps the original anti-leakage intent (don't pull stale
+    7-day-old "priors") while correctly capturing every truly-recent rotation.
+    """
+    required = {"TAIL_NUM", "EVENT_ORIGIN_UTC", "EVENT_DEST_UTC", ARR_DELAY_COL}
     if not required.issubset(df.columns):
         return df
 
     out = df.copy()
     out["_orig_pos"] = np.arange(len(out))
 
-    date_str = pd.to_datetime(out["FL_DATE"], errors="coerce").dt.strftime("%Y-%m-%d").fillna("")
-    tail_str = out["TAIL_NUM"].astype("string").fillna("")
-    out["_group_key"] = (tail_str + "|" + date_str).astype("string")
-
-    out = out.sort_values(["_group_key", "EVENT_ORIGIN_UTC"], kind="stable").reset_index(drop=True)
-
-    grp = out.groupby("_group_key", sort=False)
-    prev_arr_delay = grp[ARR_DELAY_COL].shift(1)
-    prev_event_dest = pd.to_datetime(grp["EVENT_DEST_UTC"].shift(1), errors="coerce")
+    tail_str = out["TAIL_NUM"].astype("string").fillna("__nan__")
     cur_event_origin = pd.to_datetime(out["EVENT_ORIGIN_UTC"], errors="coerce")
+    event_dest = pd.to_datetime(out["EVENT_DEST_UTC"], errors="coerce")
+    arr_delay = pd.to_numeric(out[ARR_DELAY_COL], errors="coerce")
+
+    # Use UTC date for the "today" group, not local FL_DATE — this is part of the bug-fix.
+    utc_date = cur_event_origin.dt.strftime("%Y-%m-%d").fillna("")
+    out["_tail_only_key"] = tail_str
+    out["_tail_utcdate_key"] = (tail_str + "|" + utc_date).astype("string")
+
+    out = out.sort_values(["_tail_only_key", "EVENT_ORIGIN_UTC"], kind="stable").reset_index(drop=True)
+
+    # Re-extract after sort
+    cur_event_origin = pd.to_datetime(out["EVENT_ORIGIN_UTC"], errors="coerce")
+    event_dest = pd.to_datetime(out["EVENT_DEST_UTC"], errors="coerce")
+    arr_delay = pd.to_numeric(out[ARR_DELAY_COL], errors="coerce")
+    has_arr = arr_delay.notna()
+
+    # ── KEY FIX: ffill then shift(1) within each tail group ───────────────────
+    # Inference frames mix history rows (ARR_DELAY known) with target rows (ARR_DELAY=NaN).
+    # A naive shift(1) would propagate the NaN of an immediately-prior target instead of
+    # finding the most recent SETTLED prior. We fix this by ffill-ing the valid-only
+    # triplet (arr_delay, event_dest, event_origin) within each tail before shifting.
+    out["_v_delay"] = arr_delay.where(has_arr)
+    out["_v_dest"] = event_dest.where(has_arr)
+    out["_v_orig"] = cur_event_origin.where(has_arr)
+
+    grp_tail = out.groupby("_tail_only_key", sort=False)
+    # Use transform with ffill+shift inside the lambda so both ops stay within each
+    # group (a bare .ffill().shift(1) on a SeriesGroupBy returns a flat Series whose
+    # subsequent .shift(1) crosses group boundaries, contaminating different tails).
+    def _ffill_shift(s: pd.Series) -> pd.Series:
+        return s.ffill().shift(1)
+
+    prev_arr_delay = grp_tail["_v_delay"].transform(_ffill_shift)
+    prev_event_dest = pd.to_datetime(
+        grp_tail["_v_dest"].transform(_ffill_shift), errors="coerce",
+    )
+    prev_event_origin = pd.to_datetime(
+        grp_tail["_v_orig"].transform(_ffill_shift), errors="coerce",
+    )
 
     prev_actual_arr = prev_event_dest + pd.to_timedelta(prev_arr_delay, unit="m")
     observable = (prev_actual_arr <= cur_event_origin).fillna(False)
+    # Anti-stale-prior guard: prev leg must be within 24h.
+    delta_hours = (cur_event_origin - prev_event_origin).dt.total_seconds() / 3600.0
+    within_24h = (delta_hours > 0) & (delta_hours < 24)
+    valid = observable & within_24h.fillna(False)
 
     scheduled_turnaround_min = (cur_event_origin - prev_event_dest).dt.total_seconds() / 60.0
 
-    out["prev_arr_delay_tail"] = np.where(observable, prev_arr_delay, np.nan)
-    out["prev_turnaround_tail_min"] = np.where(observable, scheduled_turnaround_min, np.nan)
-    out["tail_flights_today_prior"] = grp.cumcount().astype(np.int16)
+    out["prev_arr_delay_tail"] = np.where(valid, prev_arr_delay, np.nan)
+    out["prev_turnaround_tail_min"] = np.where(valid, scheduled_turnaround_min, np.nan)
+
+    # ── tail_flights_today_prior: count per (TAIL, UTC-date) ──────────────────
+    out["tail_flights_today_prior"] = (
+        out.groupby("_tail_utcdate_key", sort=False).cumcount().astype(np.int16)
+    )
 
     out = out.sort_values("_orig_pos").reset_index(drop=True)
-    return out.drop(columns=["_orig_pos", "_group_key"])
+    return out.drop(columns=[
+        "_orig_pos", "_tail_only_key", "_tail_utcdate_key",
+        "_v_delay", "_v_dest", "_v_orig",
+    ])
 
 
 def _daily_rate_lag(

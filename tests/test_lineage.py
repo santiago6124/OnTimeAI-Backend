@@ -33,12 +33,15 @@ def _mini_tail_df() -> pd.DataFrame:
 def test_tail_lineage_first_flight_has_nans() -> None:
     df = _mini_tail_df()
     out = add_tail_lineage_features(df)
-    # Row 0 is first flight of N1 on day 1 → prev_arr_delay_tail NaN
+    # Row 0 is N1's very first flight in the frame → no prior → NaN
     assert pd.isna(out.loc[0, "prev_arr_delay_tail"])
-    # Row 3 is first (and only) flight of N2 on day 1 → NaN
+    # Row 3 is N2's only flight → no prior → NaN
     assert pd.isna(out.loc[3, "prev_arr_delay_tail"])
-    # Row 4 is first flight of N1 on day 2 (different day) → NaN
-    assert pd.isna(out.loc[4, "prev_arr_delay_tail"])
+    # Row 4 is N1 on day 2 at 07:00 UTC. Prior is N1's row 2 (day 1, 15:00 UTC dep,
+    # 17:00 sched arr + 30min delay = actual 17:30). Gap = 16h < 24h → lineage VALID.
+    # (Previously this returned NaN because of the (TAIL, FL_DATE-local) grouping
+    # bug; the fix now correctly captures cross-midnight rotations.)
+    assert out.loc[4, "prev_arr_delay_tail"] == 30.0
 
 
 def test_tail_lineage_uses_prior_actual_arrival() -> None:
