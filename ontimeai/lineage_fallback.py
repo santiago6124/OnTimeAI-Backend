@@ -75,10 +75,13 @@ def build_lookups(master_df: pd.DataFrame) -> dict[str, Any]:
         "carrier_hour_mean_delay": _agg(df, ["OP_CARRIER", "_hour"], ARR_DELAY_COL),
         "carrier_dow_late_rate": _agg(df, ["OP_CARRIER", "DAY_OF_WEEK"], "_late"),
         "origin_hour_late_rate": _agg(df, ["ORIGIN", "_hour"], "_late"),
+        "dest_hour_late_rate": _agg(df, ["DEST", "_hour"], "_late"),
         "carrier_late_rate": _agg(df, ["OP_CARRIER"], "_late"),
         "origin_late_rate": _agg(df, ["ORIGIN"], "_late"),
+        "dest_late_rate": _agg(df, ["DEST"], "_late"),
         "global_mean_delay": float(df[ARR_DELAY_COL].mean()),
         "global_late_rate": float(df["_late"].mean()),
+        "global_on_time_rate": float(1.0 - df["_late"].mean()),
         "_meta": {
             "n_rows": int(len(df)),
             "min_group_count": MIN_GROUP_COUNT,
@@ -204,6 +207,33 @@ def apply_lineage_fallback(df: pd.DataFrame, lookups: dict[str, Any]) -> pd.Data
         for c in origin_rate_cols:
             if c in out.columns:
                 out[c] = out[c].fillna(imputed)
+
+    # ---- dest rate features ----
+    dest_rate_cols = [
+        "dest_delay_rate_1h",
+        "dest_delay_rate_6h",
+        "dest_delay_rate_24h",
+    ]
+    if any(c in out.columns for c in dest_rate_cols):
+        layers = [
+            ([dest], lookups.get("dest_late_rate")),
+            ([dest, hour], lookups.get("dest_hour_late_rate")),
+        ]
+        imputed_dest = _hierarchical_lookup(layers, out.index, g_late)
+        for c in dest_rate_cols:
+            if c in out.columns:
+                out[c] = out[c].fillna(imputed_dest)
+
+    # ---- absorb_score_origin: 1 - origin inbound late rate ----
+    if "absorb_score_origin" in out.columns:
+        g_on_time = float(lookups.get("global_on_time_rate", 1.0 - g_late))
+        layers = [
+            ([origin], lookups.get("origin_late_rate")),
+            ([origin, hour], lookups.get("origin_hour_late_rate")),
+        ]
+        imputed_late = _hierarchical_lookup(layers, out.index, g_late)
+        imputed_absorb = 1.0 - imputed_late
+        out["absorb_score_origin"] = out["absorb_score_origin"].fillna(imputed_absorb)
 
     return out
 

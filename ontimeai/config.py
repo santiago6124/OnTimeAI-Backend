@@ -102,6 +102,9 @@ class TrainConfig:
     use_origin_lag: bool = True
     use_carrier_rolling: bool = True
     use_origin_rolling: bool = True
+    use_dest_rolling: bool = True
+    use_holiday_features: bool = True
+    use_absorb_score: bool = True
     calibration: str | None = "isotonic"  # "isotonic" | "sigmoid" | None
     artifacts_dir: Path = ARTIFACTS_DIR
     lgb_params: dict[str, Any] = field(

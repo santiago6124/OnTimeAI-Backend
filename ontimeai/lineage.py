@@ -245,6 +245,14 @@ ORIGIN_ROLLING_WINDOWS: tuple[tuple[float, str], ...] = (
     (24.0, "origin_delay_rate_24h"),
 )
 
+# Destination-side congestion: delay rate of flights arriving at DEST airport.
+# Captures whether the destination is currently absorbing many delayed inbounds.
+DEST_ROLLING_WINDOWS: tuple[tuple[float, str], ...] = (
+    (1.0, "dest_delay_rate_1h"),
+    (6.0, "dest_delay_rate_6h"),
+    (24.0, "dest_delay_rate_24h"),
+)
+
 
 def add_carrier_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     out = df
@@ -260,6 +268,19 @@ def add_origin_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def add_dest_rolling_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Delay rate of flights arriving AT the destination airport in rolling windows.
+
+    Groups by DEST and uses each flight's actual arrival time as the visibility
+    timestamp (same leakage-safe logic as origin rolling). Captures destination-side
+    congestion that often propagates to the current flight's arrival delay.
+    """
+    out = df
+    for hours, col in DEST_ROLLING_WINDOWS:
+        out = add_group_rolling_rate(out, "DEST", hours, col)
+    return out
+
+
 LINEAGE_FEATURE_COLS: tuple[str, ...] = (
     "prev_arr_delay_tail",
     "prev_turnaround_tail_min",
@@ -268,4 +289,5 @@ LINEAGE_FEATURE_COLS: tuple[str, ...] = (
     "origin_delay_rate_yday",
     *(name for _, name in CARRIER_ROLLING_WINDOWS),
     *(name for _, name in ORIGIN_ROLLING_WINDOWS),
+    *(name for _, name in DEST_ROLLING_WINDOWS),
 )

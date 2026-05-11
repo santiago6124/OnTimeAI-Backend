@@ -9,8 +9,10 @@ import pandas as pd
 from ontimeai.config import ARTIFACTS_DIR, ARR_DELAY_COL
 from ontimeai.data import drop_leaky_target_columns, filter_valid_flights
 from ontimeai.features import (
+    add_absorb_score,
     add_congestion_features,
     add_cyclical_features,
+    add_holiday_features,
     add_weather_interactions,
     apply_categorical_mapping,
     normalize_weather_flags,
@@ -18,6 +20,7 @@ from ontimeai.features import (
 from ontimeai.lineage import (
     add_carrier_day_lag,
     add_carrier_rolling_features,
+    add_dest_rolling_features,
     add_origin_day_lag,
     add_origin_rolling_features,
     add_tail_lineage_features,
@@ -45,12 +48,15 @@ def prepare_inference_frame(
         df = add_origin_day_lag(df)
         df = add_carrier_rolling_features(df)
         df = add_origin_rolling_features(df)
+        df = add_dest_rolling_features(df)
+        df = add_absorb_score(df)
         df = drop_leaky_target_columns(df)
 
     if fallback_lookup is not None:
         df = apply_lineage_fallback(df, fallback_lookup)
 
     df = normalize_weather_flags(df)
+    df = add_holiday_features(df)
     df = add_cyclical_features(df)
     df = add_congestion_features(df)
     df = add_weather_interactions(df)

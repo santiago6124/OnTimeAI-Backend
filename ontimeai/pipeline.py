@@ -12,8 +12,10 @@ from ontimeai.data import drop_leaky_target_columns, filter_valid_flights, load_
 from ontimeai.evaluation import binary_metrics, confusion_df, multiclass_metrics
 from ontimeai.calibration import Calibrator, fit_calibrator
 from ontimeai.features import (
+    add_absorb_score,
     add_congestion_features,
     add_cyclical_features,
+    add_holiday_features,
     add_weather_interactions,
     build_feature_matrix,
     build_target,
@@ -22,6 +24,7 @@ from ontimeai.features import (
 from ontimeai.lineage import (
     add_carrier_day_lag,
     add_carrier_rolling_features,
+    add_dest_rolling_features,
     add_origin_day_lag,
     add_origin_rolling_features,
     add_tail_lineage_features,
@@ -63,8 +66,14 @@ def prepare_dataset(df_raw: pd.DataFrame, cfg: TrainConfig) -> tuple[pd.DataFram
         df = add_carrier_rolling_features(df)
     if cfg.use_origin_rolling:
         df = add_origin_rolling_features(df)
+    if cfg.use_dest_rolling:
+        df = add_dest_rolling_features(df)
+    if cfg.use_absorb_score:
+        df = add_absorb_score(df)
     df = drop_leaky_target_columns(df)
     df = normalize_weather_flags(df)
+    if cfg.use_holiday_features:
+        df = add_holiday_features(df)
     df = add_cyclical_features(df)
     df = add_congestion_features(df, cfg.congestion_window_min)
     df = add_weather_interactions(df)
