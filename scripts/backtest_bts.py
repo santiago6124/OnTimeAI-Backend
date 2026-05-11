@@ -68,6 +68,9 @@ def main():
                    help="Comma-separated YYYY-MM months to use as OOT test set")
     p.add_argument("--output", type=Path,
                    default=ARTIFACTS_DIR / "backtest_results.json")
+    p.add_argument("--export-dataset", type=Path, default=None,
+                   help="If set, export the feature matrix + labels as parquet "
+                        "for scoring with other models (e.g. ensemble)")
     args = p.parse_args()
 
     print("=" * 70)
@@ -166,6 +169,29 @@ def main():
 
     # Create target
     y_test = (df_test_final[ARR_DELAY_COL] > 15).astype(int)
+
+    # ── Export dataset for cross-model evaluation ────────────────────────
+    if args.export_dataset:
+        export_path = Path(args.export_dataset)
+        export_path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Build export DataFrame: features + metadata + target
+        export_df = X_test.copy()
+        export_df["__y_binary"] = y_test.values
+        export_df["__arr_delay_min"] = df_test_final[ARR_DELAY_COL].values
+
+        # Add metadata columns for slicing (not features, prefixed with __)
+        for meta_col in ["OP_CARRIER", "ORIGIN", "DEST", "TAIL_NUM",
+                         "FL_DATE", "FLOW_ATL", "PAR_AIRPORT"]:
+            if meta_col in df_test_final.columns:
+                export_df[f"__{meta_col}"] = df_test_final[meta_col].values
+
+        export_df.to_parquet(export_path, index=False)
+        print(f"\n  ✅ Exported {len(export_df):,} rows × {len(export_df.columns)} cols "
+              f"to {export_path}")
+        print(f"     Features: {len(meta['feature_cols'])} model features")
+        print(f"     + __y_binary, __arr_delay_min, __OP_CARRIER, __ORIGIN, etc.")
+        print(f"     Use columns NOT starting with '__' as X, '__y_binary' as y")
 
     print(f"\nScoring {len(X_test):,} test flights...")
     proba = predict_proba(meta["booster"], X_test)
