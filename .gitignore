@@ -23,6 +23,8 @@ dataset_maestro_ATL_2022-2024_BTS_IEM_ORIG_DEST.csv
 dataset_maestro_ATL_2022-2025_BTS_IEM_ORIG_DEST.csv
 dataset_maestro_FULL_US_*.csv
 dataset_maestro_FULL_US_*.parquet
+dataset_v7_optimized.parquet
+dataset_v7_10M.parquet
 
 # Large prediction outputs (>100 MB, OOT full-US runs)
 preds_2021_v*.csv
