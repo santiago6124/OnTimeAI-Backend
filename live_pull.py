@@ -32,7 +32,7 @@ def _iso(dt: datetime) -> str:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--artifact", default=ARTIFACTS_DIR / "4year_v6_full")
+    p.add_argument("--artifact", default=ARTIFACTS_DIR / "4year_v7_recal")
     p.add_argument("--airport", default="KATL")
     p.add_argument("--schedule-hours", type=int, default=2,
                    help="Pull scheduled departures for the next N hours")

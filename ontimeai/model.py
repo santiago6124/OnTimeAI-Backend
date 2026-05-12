@@ -37,7 +37,7 @@ def train_booster(
         label=y_train,
         weight=sw_train,
         categorical_feature=cat_cols,
-        free_raw_data=False,
+        free_raw_data=True,
     )
     val_set = lgb.Dataset(
         X_val,
@@ -45,7 +45,7 @@ def train_booster(
         weight=sw_val,
         categorical_feature=cat_cols,
         reference=train_set,
-        free_raw_data=False,
+        free_raw_data=True,
     )
 
     callbacks = [

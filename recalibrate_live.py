@@ -82,14 +82,21 @@ def main() -> int:
                    help="Tasa positiva objetivo para recalcular threshold")
     p.add_argument("--dry-run", action="store_true",
                    help="Solo muestra métricas, no guarda el artifact")
+    p.add_argument("--strategy-filter", default=None,
+                   help="Filtrar por threshold_strategy (e.g. 'artifact_batch_v7'). "
+                        "Por defecto usa todas las predicciones.")
     args = p.parse_args()
 
     conn = open_db()
     now = datetime.now(timezone.utc)
 
     # ---- 1. cargar predicciones asentadas ----
+    strategy_clause = (
+        f"AND p.threshold_strategy = '{args.strategy_filter}'"
+        if args.strategy_filter else ""
+    )
     df = pd.read_sql_query(
-        """
+        f"""
         SELECT p.fa_flight_id, p.proba_delay, p.predicted_delay,
                a.arr_delay_min, a.cancelled, a.diverted,
                f.origin, f.dest, f.op_carrier, f.fl_date
@@ -99,6 +106,7 @@ def main() -> int:
         WHERE a.cancelled = 0
           AND a.diverted  = 0
           AND a.arr_delay_min IS NOT NULL
+          {strategy_clause}
         """,
         conn,
     )

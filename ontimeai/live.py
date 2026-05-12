@@ -642,6 +642,97 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
             df = _merge_weather_asof(df, wx, "ORIGIN", "EVENT_ORIGIN_UTC", "ORIG")
             df = _merge_weather_asof(df, wx, "DEST", "EVENT_DEST_UTC", "DEST")
 
+    # v7 features: BEARING_DEG + ERA5 wind at cruise altitude
+    df = _add_v7_wind_features(df)
+
+    return df
+
+
+# ERA5 grids loaded once per process (lazy, cached at module level)
+_ERA5_GRIDS: dict | None = None
+
+
+def _add_v7_wind_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Agrega BEARING_DEG y features ERA5 viento 250hPa al inference frame."""
+    global _ERA5_GRIDS
+
+    try:
+        import sys
+        sys.path.insert(0, str(PROJECT_ROOT))
+        from feature_engineering_v7.airport_lookup import great_circle_bearing, airport_coords
+        from feature_engineering_v7.era5_wind_features import Era5WindGrid, _midpoint as era5_midpoint
+        import numpy as _np
+
+        # BEARING_DEG por par único ORIGIN-DEST
+        pairs = df[["ORIGIN", "DEST"]].drop_duplicates().copy()
+        pairs["BEARING_DEG"] = pairs.apply(
+            lambda r: great_circle_bearing(r["ORIGIN"], r["DEST"]), axis=1
+        )
+        df = df.merge(pairs, on=["ORIGIN", "DEST"], how="left")
+
+        # Cargar ERA5 grids una sola vez
+        if _ERA5_GRIDS is None:
+            era5_dir = PROJECT_ROOT / "data_raw" / "era5_wind"
+            if era5_dir.exists():
+                grids: dict = {}
+                for p in sorted(era5_dir.glob("era5_wind_*.nc")):
+                    parts = p.stem.split("_")
+                    if len(parts) >= 4:
+                        try:
+                            grids[(int(parts[2]), int(parts[3]))] = Era5WindGrid(p)
+                        except Exception:
+                            pass
+                _ERA5_GRIDS = grids
+            else:
+                _ERA5_GRIDS = {}
+
+        if not _ERA5_GRIDS:
+            for c in ["ERA5_U_KT", "ERA5_V_KT", "ERA5_HEADWIND_KT", "ERA5_CROSSWIND_KT"]:
+                df[c] = _np.nan
+            df["ERA5_TAILWIND_FLAG"] = 0
+            return df
+
+        n = len(df)
+        era5_u = _np.full(n, _np.nan)
+        era5_v = _np.full(n, _np.nan)
+
+        for (origin, dest, year, month), idx in df.groupby(["ORIGIN", "DEST", "YEAR", "MONTH"]).indices.items():
+            midpt = era5_midpoint(origin, dest)
+            bearing_vals = df["BEARING_DEG"].iloc[list(idx)]
+            bearing = bearing_vals.iloc[0] if not bearing_vals.isna().all() else None
+            if midpt is None or bearing is None:
+                continue
+            grid = _ERA5_GRIDS.get((int(year), int(month)))
+            if grid is None:
+                candidates = [(abs(y - int(year)), g) for (y, m), g in _ERA5_GRIDS.items() if m == int(month)]
+                if candidates:
+                    grid = min(candidates, key=lambda x: x[0])[1]
+            if grid is None:
+                continue
+            u_kt, v_kt = grid.wind_at(midpt[0], midpt[1])
+            era5_u[list(idx)] = u_kt
+            era5_v[list(idx)] = v_kt
+
+        df["ERA5_U_KT"] = era5_u
+        df["ERA5_V_KT"] = era5_v
+        bearing_rad = _np.radians(df["BEARING_DEG"].values.astype(float))
+        flight_e = _np.sin(bearing_rad)
+        flight_n = _np.cos(bearing_rad)
+        tailwind = era5_u * flight_e + era5_v * flight_n
+        df["ERA5_HEADWIND_KT"] = -tailwind
+        df["ERA5_CROSSWIND_KT"] = era5_u * flight_n - era5_v * flight_e
+        df["ERA5_TAILWIND_FLAG"] = (df["ERA5_HEADWIND_KT"] < -15).astype("int8")
+
+    except Exception as e:
+        # Si falla por cualquier razón, rellenar con NaN para no romper inferencia
+        import warnings
+        warnings.warn(f"v7 wind features failed: {e}")
+        for c in ["BEARING_DEG", "ERA5_U_KT", "ERA5_V_KT", "ERA5_HEADWIND_KT", "ERA5_CROSSWIND_KT"]:
+            if c not in df.columns:
+                df[c] = _np.nan if "ERA5" in c or "BEARING" in c else 0
+        if "ERA5_TAILWIND_FLAG" not in df.columns:
+            df["ERA5_TAILWIND_FLAG"] = 0
+
     return df
 
 

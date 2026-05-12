@@ -1,0 +1,61 @@
+{
+  "version": "v7_recal",
+  "created_at_utc": "2026-05-12T21:39:09Z",
+  "source_artifact": "4year_v7_full",
+  "description": "v7_full recalibrated with isotonic stacking on 4,360 live actuals (2026-05-12)",
+
+  "offline_test": {
+    "note": "Inherited from 4year_v7_full — booster unchanged",
+    "train_size": 16203347,
+    "val_size": 5401115,
+    "test_size": 5401117,
+    "test_roc_auc": 0.8558,
+    "test_brier": 0.1040,
+    "test_f1": 0.6529,
+    "test_accuracy": 0.8525
+  },
+
+  "live_head_to_head": {
+    "note": "Same 6,320 flights (7-day window), quantile threshold target_pos_rate=0.22",
+    "n_flights": 6320,
+    "pos_rate_true": 0.2517,
+    "v6_recal": {
+      "roc_auc": 0.6565,
+      "brier":   0.1783,
+      "f1":      0.3608,
+      "accuracy":0.6188,
+      "pos_rate_pred": 0.3446
+    },
+    "v7_full": {
+      "roc_auc": 0.6625,
+      "brier":   0.1891,
+      "f1":      0.2904,
+      "accuracy":0.6620,
+      "pos_rate_pred": 0.2245
+    },
+    "v7_recal": {
+      "roc_auc": 0.6631,
+      "brier":   0.1771,
+      "f1":      0.3569,
+      "accuracy":0.6351,
+      "pos_rate_pred": 0.3157
+    },
+    "delta_v7_recal_vs_v6_recal": {
+      "roc_auc": "+0.0066",
+      "brier":   "-0.0012",
+      "f1":      "-0.0039",
+      "accuracy":"+0.0163"
+    }
+  },
+
+  "calibration": {
+    "method": "stacked_isotonic",
+    "layer1": "original v7_full isotonic calibrator (fit on 27.5M training set)",
+    "layer2": "live isotonic calibrator (fit on 4,360 live actuals)",
+    "brier_before_recal": 0.1960,
+    "brier_after_recal":  0.1819,
+    "brier_delta": -0.0140,
+    "ece_before": 0.0740,
+    "ece_after":  0.0000
+  }
+}

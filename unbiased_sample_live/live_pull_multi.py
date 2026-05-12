@@ -123,7 +123,7 @@ def main() -> int:
     )
     p.add_argument(
         "--artifact",
-        default=str(ARTIFACTS_DIR / "4year_v6_full"),
+        default=str(ARTIFACTS_DIR / "4year_v7_recal"),
         help="Path to model artifact directory",
     )
     p.add_argument(

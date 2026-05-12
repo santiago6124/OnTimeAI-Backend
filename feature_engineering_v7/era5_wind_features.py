@@ -147,11 +147,13 @@ def add_era5_wind_features(
     print(f"  {len(grids)} archivos mensuales cargados")
 
     # Pre-computar midpoints y bearings por par único ORIGIN-DEST
+    # Usamos _MIDPOINT y _ERA5_BEARING para no colisionar con BEARING_DEG
+    # que puede ya existir en df (agregado por build_v7_dataset Fase 1)
     pairs = df[["ORIGIN", "DEST"]].drop_duplicates().copy()
-    pairs["MIDPOINT"] = pairs.apply(
+    pairs["_MIDPOINT"] = pairs.apply(
         lambda r: _midpoint(r["ORIGIN"], r["DEST"]), axis=1
     )
-    pairs["BEARING_DEG"] = pairs.apply(
+    pairs["_ERA5_BEARING"] = pairs.apply(
         lambda r: great_circle_bearing(r["ORIGIN"], r["DEST"]), axis=1
     )
 
@@ -166,8 +168,8 @@ def add_era5_wind_features(
     groups = df.groupby(["ORIGIN", "DEST", "YEAR", "MONTH"]).indices
 
     for (origin, dest, year, month), idx in groups.items():
-        midpt = df.at[idx[0], "MIDPOINT"]
-        bearing = df.at[idx[0], "BEARING_DEG"]
+        midpt = df.at[idx[0], "_MIDPOINT"]
+        bearing = df.at[idx[0], "_ERA5_BEARING"]
         if midpt is None or bearing is None:
             continue
 
@@ -185,24 +187,24 @@ def add_era5_wind_features(
         era5_u[list(idx)] = u_kt
         era5_v[list(idx)] = v_kt
 
-    df = df.drop(columns=["MIDPOINT"])
+    df = df.drop(columns=["_MIDPOINT"])
 
     df["ERA5_U_KT"] = era5_u
     df["ERA5_V_KT"] = era5_v
 
-    # Headwind = componente del viento que se opone al vuelo
-    # viento va hacia bearing_wind = (DRCT_meteorologico + 180) mod 360
-    # Para ERA5: u = componente E-O (+ hacia este), v = N-S (+ hacia norte)
-    # El vector viento en grados desde el norte: atan2(u, v)
-    bearing_rad = np.radians(df["BEARING_DEG"].values.astype(float))
-    # Proyección del vector viento (u,v) sobre la dirección del vuelo (sin, cos)
-    flight_e = np.sin(bearing_rad)   # componente este de la dirección de vuelo
-    flight_n = np.cos(bearing_rad)   # componente norte de la dirección de vuelo
-    # Tailwind = viento DOT dirección_vuelo = u*sin(bearing) + v*cos(bearing)
+    bearing_rad = np.radians(df["_ERA5_BEARING"].values.astype(float))
+    flight_e = np.sin(bearing_rad)
+    flight_n = np.cos(bearing_rad)
     tailwind = era5_u * flight_e + era5_v * flight_n
-    df["ERA5_HEADWIND_KT"] = -tailwind   # headwind = -tailwind
+    df["ERA5_HEADWIND_KT"] = -tailwind
     df["ERA5_CROSSWIND_KT"] = (era5_u * flight_n - era5_v * flight_e)
     df["ERA5_TAILWIND_FLAG"] = (df["ERA5_HEADWIND_KT"] < -15).astype("int8")
+
+    # Promover _ERA5_BEARING a BEARING_DEG solo si no existe ya en df
+    if "BEARING_DEG" not in df.columns:
+        df = df.rename(columns={"_ERA5_BEARING": "BEARING_DEG"})
+    else:
+        df = df.drop(columns=["_ERA5_BEARING"])
 
     return df
 
