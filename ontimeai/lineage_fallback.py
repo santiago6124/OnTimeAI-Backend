@@ -45,7 +45,15 @@ def _agg(df: pd.DataFrame, group_cols: list[str], value_col: str,
          min_count: int = MIN_GROUP_COUNT) -> pd.Series:
     g = df.groupby(group_cols, observed=True)[value_col].agg(["mean", "count"])
     keep = g[g["count"] >= min_count]
-    return keep["mean"].astype(float)
+    result = keep["mean"].astype(float)
+    # Convert CategoricalIndex levels to plain object so MultiIndex.reindex works.
+    if isinstance(result.index, pd.MultiIndex):
+        result.index = result.index.set_levels(
+            [lvl.astype(object) for lvl in result.index.levels]
+        )
+    elif hasattr(result.index, "categories"):
+        result.index = result.index.astype(object)
+    return result
 
 
 def build_lookups(master_df: pd.DataFrame) -> dict[str, Any]:
@@ -105,6 +113,21 @@ def _series_or_int(out: pd.DataFrame, col: str, default: int = 0) -> pd.Series:
     return s
 
 
+def _decat(lookup: pd.Series) -> pd.Series:
+    """Convert any CategoricalIndex levels to plain object so reindex works."""
+    if isinstance(lookup.index, pd.MultiIndex):
+        new_levels = [
+            lvl.astype(object) if hasattr(lvl, "categories") else lvl
+            for lvl in lookup.index.levels
+        ]
+        lookup = lookup.copy()
+        lookup.index = lookup.index.set_levels(new_levels)
+    elif hasattr(lookup.index, "categories"):
+        lookup = lookup.copy()
+        lookup.index = lookup.index.astype(object)
+    return lookup
+
+
 def _hierarchical_lookup(
     layers: list[tuple[list[pd.Series], pd.Series | None]],
     target_index: pd.Index,
@@ -117,10 +140,10 @@ def _hierarchical_lookup(
     global_value where every layer misses).
     """
     imputed = pd.Series(global_value, index=target_index, dtype=float)
-    # Walk in order: least-specific first, then overlay more-specific layers.
     for key_arrays, lookup in layers:
         if lookup is None or lookup.empty:
             continue
+        lookup = _decat(lookup)
         idx = pd.MultiIndex.from_arrays(key_arrays)
         layer_vals = lookup.reindex(idx)
         layer_vals.index = target_index

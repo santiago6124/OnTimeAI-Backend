@@ -83,7 +83,11 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     meta = load_artifact(args.artifact)
-    df_raw = pd.read_csv(args.input, parse_dates=["FL_DATE"], low_memory=False)
+    if Path(args.input).suffix == ".parquet":
+        df_raw = pd.read_parquet(args.input)
+        df_raw["FL_DATE"] = pd.to_datetime(df_raw["FL_DATE"], errors="coerce")
+    else:
+        df_raw = pd.read_csv(args.input, parse_dates=["FL_DATE"], low_memory=False)
 
     fallback = load_lookups(args.fallback_lookup) if args.fallback_lookup.exists() else None
     if fallback is not None:

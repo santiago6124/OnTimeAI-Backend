@@ -24,6 +24,9 @@ dataset_maestro_ATL_2022-2025_BTS_IEM_ORIG_DEST.csv
 dataset_maestro_FULL_US_*.csv
 dataset_maestro_FULL_US_*.parquet
 
+# Large prediction outputs (>100 MB, OOT full-US runs)
+preds_2021_v*.csv
+
 # Training / tuning logs
 *.log
 

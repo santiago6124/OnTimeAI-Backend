@@ -30,7 +30,11 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     print(f"== {args.label} ==")
-    master = pd.read_csv(args.master, parse_dates=["FL_DATE"], low_memory=False)
+    if Path(args.master).suffix == ".parquet":
+        master = pd.read_parquet(args.master)
+        master["FL_DATE"] = pd.to_datetime(master["FL_DATE"], errors="coerce")
+    else:
+        master = pd.read_csv(args.master, parse_dates=["FL_DATE"], low_memory=False)
     preds = pd.read_csv(args.preds)
     if len(master) != len(preds):
         print(f"WARN: master rows ({len(master)}) != preds rows ({len(preds)}); reindexing by row order.")
