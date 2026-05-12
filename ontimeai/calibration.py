@@ -28,6 +28,20 @@ class Calibrator:
         return self.estimator.predict_proba(logits.reshape(-1, 1))[:, 1]
 
 
+@dataclass
+class StackedCalibrator:
+    """Two-stage calibrator: applies cal1 first, then cal2.
+
+    Used when refitting calibration on live data without discarding the
+    original calibration trained on the historical validation set.
+    """
+    cal1: Any
+    cal2: Any
+
+    def transform(self, proba: np.ndarray) -> np.ndarray:
+        return self.cal2.transform(self.cal1.transform(proba))
+
+
 def fit_calibrator(
     proba_val: np.ndarray,
     y_val: np.ndarray,
