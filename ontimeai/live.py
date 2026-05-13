@@ -645,6 +645,9 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
     # v7 features: BEARING_DEG + ERA5 wind at cruise altitude
     df = _add_v7_wind_features(df)
 
+    # v8 features: PageRank + GDP flag (both gracefully degrade if unavailable)
+    df = _add_v8_features(df)
+
     return df
 
 
@@ -732,6 +735,46 @@ def _add_v7_wind_features(df: pd.DataFrame) -> pd.DataFrame:
                 df[c] = _np.nan if "ERA5" in c or "BEARING" in c else 0
         if "ERA5_TAILWIND_FLAG" not in df.columns:
             df["ERA5_TAILWIND_FLAG"] = 0
+
+    return df
+
+
+_PAGERANK_PATH_LIVE = PROJECT_ROOT / "artifacts" / "airport_pagerank.json"
+_GDP_CLIENT = None
+
+
+def _add_v8_features(df: "pd.DataFrame") -> "pd.DataFrame":
+    """Add v8 features: ORIGIN_PAGERANK, DEST_PAGERANK, GDP_FLAG, GDP_DELAY_MIN.
+
+    All features degrade gracefully: if artifact/API is unavailable they
+    fill with 0/NaN so inference is never blocked.
+    NAS_RATE_2H is not computed live (no real-time NAS breakdown available);
+    GDP_FLAG from the FAA API is the live equivalent.
+    """
+    global _GDP_CLIENT
+    import warnings
+
+    try:
+        from feature_engineering_v7.v8_features import add_pagerank_features
+        df = add_pagerank_features(df, lookup_path=_PAGERANK_PATH_LIVE)
+    except Exception as e:
+        warnings.warn(f"v8 PageRank features failed: {e}")
+        if "ORIGIN_PAGERANK" not in df.columns:
+            df["ORIGIN_PAGERANK"] = 0.0
+        if "DEST_PAGERANK" not in df.columns:
+            df["DEST_PAGERANK"] = 0.0
+
+    try:
+        from feature_engineering_v7.gdp_scraper import GdpClient
+        if _GDP_CLIENT is None:
+            _GDP_CLIENT = GdpClient()
+        df = _GDP_CLIENT.add_gdp_features(df)
+    except Exception as e:
+        warnings.warn(f"v8 GDP features failed: {e}")
+        if "GDP_FLAG" not in df.columns:
+            df["GDP_FLAG"] = 0
+        if "GDP_DELAY_MIN" not in df.columns:
+            df["GDP_DELAY_MIN"] = 0.0
 
     return df
 

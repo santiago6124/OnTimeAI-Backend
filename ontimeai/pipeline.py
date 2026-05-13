@@ -71,6 +71,16 @@ def prepare_dataset(df_raw: pd.DataFrame, cfg: TrainConfig) -> tuple[pd.DataFram
     if cfg.use_absorb_score:
         df = add_absorb_score(df)
     df = drop_leaky_target_columns(df)
+
+    # v8 features: TAIL_DELAY_DECAY + airport PageRank (gracefully no-op if unavailable)
+    try:
+        from feature_engineering_v7.v8_features import add_tail_delay_decay, add_pagerank_features
+        from ontimeai.config import ARTIFACTS_DIR
+        df = add_tail_delay_decay(df)
+        df = add_pagerank_features(df, lookup_path=ARTIFACTS_DIR / "airport_pagerank.json")
+    except Exception:
+        pass
+
     df = normalize_weather_flags(df)
     if cfg.use_holiday_features:
         df = add_holiday_features(df)

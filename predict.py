@@ -28,6 +28,8 @@ from ontimeai.lineage import (
 from ontimeai.lineage_fallback import apply_lineage_fallback, load_lookups
 from ontimeai.model import load_artifact, predict_label, predict_proba
 
+_PAGERANK_PATH = Path(__file__).resolve().parent / "artifacts" / "airport_pagerank.json"
+
 
 def prepare_inference_frame(
     df_raw: pd.DataFrame,
@@ -54,6 +56,16 @@ def prepare_inference_frame(
 
     if fallback_lookup is not None:
         df = apply_lineage_fallback(df, fallback_lookup)
+
+    # v8 features — silently no-op if not in feature_cols
+    try:
+        from feature_engineering_v7.v8_features import add_tail_delay_decay, add_pagerank_features
+        if "TAIL_DELAY_DECAY" in feature_cols:
+            df = add_tail_delay_decay(df)
+        if "ORIGIN_PAGERANK" in feature_cols or "DEST_PAGERANK" in feature_cols:
+            df = add_pagerank_features(df, lookup_path=_PAGERANK_PATH)
+    except Exception:
+        pass
 
     df = normalize_weather_flags(df)
     df = add_holiday_features(df)
