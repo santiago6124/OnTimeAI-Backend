@@ -67,6 +67,15 @@ def prepare_inference_frame(
     except Exception:
         pass
 
+    # v9: AIRCRAFT_FAMILY
+    if "AIRCRAFT_FAMILY" in feature_cols:
+        try:
+            from feature_engineering_v7.aircraft_type import add_aircraft_family
+            _lookup_path = Path(__file__).resolve().parent / "artifacts" / "tail_to_aircraft_family.json"
+            df = add_aircraft_family(df, lookup_path=str(_lookup_path))
+        except Exception:
+            df["AIRCRAFT_FAMILY"] = "OTHER"
+
     df = normalize_weather_flags(df)
     df = add_holiday_features(df)
     df = add_cyclical_features(df)

@@ -51,8 +51,19 @@ class PipelineResult:
     calibrator: Calibrator | None = None
 
 
-def prepare_dataset(df_raw: pd.DataFrame, cfg: TrainConfig) -> tuple[pd.DataFrame, pd.Series]:
-    df = filter_valid_flights(df_raw)
+def prepare_dataset(
+    df_raw: pd.DataFrame,
+    cfg: TrainConfig,
+    *,
+    already_filtered: bool = False,
+) -> tuple[pd.DataFrame, pd.Series]:
+    # When already_filtered=True the caller loaded via load_master(valid_only=True),
+    # so cancelled/diverted/null-target rows were excluded at scan time. Skipping
+    # filter_valid_flights avoids an 8.5 GB copy of the full dataset.
+    if already_filtered:
+        df = df_raw
+    else:
+        df = filter_valid_flights(df_raw)
     y = build_target(df, cfg.target, cfg.delay_threshold_min)
     # Lineage features must run BEFORE drop_leaky because they consume ARR_DELAY
     # + EVENT_*_UTC. They emit only leakage-safe summary columns.
@@ -81,6 +92,17 @@ def prepare_dataset(df_raw: pd.DataFrame, cfg: TrainConfig) -> tuple[pd.DataFram
     except Exception:
         pass
 
+    # v9: AIRCRAFT_FAMILY — replaces TAIL_NUM, stable ICAO type family per aircraft
+    try:
+        from feature_engineering_v7.aircraft_type import add_aircraft_family
+        from ontimeai.config import ARTIFACTS_DIR
+        df = add_aircraft_family(
+            df,
+            lookup_path=str(ARTIFACTS_DIR / "tail_to_aircraft_family.json"),
+        )
+    except Exception:
+        df["AIRCRAFT_FAMILY"] = "OTHER"
+
     df = normalize_weather_flags(df)
     if cfg.use_holiday_features:
         df = add_holiday_features(df)
@@ -97,23 +119,36 @@ def run_training(
     df_raw: pd.DataFrame | None = None,
     save_artifacts: bool = True,
 ) -> PipelineResult:
+    already_filtered = False
     if df_raw is None:
-        df_raw = load_master()
+        # Load with scan-time filter so cancelled/diverted/null-target rows are
+        # never held in memory alongside the filtered copy.
+        df_raw = load_master(valid_only=True)
+        already_filtered = True
 
-    df_ready, _ = prepare_dataset(df_raw, cfg)
+    df_ready, _ = prepare_dataset(df_raw, cfg, already_filtered=already_filtered)
+    # df_ready IS df_raw when already_filtered=True (same object, in-place ops).
+    # Remove the df_raw name so Python can GC the object once df_ready is also gone.
+    del df_raw
+
     train_idx, val_idx, test_idx = temporal_split(
         df_ready, train_frac=cfg.train_frac, val_frac=cfg.val_frac
     )
 
-    X_full, cat_cols, cat_mapping = build_feature_matrix(df_ready)
+    # Extract y before build_feature_matrix drops TARGET_COL from df_ready.
     y_full = df_ready[TARGET_COL].to_numpy()
+    X_full, cat_cols, cat_mapping = build_feature_matrix(df_ready)
+    # df_ready no longer needed — X_full contains all feature columns.
+    del df_ready
 
+    feature_col_names = list(X_full.columns)
     X_train = X_full.iloc[train_idx]
     X_val = X_full.iloc[val_idx]
     X_test = X_full.iloc[test_idx]
     y_train = y_full[train_idx]
     y_val = y_full[val_idx]
     y_test = y_full[test_idx]
+    del X_full
 
     booster = train_booster(X_train, y_train, X_val, y_val, cat_cols, cfg)
 
@@ -153,7 +188,7 @@ def run_training(
         "val": val_m,
         "test": test_m,
         "confusion_test": test_cm.to_dict(),
-        "feature_cols": list(X_full.columns),
+        "feature_cols": feature_col_names,
     }
 
     artifact_dir = None
@@ -161,7 +196,7 @@ def run_training(
         artifact_dir = save_artifact(
             booster,
             threshold=threshold,
-            feature_cols=list(X_full.columns),
+            feature_cols=feature_col_names,
             cat_cols=cat_cols,
             cat_mapping=cat_mapping,
             target=cfg.target,
@@ -173,7 +208,7 @@ def run_training(
     return PipelineResult(
         booster=booster,
         threshold=threshold,
-        feature_cols=list(X_full.columns),
+        feature_cols=feature_col_names,
         cat_cols=cat_cols,
         cat_mapping=cat_mapping,
         metrics=metrics,

@@ -30,87 +30,102 @@ DELAY_THRESHOLD_MIN = 15.0
 def add_tail_lineage_features(df: pd.DataFrame) -> pd.DataFrame:
     """Compute prev_arr_delay_tail / prev_turnaround / tail_flights_today_prior.
 
-    Groups by TAIL_NUM only (across days) and uses a 24h UTC window to identify
-    the prior leg. The previous implementation grouped by (TAIL_NUM, FL_DATE)
-    where FL_DATE is local-tz, which silently dropped overnight rotations
-    (target's local date != prior's local date when crossing midnight at any
-    timezone). With ATL EDT vs e.g. LAX PDT, even within-tz rotations could
-    miss when scheduled_off straddled midnight.
-
-    The 24h window keeps the original anti-leakage intent (don't pull stale
-    7-day-old "priors") while correctly capturing every truly-recent rotation.
+    Memory-efficient implementation: works entirely with numpy index arrays
+    instead of sorting the full DataFrame. Peak overhead is ~1-2 GB (index
+    arrays + per-group output buffers) vs ~9 GB for a full DataFrame sort.
     """
     required = {"TAIL_NUM", "EVENT_ORIGIN_UTC", "EVENT_DEST_UTC", ARR_DELAY_COL}
     if not required.issubset(df.columns):
         return df
 
-    out = df.copy()
-    out["_orig_pos"] = np.arange(len(out))
+    n = len(df)
 
-    tail_str = out["TAIL_NUM"].astype("string").fillna("__nan__")
-    cur_event_origin = pd.to_datetime(out["EVENT_ORIGIN_UTC"], errors="coerce")
-    event_dest = pd.to_datetime(out["EVENT_DEST_UTC"], errors="coerce")
-    arr_delay = pd.to_numeric(out[ARR_DELAY_COL], errors="coerce")
+    # Extract only the needed columns as numpy arrays — cheap, no DataFrame copy.
+    tail_arr  = df["TAIL_NUM"].astype("string").fillna("__nan__").to_numpy()
+    t_orig    = pd.to_datetime(df["EVENT_ORIGIN_UTC"], errors="coerce").astype("datetime64[ns]").to_numpy()
+    t_dest    = pd.to_datetime(df["EVENT_DEST_UTC"],   errors="coerce").astype("datetime64[ns]").to_numpy()
+    delay_arr = pd.to_numeric(df[ARR_DELAY_COL], errors="coerce").to_numpy(dtype="float32")
 
-    # Use UTC date for the "today" group, not local FL_DATE — this is part of the bug-fix.
-    utc_date = cur_event_origin.dt.strftime("%Y-%m-%d").fillna("")
-    out["_tail_only_key"] = tail_str
-    out["_tail_utcdate_key"] = (tail_str + "|" + utc_date).astype("string")
+    # Sort by (tail_code, departure time) — argsort only, no DataFrame copy.
+    tail_codes  = pd.Categorical(tail_arr).codes.astype(np.int32)
+    sort_order  = np.lexsort([t_orig, tail_codes])   # primary: tail, secondary: time
+    inv_order   = np.empty(n, dtype=np.int32)
+    inv_order[sort_order] = np.arange(n, dtype=np.int32)
 
-    out = out.sort_values(["_tail_only_key", "EVENT_ORIGIN_UTC"], kind="stable").reset_index(drop=True)
+    # Sorted arrays (one copy per column, ~220 MB each — much less than full DF sort)
+    tc_s   = tail_codes[sort_order]
+    orig_s = t_orig[sort_order]
+    dest_s = t_dest[sort_order]
+    dly_s  = delay_arr[sort_order]
 
-    # Re-extract after sort
-    cur_event_origin = pd.to_datetime(out["EVENT_ORIGIN_UTC"], errors="coerce")
-    event_dest = pd.to_datetime(out["EVENT_DEST_UTC"], errors="coerce")
-    arr_delay = pd.to_numeric(out[ARR_DELAY_COL], errors="coerce")
-    has_arr = arr_delay.notna()
+    # Group boundaries by tail code
+    unique_tc    = np.unique(tc_s)
+    boundaries   = np.searchsorted(tc_s, np.append(unique_tc, unique_tc[-1] + 1))
 
-    # ── KEY FIX: ffill then shift(1) within each tail group ───────────────────
-    # Inference frames mix history rows (ARR_DELAY known) with target rows (ARR_DELAY=NaN).
-    # A naive shift(1) would propagate the NaN of an immediately-prior target instead of
-    # finding the most recent SETTLED prior. We fix this by ffill-ing the valid-only
-    # triplet (arr_delay, event_dest, event_origin) within each tail before shifting.
-    out["_v_delay"] = arr_delay.where(has_arr)
-    out["_v_dest"] = event_dest.where(has_arr)
-    out["_v_orig"] = cur_event_origin.where(has_arr)
+    # Output buffers in sorted order
+    prev_delay_s     = np.full(n, np.nan, dtype="float32")
+    prev_dest_s      = np.full(n, np.datetime64("NaT", "ns"))
+    prev_orig_s      = np.full(n, np.datetime64("NaT", "ns"))
+    today_count_s    = np.zeros(n, dtype="int16")
 
-    grp_tail = out.groupby("_tail_only_key", sort=False)
-    # Use transform with ffill+shift inside the lambda so both ops stay within each
-    # group (a bare .ffill().shift(1) on a SeriesGroupBy returns a flat Series whose
-    # subsequent .shift(1) crosses group boundaries, contaminating different tails).
-    def _ffill_shift(s: pd.Series) -> pd.Series:
-        return s.ffill().shift(1)
+    NaT = np.datetime64("NaT", "ns")
 
-    prev_arr_delay = grp_tail["_v_delay"].transform(_ffill_shift)
-    prev_event_dest = pd.to_datetime(
-        grp_tail["_v_dest"].transform(_ffill_shift), errors="coerce",
-    )
-    prev_event_origin = pd.to_datetime(
-        grp_tail["_v_orig"].transform(_ffill_shift), errors="coerce",
-    )
+    for i, g in enumerate(unique_tc):
+        b, e = int(boundaries[i]), int(boundaries[i + 1])
+        if e - b < 2:
+            continue
 
-    prev_actual_arr = prev_event_dest + pd.to_timedelta(prev_arr_delay, unit="m")
-    observable = (prev_actual_arr <= cur_event_origin).fillna(False)
-    # Anti-stale-prior guard: prev leg must be within 24h.
-    delta_hours = (cur_event_origin - prev_event_origin).dt.total_seconds() / 3600.0
-    within_24h = (delta_hours > 0) & (delta_hours < 24)
-    valid = observable & within_24h.fillna(False)
+        d = dly_s[b:e]
+        o = orig_s[b:e]
+        de = dest_s[b:e]
+        m = e - b
 
-    scheduled_turnaround_min = (cur_event_origin - prev_event_dest).dt.total_seconds() / 60.0
+        # For each position i, find the last settled (non-NaN delay) position < i.
+        # settled_pos[j] = the position within the group of the j-th settled flight.
+        settled_pos = np.where(np.isfinite(d))[0]  # positions where delay is known
+        if len(settled_pos) > 0:
+            # For each position i (1..m-1), how many settled flights are before i?
+            # = searchsorted(settled_pos, i) gives count of settled_pos < i
+            query_idx = np.arange(1, m)
+            cnt_before = np.searchsorted(settled_pos, query_idx, side="left")
+            has_prior  = cnt_before > 0
+            prior_pos  = settled_pos[np.maximum(cnt_before - 1, 0)]
 
-    out["prev_arr_delay_tail"] = np.where(valid, prev_arr_delay, np.nan)
-    out["prev_turnaround_tail_min"] = np.where(valid, scheduled_turnaround_min, np.nan)
+            out_slice = slice(b + 1, e)
+            prev_delay_s[out_slice] = np.where(has_prior, d[prior_pos], np.nan)
+            prev_dest_s[out_slice]  = np.where(has_prior, de[prior_pos], NaT)
+            prev_orig_s[out_slice]  = np.where(has_prior, o[prior_pos],  NaT)
 
-    # ── tail_flights_today_prior: count per (TAIL, UTC-date) ──────────────────
-    out["tail_flights_today_prior"] = (
-        out.groupby("_tail_utcdate_key", sort=False).cumcount().astype(np.int16)
-    )
+        # tail_flights_today_prior: cumcount per UTC date within this group.
+        # datetime64[D] is backed by int64 — must view as int64, not int32.
+        utc_days = o.astype("datetime64[D]").view(np.int64)
+        for day_val in np.unique(utc_days):
+            mask = utc_days == day_val
+            positions_in_day = np.where(mask)[0]
+            today_count_s[b + positions_in_day] = np.arange(len(positions_in_day), dtype="int16")
 
-    out = out.sort_values("_orig_pos").reset_index(drop=True)
-    return out.drop(columns=[
-        "_orig_pos", "_tail_only_key", "_tail_utcdate_key",
-        "_v_delay", "_v_dest", "_v_orig",
-    ])
+    # Validity checks (done in sorted-array space)
+    delay_td    = (prev_delay_s * 60 * 1e9).astype("int64")  # minutes → ns
+    prev_arr_ns = prev_dest_s.view("int64") + delay_td
+    nat_val     = np.datetime64("NaT", "ns").view("int64")
+    not_nat     = prev_dest_s.view("int64") != nat_val
+
+    observable  = not_nat & (prev_arr_ns <= orig_s.view("int64"))
+    delta_ns    = orig_s.view("int64") - prev_orig_s.view("int64")
+    delta_h     = delta_ns / 3_600_000_000_000.0
+    within_24h  = (delta_h > 0) & (delta_h < 24)
+    valid       = observable & within_24h
+
+    turnaround_s = (orig_s.view("int64") - prev_dest_s.view("int64")) / 60_000_000_000.0
+
+    prev_delay_out    = np.where(valid, prev_delay_s,  np.nan)
+    prev_turn_out     = np.where(valid, turnaround_s,  np.nan)
+
+    # Map back to original DataFrame order and write directly (no copy)
+    df["prev_arr_delay_tail"]      = prev_delay_out[inv_order].astype("float32")
+    df["prev_turnaround_tail_min"] = prev_turn_out[inv_order].astype("float32")
+    df["tail_flights_today_prior"] = today_count_s[inv_order].astype(np.int16)
+    return df
 
 
 def _daily_rate_lag(
@@ -118,7 +133,7 @@ def _daily_rate_lag(
 ) -> pd.DataFrame:
     if key_col not in df.columns or "FL_DATE" not in df.columns or ARR_DELAY_COL not in df.columns:
         return df
-    out = df.copy()
+    out = df  # in-place: only adds one new column, never modifies existing ones
 
     date_day = pd.to_datetime(out["FL_DATE"], errors="coerce").dt.floor("D")
     key_str = out[key_col].astype("string")
@@ -172,7 +187,7 @@ def add_group_rolling_rate(
     if not required.issubset(df.columns):
         return df
 
-    out = df.copy()
+    out = df  # in-place: only adds one new column, never modifies existing ones
     n = len(out)
 
     arr_delay = pd.to_numeric(out[ARR_DELAY_COL], errors="coerce").to_numpy()

@@ -66,7 +66,7 @@ def build_target(df: pd.DataFrame, target: str, threshold_min: float) -> pd.Seri
 
 
 def add_cyclical_features(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+    out = df
     mins = pd.to_numeric(out["CRS_DEP_MIN"], errors="coerce").astype(float)
     out["dep_hour_sin"] = np.sin(2 * np.pi * mins / 1440.0)
     out["dep_hour_cos"] = np.cos(2 * np.pi * mins / 1440.0)
@@ -91,8 +91,7 @@ def _window_counts_per_group(mins: np.ndarray, window: float) -> np.ndarray:
 
 
 def add_congestion_features(df: pd.DataFrame, window_min: int = 30) -> pd.DataFrame:
-    original_index = df.index
-    out = df.reset_index(drop=True).copy()
+    out = df
     date_key = pd.to_datetime(out["FL_DATE"]).dt.strftime("%Y-%m-%d").astype(str)
     mins_all = pd.to_numeric(out["CRS_DEP_MIN"], errors="coerce").fillna(-1.0).to_numpy(dtype=float)
 
@@ -100,6 +99,8 @@ def add_congestion_features(df: pd.DataFrame, window_min: int = 30) -> pd.DataFr
         ("ORIGIN", "congestion_orig_window"),
         ("DEST", "congestion_dest_window"),
     ):
+        # grp_series is built from a fresh numpy array so groupby.indices returns
+        # 0-based positions that align with mins_all and counts directly.
         grp_series = pd.Series((date_key + "|" + out[airport_col].astype(str)).to_numpy())
         counts = np.zeros(len(out), dtype=np.int32)
         for pos in grp_series.groupby(grp_series).indices.values():
@@ -107,7 +108,6 @@ def add_congestion_features(df: pd.DataFrame, window_min: int = 30) -> pd.DataFr
             counts[pos] = _window_counts_per_group(mins_all[pos], float(window_min))
         out[out_col] = counts
 
-    out.index = original_index
     return out
 
 
@@ -123,7 +123,7 @@ WEATHER_FLAGS: tuple[str, ...] = ("PRECIP_FLAG", "LOW_VIS_FLAG", "STRONG_WIND_FL
 
 
 def normalize_weather_flags(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+    out = df
     for prefix in ("ORIG", "DEST"):
         for flag in WEATHER_FLAGS:
             col = f"{prefix}_WX_{flag}"
@@ -133,7 +133,7 @@ def normalize_weather_flags(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_weather_interactions(df: pd.DataFrame) -> pd.DataFrame:
-    out = df.copy()
+    out = df
     mapping = (
         ("PRECIP_FLAG", "wx_both_precip"),
         ("LOW_VIS_FLAG", "wx_both_low_vis"),
@@ -156,7 +156,7 @@ def add_holiday_features(df: pd.DataFrame) -> pd.DataFrame:
       - is_thanksgiving_window   (Wed before → Sun after Thanksgiving)
       - is_summer_peak           (Jul-4 week + Labor Day weekend)
     """
-    out = df.copy()
+    out = df
     fl_dates = pd.to_datetime(out.get("FL_DATE"), errors="coerce")
     has_date = fl_dates.notna()
 
@@ -259,7 +259,7 @@ def add_absorb_score(
     if not required.issubset(df.columns):
         return df
 
-    out = df.copy()
+    out = df
     n = len(out)
 
     arr_delay_raw = pd.to_numeric(out[ARR_DELAY_COL], errors="coerce").to_numpy()
@@ -336,7 +336,7 @@ def build_feature_matrix(
     drop_cols: tuple[str, ...] = DROP_COLS,
 ) -> tuple[pd.DataFrame, list[str], dict[str, list]]:
     to_drop = [c for c in (*drop_cols, target_col) if c in df.columns]
-    X = df.drop(columns=to_drop).copy()
+    X = df.drop(columns=to_drop)  # drop() already returns a new DataFrame; .copy() was redundant
 
     for c in X.columns:
         if X[c].dtype == bool:

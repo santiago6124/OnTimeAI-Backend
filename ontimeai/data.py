@@ -84,14 +84,72 @@ def optimize_dtypes(df: pd.DataFrame, *, verbose: bool = True, in_place: bool = 
     return out
 
 
-def load_master(path: Path | str = DATA_PATH, *, optimize: bool = True) -> pd.DataFrame:
+def load_master(
+    path: Path | str = DATA_PATH,
+    *,
+    optimize: bool = True,
+    valid_only: bool = False,
+) -> pd.DataFrame:
+    """Load the master dataset.
+
+    valid_only=True applies CANCELLED/DIVERTED/ARR_DELAY filters at parquet
+    scan time so we never hold the full dataset + a filtered copy simultaneously
+    (eliminates an ~8.5 GB temporary peak during training).
+    """
     path = Path(path)
     if path.suffix.lower() == ".parquet":
-        df = pd.read_parquet(path)
+        # Cast float64 → float32 and int64 → int32 during scan so we never
+        # hold the full 22 GB float64 dataset in memory. Peak RAM drops from
+        # ~22 GB to ~10 GB on the 27.5M-row US master parquet.
+        try:
+            import pyarrow.dataset as ds
+            import pyarrow as pa
+
+            dataset = ds.dataset(str(path), format="parquet")
+            schema = dataset.schema
+            col_exprs: dict = {}
+            for field in schema:
+                nm = field.name
+                if pa.types.is_floating(field.type):
+                    col_exprs[nm] = ds.field(nm).cast(pa.float32())
+                elif pa.types.is_large_string(field.type) or pa.types.is_string(field.type):
+                    col_exprs[nm] = ds.field(nm)
+                elif pa.types.is_integer(field.type) and nm not in ("YEAR",):
+                    col_exprs[nm] = ds.field(nm).cast(pa.int32())
+                else:
+                    col_exprs[nm] = ds.field(nm)
+
+            if valid_only:
+                # Filter at scan time: never load cancelled/diverted rows or rows
+                # with no ARR_DELAY. Eliminates the filter_valid_flights copy peak.
+                schema_names = {f.name for f in schema}
+                filter_parts = []
+                if "CANCELLED" in schema_names:
+                    filter_parts.append(ds.field("CANCELLED") != 1)
+                if "DIVERTED" in schema_names:
+                    filter_parts.append(ds.field("DIVERTED") != 1)
+                if ARR_DELAY_COL in schema_names:
+                    filter_parts.append(ds.field(ARR_DELAY_COL).is_valid())
+                scan_filter = filter_parts[0]
+                for part in filter_parts[1:]:
+                    scan_filter = scan_filter & part
+                table = dataset.to_table(columns=col_exprs, filter=scan_filter)
+            else:
+                table = dataset.to_table(columns=col_exprs)
+
+            df = table.to_pandas()
+        except Exception:
+            # Fallback: standard read + post-hoc optimization
+            df = pd.read_parquet(path)
+            if valid_only:
+                df = filter_valid_flights(df)
+
         if "FL_DATE" in df.columns:
             df["FL_DATE"] = pd.to_datetime(df["FL_DATE"], errors="coerce")
     else:
         df = pd.read_csv(path, parse_dates=["FL_DATE"], low_memory=False)
+        if valid_only:
+            df = filter_valid_flights(df)
 
     if optimize:
         df = optimize_dtypes(df)

@@ -65,11 +65,12 @@ DROP_COLS: tuple[str, ...] = (
     "OP_CARRIER_FL_NUM",
     "CRS_DEP_TIME",
     "CRS_ARR_TIME",
+    "TAIL_NUM",  # replaced by AIRCRAFT_FAMILY (stable across years, no tail-specific drift)
 )
 
 CATEGORICAL_COLS: tuple[str, ...] = (
     "OP_CARRIER",
-    "TAIL_NUM",
+    "AIRCRAFT_FAMILY",  # v9: replaces TAIL_NUM — 13 stable ICAO type families
     "ORIGIN",
     "DEST",
     "PAR_AIRPORT",

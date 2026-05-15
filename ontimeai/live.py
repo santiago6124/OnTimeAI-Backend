@@ -648,6 +648,9 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
     # v8 features: PageRank + GDP flag (both gracefully degrade if unavailable)
     df = _add_v8_features(df)
 
+    # v9: AIRCRAFT_FAMILY — use aircraft_type from FlightAware (already ICAO typecode)
+    df = _add_aircraft_family(df)
+
     return df
 
 
@@ -741,6 +744,51 @@ def _add_v7_wind_features(df: pd.DataFrame) -> pd.DataFrame:
 
 _PAGERANK_PATH_LIVE = PROJECT_ROOT / "artifacts" / "airport_pagerank.json"
 _GDP_CLIENT = None
+
+
+_AIRCRAFT_FAMILY_LOOKUP: dict | None = None
+_AIRCRAFT_FAMILY_LOOKUP_PATH = PROJECT_ROOT / "artifacts" / "tail_to_aircraft_family.json"
+
+
+def _add_aircraft_family(df: pd.DataFrame) -> pd.DataFrame:
+    """Add AIRCRAFT_FAMILY from aircraft_type (FlightAware ICAO typecode) or TAIL_NUM lookup.
+
+    Priority:
+      1. aircraft_type column (already an ICAO typecode from FlightAware)
+      2. TAIL_NUM → OpenSky lookup JSON
+      3. Carrier-based fallback
+      4. "OTHER"
+    """
+    global _AIRCRAFT_FAMILY_LOOKUP
+    import warnings
+    try:
+        from feature_engineering_v7.aircraft_type import _FAMILY_MAP, _CARRIER_FALLBACK
+        import json
+
+        # Option 1: aircraft_type column from flights table (ICAO typecode)
+        if "aircraft_type" in df.columns:
+            mapped = df["aircraft_type"].str.strip().str.upper().map(_FAMILY_MAP)
+        else:
+            mapped = pd.Series(pd.NA, index=df.index)
+
+        # Option 2: TAIL_NUM lookup for rows where aircraft_type was missing
+        missing = mapped.isna()
+        if missing.any() and "TAIL_NUM" in df.columns:
+            if _AIRCRAFT_FAMILY_LOOKUP is None and _AIRCRAFT_FAMILY_LOOKUP_PATH.exists():
+                _AIRCRAFT_FAMILY_LOOKUP = json.loads(_AIRCRAFT_FAMILY_LOOKUP_PATH.read_text())
+            if _AIRCRAFT_FAMILY_LOOKUP:
+                mapped[missing] = df.loc[missing, "TAIL_NUM"].map(_AIRCRAFT_FAMILY_LOOKUP)
+
+        # Option 3: carrier fallback
+        still_missing = mapped.isna()
+        if still_missing.any() and "OP_CARRIER" in df.columns:
+            mapped[still_missing] = df.loc[still_missing, "OP_CARRIER"].map(_CARRIER_FALLBACK)
+
+        df["AIRCRAFT_FAMILY"] = mapped.fillna("OTHER").astype("category")
+    except Exception as e:
+        warnings.warn(f"AIRCRAFT_FAMILY feature failed: {e}")
+        df["AIRCRAFT_FAMILY"] = "OTHER"
+    return df
 
 
 def _add_v8_features(df: "pd.DataFrame") -> "pd.DataFrame":
