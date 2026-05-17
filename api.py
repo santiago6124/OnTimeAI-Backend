@@ -352,6 +352,87 @@ def metrics_model():
     }
 
 
+@app.get("/weather/{airport_code}")
+def weather(airport_code: str):
+    """Latest METAR observation for an airport from the stored weather_obs table."""
+    con = get_db()
+    try:
+        row = con.execute("""
+            SELECT station, valid_utc, tmpc, dwpc, relh, drct, sknt, alti,
+                   p01m, vsby, gust, wxcodes,
+                   wx_precip_flag, wx_low_vis_flag, wx_strong_wind_flag
+            FROM weather_obs
+            WHERE station = ?
+            ORDER BY valid_utc DESC
+            LIMIT 1
+        """, (airport_code.upper(),)).fetchone()
+        if row is None:
+            raise HTTPException(status_code=404, detail=f"No weather data for {airport_code}")
+        return {
+            "airport_code":      row["station"],
+            "valid_utc":         row["valid_utc"],
+            "temperature_c":     row["tmpc"],
+            "dewpoint_c":        row["dwpc"],
+            "humidity_pct":      row["relh"],
+            "wind_direction":    row["drct"],
+            "wind_knots":        row["sknt"],
+            "gust_knots":        row["gust"],
+            "altimeter_inhg":    row["alti"],
+            "precip_mm":         row["p01m"],
+            "visibility_miles":  row["vsby"],
+            "wx_codes":          row["wxcodes"],
+            "precip_flag":       bool(row["wx_precip_flag"]),
+            "low_visibility":    bool(row["wx_low_vis_flag"]),
+            "strong_wind":       bool(row["wx_strong_wind_flag"]),
+        }
+    finally:
+        con.close()
+
+
+@app.get("/operations/{airport_code}")
+def operations(airport_code: str):
+    """Today's operational delay stats for flights departing or arriving at an airport."""
+    con = get_db()
+    try:
+        today = today_utc()
+        rows = con.execute("""
+            SELECT f.origin, f.dest, p.proba_delay, p.predicted_delay
+            FROM flights f
+            JOIN (
+                SELECT fa_flight_id, proba_delay, predicted_delay,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY fa_flight_id ORDER BY predicted_at_utc DESC
+                       ) AS rn
+                FROM predictions
+            ) p ON p.fa_flight_id = f.fa_flight_id AND p.rn = 1
+            WHERE f.scheduled_out_utc LIKE ? || '%'
+              AND f.cancelled = 0
+              AND (f.origin = ? OR f.dest = ?)
+        """, (today, airport_code.upper(), airport_code.upper())).fetchall()
+
+        if not rows:
+            raise HTTPException(status_code=404, detail=f"No flight data for {airport_code} today")
+
+        probas = [float(r["proba_delay"]) for r in rows]
+        departures = [r for r in rows if r["origin"] == airport_code.upper()]
+        high_risk  = sum(1 for p in probas if p >= 0.35)
+        total      = len(rows)
+
+        return {
+            "airport_code":          airport_code.upper(),
+            "date_utc":              today,
+            "total_flights":         total,
+            "departures":            len(departures),
+            "arrivals":              total - len(departures),
+            "high_risk_count":       high_risk,
+            "delay_rate":            round(sum(r["predicted_delay"] for r in rows) / total, 4),
+            "avg_delay_probability": round(float(np.mean(probas)), 4),
+            "congestion_level":      "high" if total > 80 else "medium" if total > 40 else "low",
+        }
+    finally:
+        con.close()
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
