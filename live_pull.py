@@ -38,6 +38,9 @@ def main() -> int:
                    help="Pull scheduled departures for the next N hours")
     p.add_argument("--actuals-hours", type=int, default=4,
                    help="Pull arrivals from the past N hours to settle actuals")
+    p.add_argument("--actuals-offset-hours", type=int, default=0,
+                   help="Shift the actuals window back by N hours (e.g. --actuals-hours 3 "
+                        "--actuals-offset-hours 6 covers the window 9h..6h ago)")
     p.add_argument("--max-pages", type=int, default=2,
                    help="Max client-side cursor pages per endpoint (1 page ≈ 15 flights)")
     p.add_argument("--skip-arrivals-sched", action="store_true",
@@ -70,8 +73,8 @@ def main() -> int:
     now = datetime.now(timezone.utc)
     sched_start = now
     sched_end = now + timedelta(hours=args.schedule_hours)
-    arr_start = now - timedelta(hours=args.actuals_hours)
-    arr_end = now
+    arr_end   = now - timedelta(hours=args.actuals_offset_hours)
+    arr_start = arr_end - timedelta(hours=args.actuals_hours)
 
     print(f"Tick {now.isoformat()}")
     print(f"  schedule window: {_iso(sched_start)} → {_iso(sched_end)}")

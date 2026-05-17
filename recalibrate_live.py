@@ -1,21 +1,18 @@
-"""Re-calibra el modelo v6_full con las predicciones live ya asentadas.
+"""Re-calibra un modelo con las predicciones live ya asentadas.
 
-El calibrador original de v6_full fue entrenado sobre el set histórico 2022-2025.
-En condiciones live (mayo 2026) hay drift sistemático:
-  - Bin 0 (prob 0.0-0.1): modelo dice 5.7%  → observado 18.2%
-  - Bin 1 (prob 0.1-0.2): modelo dice 14.5% → observado 28.4%
-  - Bin 6 (prob 0.6-0.7): modelo dice 65%   → observado 21%
-
-Este script:
-  1. Lee 2,847 predicciones + actuals de live_data.db
-  2. Ajusta un isotonic calibrador sobre esos datos (stacked sobre el original)
-  3. Guarda artifacts/4year_v6_recal/ con calibrador compuesto + threshold actualizado
-  4. Imprime ECE y Brier antes/después
-
-Uso:
+Uso habitual:
+    # v9 recalibration (default):
     python3 recalibrate_live.py
-    python3 recalibrate_live.py --min-n 300 --out artifacts/4year_v6_recal
     python3 recalibrate_live.py --dry-run   # solo muestra métricas, no guarda
+
+    # v6_full → v6_recal (uso original):
+    python3 recalibrate_live.py \\
+        --source-artifact artifacts/4year_v6_full \\
+        --out artifacts/4year_v6_recal \\
+        --since 2000-01-01
+
+El script ajusta un isotonic calibrador de segunda capa sobre las probabilidades
+ya calibradas que se almacenan en live_data.db, produciendo un StackedCalibrator.
 """
 from __future__ import annotations
 
@@ -72,8 +69,11 @@ def calibration_table(y_true, proba, n_bins: int = 10) -> pd.DataFrame:
 
 def main() -> int:
     p = argparse.ArgumentParser()
-    p.add_argument("--out", default=str(ARTIFACTS_DIR / "4year_v6_recal"))
-    p.add_argument("--source-artifact", default=str(ARTIFACTS_DIR / "4year_v6_full"))
+    p.add_argument("--out", default=str(ARTIFACTS_DIR / "4year_v9_recal"))
+    p.add_argument("--source-artifact", default=str(ARTIFACTS_DIR / "4year_v9"))
+    p.add_argument("--since", default="2026-05-15 01:43",
+                   help="Only use predictions at or after this UTC timestamp (ISO format). "
+                        "Default: v9 deploy time. Use '2000-01-01' for all predictions.")
     p.add_argument("--min-n", type=int, default=200,
                    help="Número mínimo de predicciones asentadas para recalibrar")
     p.add_argument("--delay-threshold-min", type=float, default=15.0,
@@ -95,17 +95,17 @@ def main() -> int:
         f"AND p.threshold_strategy = '{args.strategy_filter}'"
         if args.strategy_filter else ""
     )
+    since_clause = f"AND p.predicted_at_utc >= '{args.since}'"
     df = pd.read_sql_query(
         f"""
         SELECT p.fa_flight_id, p.proba_delay, p.predicted_delay,
-               a.arr_delay_min, a.cancelled, a.diverted,
-               f.origin, f.dest, f.op_carrier, f.fl_date
+               a.arr_delay_min, a.cancelled, a.diverted
         FROM predictions p
-        JOIN actuals   a ON a.fa_flight_id = p.fa_flight_id
-        JOIN flights   f ON f.fa_flight_id = p.fa_flight_id
+        JOIN actuals a ON a.fa_flight_id = p.fa_flight_id
         WHERE a.cancelled = 0
           AND a.diverted  = 0
           AND a.arr_delay_min IS NOT NULL
+          {since_clause}
           {strategy_clause}
         """,
         conn,
@@ -141,9 +141,11 @@ def main() -> int:
     print(cal_before.to_string(index=False))
 
     # ---- 3. ajustar calibrador sobre datos live ----
-    # Los valores en DB ya son post-calibración del v6_full.
-    # Ajustamos una segunda capa isotónica sobre esos valores → calibración apilada.
-    live_cal = fit_calibrator(y_proba_live, y_true, method="isotonic")
+    # Usamos sigmoid (Platt scaling) en lugar de isotonic: solo 2 parámetros,
+    # no colapsa rankings ni destruye AUC con muestras limitadas (<10k).
+    # Isotonic puede overfittear con pocas muestras mapeando distintos scores
+    # al mismo valor, perdiendo el orden relativo entre vuelos.
+    live_cal = fit_calibrator(y_proba_live, y_true, method="sigmoid")
     y_proba_recal = live_cal.transform(y_proba_live)
 
     # ---- 4. métricas DESPUÉS ----
@@ -160,15 +162,8 @@ def main() -> int:
     print(cal_after.to_string(index=False))
 
     # ---- 5. nuevo threshold ----
-    # Isotonic regression produce salidas discretas (función escalón): puede haber
-    # muchas predicciones con exactamente el mismo valor, lo que rompe el percentil
-    # simple. Buscamos el threshold mínimo tal que pos_rate sea <= target_pos_rate.
-    sorted_unique = np.sort(np.unique(y_proba_recal))[::-1]
-    new_threshold = float(sorted_unique[-1])  # fallback: mínimo valor
-    for t in sorted_unique:
-        if (y_proba_recal >= t).mean() <= args.target_pos_rate:
-            new_threshold = float(t)
-            break
+    # Threshold at the (1 - target_pos_rate) quantile of recalibrated probabilities.
+    new_threshold = float(np.quantile(y_proba_recal, 1 - args.target_pos_rate))
     actual_pos_rate = (y_proba_recal >= new_threshold).mean()
     print(f"\nNuevo threshold (target_pos_rate={args.target_pos_rate}): {new_threshold:.4f}")
     print(f"Pos rate real con nuevo threshold: {actual_pos_rate:.3f}")

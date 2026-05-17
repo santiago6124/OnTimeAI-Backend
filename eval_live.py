@@ -26,15 +26,22 @@ from sklearn.metrics import (
 MODEL_VERSIONS: list[tuple[str, str]] = [
     ("v7_recal",  "2000-01-01 00:00"),   # everything before v9
     ("v9",        "2026-05-15 01:43"),   # artifacts/4year_v9 deployed
+    ("v9_recal",  "2026-05-16 18:45"),   # isotonic overfit — rolled back next day
+    ("v9",        "2026-05-17 16:23"),   # rollback: clean v9 resumed (run_id=700)
 ]
 
 DB_PATH = Path(__file__).parent / "live_data.db"
 
 
 def label_model(ts: str) -> str:
+    # Normalize ISO timestamps ("2026-05-17T15:04:xx") to space format
+    # before comparing with MODEL_VERSIONS entries ("2026-05-17 16:23").
+    # Without this, "T" (84) > " " (32) makes every same-date prediction
+    # compare as greater than any space-separated boundary.
+    ts_norm = ts.replace("T", " ")[:16]
     model = MODEL_VERSIONS[0][0]
     for name, start in MODEL_VERSIONS:
-        if ts >= start:
+        if ts_norm >= start:
             model = name
     return model
 
@@ -45,7 +52,8 @@ def load_resolved(db: Path, days: int | None) -> pd.DataFrame:
         f"AND p.predicted_at_utc >= datetime('now', '-{days} days')" if days else ""
     )
     df = pd.read_sql(f"""
-        SELECT p.proba_delay,
+        SELECT p.fa_flight_id,
+               p.proba_delay,
                p.threshold_used,
                p.threshold_strategy,
                p.predicted_at_utc,
@@ -58,6 +66,10 @@ def load_resolved(db: Path, days: int | None) -> pd.DataFrame:
           {where_days}
         ORDER BY p.predicted_at_utc
     """, con)
+    # Keep only the LATEST prediction per flight (most info available before departure).
+    # The cron re-predicts the same flight every 5 min; without dedup a single flight
+    # can inflate n by 5-10x and bias metrics toward later (better-informed) predictions.
+    df = df.sort_values("predicted_at_utc").groupby("fa_flight_id", as_index=False).last()
     con.close()
     df["model"] = df["predicted_at_utc"].apply(label_model)
     df["date"]  = df["predicted_at_utc"].str[:10]
@@ -118,7 +130,7 @@ def main(argv=None) -> int:
     print("=" * 70)
     print("OVERALL PER MODEL")
     print("=" * 70)
-    for model in [v[0] for v in MODEL_VERSIONS]:
+    for model in dict.fromkeys(v[0] for v in MODEL_VERSIONS):  # deduplicate, preserve order
         g = df[df["model"] == model]
         m = metrics_for(g)
         results[model] = m
