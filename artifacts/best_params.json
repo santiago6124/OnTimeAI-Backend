@@ -1,0 +1,15 @@
+{
+  "best_value": 0.8195952562210859,
+  "best_params": {
+    "num_leaves": 218,
+    "learning_rate": 0.02659070495879603,
+    "min_data_in_leaf": 1876,
+    "feature_fraction": 0.9314636609266264,
+    "bagging_fraction": 0.921776614175408,
+    "bagging_freq": 8,
+    "reg_alpha": 0.6742709773778043,
+    "reg_lambda": 0.0025321296179494903
+  },
+  "n_trials": 25,
+  "study_name": "ontimeai_lgb"
+}

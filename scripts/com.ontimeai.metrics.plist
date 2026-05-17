@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.ontimeai.metrics</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/scripts/cron_metrics.sh</string>
+    </array>
+
+    <!-- Daily at 04:00 LOCAL time (typically late-night so ATL evening
+         flights have already settled in `actuals`). Pure DB read; no API cost. -->
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>4</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <false/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/logs/launchd_metrics.out</string>
+    <key>StandardErrorPath</key>
+    <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/logs/launchd_metrics.err</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend</string>
+</dict>
+</plist>

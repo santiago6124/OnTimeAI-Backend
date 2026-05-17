@@ -1,0 +1,61 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Raw data (no-commit per README)
+data_raw/
+
+# Large master datasets (>100 MB GitHub limit)
+dataset_maestro_ATL_2022-2024_BTS_IEM_ORIG_DEST.csv
+dataset_maestro_ATL_2022-2025_BTS_IEM_ORIG_DEST.csv
+dataset_maestro_FULL_US_*.csv
+dataset_maestro_FULL_US_*.parquet
+dataset_v7_optimized.parquet
+dataset_v7_10M.parquet
+dataset_v8_optimized.parquet
+dataset_maestro_FULL_US_2022-2025_v8.parquet
+
+# Large prediction outputs (>100 MB, OOT full-US runs)
+preds_2021_v*.csv
+
+# Training / tuning logs
+*.log
+
+# Optuna study DBs
+*.db
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Secrets
+.env
+.env.*
+!.env.example
+
+# Cron / live runtime state (per-machine, regenerated each tick)
+.last_tick_utc
+.cron_tick.lock
+.cron_disabled
+logs/
+dataset_prepared_v4.parquet

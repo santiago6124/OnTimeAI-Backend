@@ -1,0 +1,23 @@
+{
+  "created_at_utc": "2026-05-16T18:45:29.445635+00:00",
+  "source_artifact": "/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/artifacts/4year_v9",
+  "n_live_samples": 1938,
+  "delay_threshold_min": 15.0,
+  "before": {
+    "auc": 0.7313,
+    "brier": 0.0619,
+    "ece": 0.0143
+  },
+  "after": {
+    "auc": 0.7457,
+    "brier": 0.06,
+    "ece": 0.0
+  },
+  "delta": {
+    "auc": 0.0145,
+    "brier": -0.0019,
+    "ece": -0.0143
+  },
+  "new_threshold": 0.07346938775510205,
+  "target_pos_rate": 0.22
+}

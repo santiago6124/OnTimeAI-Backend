@@ -1,0 +1,47 @@
+{
+  "version": "v8_full",
+  "status": "ARCHIVED — not deployed (v7_recal outperforms on live)",
+  "created_at_utc": "2026-05-13",
+  "source_dataset": "dataset_maestro_FULL_US_2022-2025_v8.parquet",
+  "n_features": 83,
+
+  "new_features_vs_v7": [
+    "TAIL_DELAY_DECAY",
+    "ORIGIN_PAGERANK",
+    "DEST_PAGERANK",
+    "nas_rate_2h"
+  ],
+
+  "target": "binary",
+  "threshold": 0.32,
+  "train_size": 16203347,
+  "val_size": 5401115,
+  "test_size": 5401117,
+
+  "offline_test": {
+    "test_roc_auc": 0.8556,
+    "test_brier": 0.1042,
+    "test_f1": 0.6520,
+    "test_accuracy": 0.8515,
+    "note": "Essentially identical to v7_full (AUC -0.0002). New features informationally redundant."
+  },
+
+  "live_head_to_head": {
+    "n_flights": 6089,
+    "pos_rate_true": 0.2559,
+    "v7_recal": { "roc_auc": 0.6732, "brier": 0.1781, "f1": 0.3657, "accuracy": 0.6331 },
+    "v8_full":  { "roc_auc": 0.6710, "brier": 0.1901, "f1": 0.3082, "accuracy": 0.6674 },
+    "v8_recal": { "roc_auc": 0.6679, "brier": 0.1794, "f1": 0.3397, "accuracy": 0.6418 }
+  },
+
+  "conclusion": {
+    "finding": "Negative — new features do not improve over v7_recal",
+    "reasons": [
+      "TAIL_DELAY_DECAY redundant: LightGBM learns prev_delay x turnaround via tree splits",
+      "ORIGIN/DEST_PAGERANK redundant: categorical encoding already captures hub centrality",
+      "nas_rate_2h overlaps with origin_delay_rate_1h",
+      "GDP_FLAG live-only (0 in training) — needs months of live data accumulation to be trainable"
+    ],
+    "production_model": "4year_v7_recal"
+  }
+}

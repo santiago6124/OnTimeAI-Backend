@@ -1,0 +1,37 @@
+{
+  "created_at_utc": "2026-05-12T02:10:54.521426+00:00",
+  "source_artifact": "/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/artifacts/4year_v6_full",
+  "n_live_samples": 2266,
+  "delay_threshold_min": 15.0,
+  "before": {
+    "auc": 0.6128,
+    "brier": 0.1921,
+    "ece": 0.1114
+  },
+  "after": {
+    "auc": 0.6215,
+    "brier": 0.1686,
+    "ece": 0.0
+  },
+  "delta": {
+    "auc": 0.0087,
+    "brier": -0.0236,
+    "ece": -0.1114
+  },
+  "new_threshold": 0.3383084577114428,
+  "target_pos_rate": 0.22,
+  "cross_validation_5fold": {
+    "auc_before": 0.6121,
+    "auc_after": 0.6108,
+    "auc_delta": -0.0013,
+    "brier_before": 0.1921,
+    "brier_after": 0.1705,
+    "brier_delta": -0.0217,
+    "brier_pct": -11.3,
+    "ece_before": 0.1206,
+    "ece_after": 0.023,
+    "ece_delta": -0.0976,
+    "ece_pct": -80.9,
+    "note": "AUC invariante a calibracion (rank-order). Brier y ECE son las metricas de mejora real."
+  }
+}
