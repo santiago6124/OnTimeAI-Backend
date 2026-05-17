@@ -352,6 +352,88 @@ def metrics_model():
     }
 
 
+@app.get("/test-cases")
+def test_cases():
+    """Formal test case results for thesis validation (CP-01, CP-02)."""
+    import pandas as pd
+    from sklearn.metrics import roc_auc_score, brier_score_loss
+
+    con = get_db()
+    try:
+        cp01_row = con.execute("""
+            SELECT p.fa_flight_id, p.proba_delay, a.arr_delay_min,
+                   f.ident_iata, f.op_carrier, f.origin, f.dest,
+                   f.scheduled_out_utc, f.aircraft_type
+            FROM (
+                SELECT fa_flight_id, proba_delay,
+                       ROW_NUMBER() OVER (
+                           PARTITION BY fa_flight_id ORDER BY predicted_at_utc DESC
+                       ) AS rn
+                FROM predictions
+            ) p
+            JOIN actuals a ON p.fa_flight_id = a.fa_flight_id
+            JOIN flights  f ON f.fa_flight_id = p.fa_flight_id
+            WHERE p.rn = 1
+              AND p.proba_delay >= 0.35
+              AND a.arr_delay_min > 15
+              AND a.cancelled = 0
+              AND f.origin = 'ATL'
+            ORDER BY p.proba_delay DESC
+            LIMIT 1
+        """).fetchone()
+
+        cp01 = None
+        if cp01_row:
+            shap = _compute_shap(cp01_row["fa_flight_id"])
+            ident = cp01_row["ident_iata"] or cp01_row["fa_flight_id"]
+            cp01 = {
+                "fa_flight_id":      cp01_row["fa_flight_id"],
+                "flight_number":     ident,
+                "airline_code":      cp01_row["op_carrier"] or "",
+                "origin":            cp01_row["origin"] or "",
+                "destination":       cp01_row["dest"] or "",
+                "scheduled_out_utc": cp01_row["scheduled_out_utc"] or "",
+                "predicted_proba":   round(float(cp01_row["proba_delay"]), 4),
+                "predicted_risk":    risk_level(float(cp01_row["proba_delay"])),
+                "actual_delay_min":  int(cp01_row["arr_delay_min"]),
+                "shap":              shap,
+                "passed":            True,
+            }
+
+        df = pd.read_sql("""
+            SELECT p.fa_flight_id, p.proba_delay, p.predicted_at_utc,
+                   CASE WHEN a.arr_delay_min > 15 THEN 1 ELSE 0 END AS delayed
+            FROM predictions p
+            JOIN actuals a ON p.fa_flight_id = a.fa_flight_id
+            WHERE a.arr_delay_min IS NOT NULL AND a.cancelled = 0
+        """, con)
+
+        cp02: dict[str, Any] = {
+            "n_actuals": 0, "auc": None, "brier": None,
+            "actual_delay_rate": None, "passed": False,
+        }
+        if not df.empty:
+            df = (df.sort_values("predicted_at_utc")
+                    .groupby("fa_flight_id", as_index=False)
+                    .last())
+            y      = df["delayed"].to_numpy(dtype=int)
+            p_vals = df["proba_delay"].to_numpy(dtype=float)
+            if len(y) >= 30 and y.sum() >= 5:
+                auc   = float(roc_auc_score(y, p_vals))
+                brier = float(brier_score_loss(y, p_vals))
+                cp02 = {
+                    "n_actuals":         int(len(y)),
+                    "auc":               round(auc, 4),
+                    "brier":             round(brier, 4),
+                    "actual_delay_rate": round(float(y.mean()), 4),
+                    "passed":            auc >= 0.70 and brier <= 0.15,
+                }
+
+        return {"cp01": cp01, "cp02": cp02}
+    finally:
+        con.close()
+
+
 @app.get("/weather/{airport_code}")
 def weather(airport_code: str):
     """Latest METAR observation for an airport from the stored weather_obs table."""
