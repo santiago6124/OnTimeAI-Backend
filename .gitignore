@@ -34,8 +34,9 @@ preds_2021_v*.csv
 # Training / tuning logs
 *.log
 
-# Optuna study DBs
+# Optuna study DBs (excluye live_data.db que sí se versiona)
 *.db
+!live_data.db
 
 # Jupyter
 .ipynb_checkpoints/
