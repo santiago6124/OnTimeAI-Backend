@@ -1,0 +1,11 @@
+steps:
+  - name: 'gcr.io/cloud-builders/docker'
+    args:
+      - 'build'
+      - '-f'
+      - 'Dockerfile.job'
+      - '-t'
+      - 'gcr.io/$PROJECT_ID/ontimeai-live-pull'
+      - '.'
+images:
+  - 'gcr.io/$PROJECT_ID/ontimeai-live-pull'
