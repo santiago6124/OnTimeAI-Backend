@@ -15,14 +15,19 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
 import numpy as np
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+import secrets
+from jose import JWTError, jwt
+from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
@@ -38,6 +43,44 @@ MODEL_REGISTRY: dict[str, Path] = {
 }
 ACTIVE_MODEL = os.getenv("ACTIVE_MODEL", "4year_v9")
 ARTIFACT_PATH = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["4year_v9"])
+
+# ── Auth ───────────────────────────────────────────────────────────────────
+
+JWT_SECRET = os.getenv("JWT_SECRET_KEY", "ontimeai-dev-secret-change-in-prod-32chars")
+JWT_ALGORITHM = "HS256"
+JWT_EXPIRE_HOURS = 8
+
+_API_USER = os.getenv("API_USERNAME", "admin")
+_API_PASS = os.getenv("API_PASSWORD", "ontimeai2026")
+
+
+def _verify_password(plain: str) -> bool:
+    return secrets.compare_digest(plain.encode(), _API_PASS.encode())
+
+_PUBLIC_PATHS = {"/auth/login", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"}
+
+
+class AuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.url.path in _PUBLIC_PATHS or request.url.path.startswith("/redoc"):
+            return await call_next(request)
+        auth = request.headers.get("Authorization", "")
+        if not auth.startswith("Bearer "):
+            return JSONResponse({"detail": "Not authenticated"}, status_code=401)
+        token = auth[7:]
+        try:
+            jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+        except JWTError:
+            return JSONResponse({"detail": "Invalid or expired token"}, status_code=401)
+        return await call_next(request)
+
+
+class LoginRequest(BaseModel):
+    username: str
+    password: str
+
+
+# ── Feature labels ─────────────────────────────────────────────────────────
 
 FEATURE_LABELS: dict[str, str] = {
     "prev_arr_delay_tail":      "Demora previa del avión",
@@ -88,6 +131,8 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="OnTimeAI API", version="1.0.0", lifespan=lifespan)
+# Auth is inner; CORS is outer so it wraps 401 responses too
+app.add_middleware(AuthMiddleware)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -182,7 +227,30 @@ def _flight_row_to_dict(row: sqlite3.Row) -> dict:
     }
 
 
-# ── Routes ─────────────────────────────────────────────────────────────────
+# ── Auth routes ────────────────────────────────────────────────────────────
+
+@app.post("/auth/login")
+def login(body: LoginRequest):
+    if body.username != _API_USER or not _verify_password(body.password):
+        raise HTTPException(status_code=401, detail="Credenciales incorrectas")
+    expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
+    token = jwt.encode(
+        {"sub": body.username, "exp": expire},
+        JWT_SECRET,
+        algorithm=JWT_ALGORITHM,
+    )
+    return {"access_token": token, "token_type": "bearer"}
+
+
+@app.get("/auth/me")
+def auth_me(request: Request):
+    auth = request.headers.get("Authorization", "")
+    token = auth[7:]
+    payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+    return {"username": payload.get("sub")}
+
+
+# ── Protected routes ────────────────────────────────────────────────────────
 
 @app.get("/flights")
 def list_flights():
