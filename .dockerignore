@@ -47,7 +47,6 @@ eval_live.py
 eval_predictions.py
 live_backfill*.py
 live_metrics.py
-live_pull*.py
 recalibrate_live.py
 seed_demo.py
 unbiased_sample_live/

@@ -22,7 +22,7 @@ import requests
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 ENV_PATH = PROJECT_ROOT / ".env"
-DB_PATH = PROJECT_ROOT / "live_data.db"
+DB_PATH = Path(os.environ.get("DB_PATH", str(PROJECT_ROOT / "live_data.db")))
 DISTANCE_LOOKUP = PROJECT_ROOT / "artifacts" / "distance_lookup.csv"
 
 AEROAPI_BASE = "https://aeroapi.flightaware.com/aeroapi"

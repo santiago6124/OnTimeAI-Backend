@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from functools import lru_cache
 from pathlib import Path
@@ -25,7 +26,10 @@ from fastapi.middleware.cors import CORSMiddleware
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
-DB_PATH = Path(__file__).parent / "live_data.db"
+GCS_BUCKET = os.getenv("GCS_BUCKET", "")
+_TMP_DB = Path("/tmp/live_data.db")
+_BUNDLED_DB = Path(__file__).parent / "live_data.db"
+DB_PATH = _TMP_DB if GCS_BUCKET else _BUNDLED_DB
 
 MODEL_REGISTRY: dict[str, Path] = {
     "4year_v9":       Path(__file__).parent / "artifacts/4year_v9",
@@ -66,7 +70,24 @@ FEATURE_LABELS: dict[str, str] = {
 
 # ── App ────────────────────────────────────────────────────────────────────
 
-app = FastAPI(title="OnTimeAI API", version="1.0.0")
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    if GCS_BUCKET:
+        try:
+            from google.cloud import storage as gcs
+            client = gcs.Client()
+            blob = client.bucket(GCS_BUCKET).blob("live_data.db")
+            blob.download_to_filename(str(_TMP_DB))
+            mb = _TMP_DB.stat().st_size / 1e6
+            print(f"[startup] DB downloaded from gs://{GCS_BUCKET}/live_data.db ({mb:.1f} MB)")
+        except Exception as e:
+            print(f"[startup] GCS download failed, using bundled DB: {e}")
+            import shutil
+            shutil.copy(_BUNDLED_DB, _TMP_DB)
+    yield
+
+
+app = FastAPI(title="OnTimeAI API", version="1.0.0", lifespan=lifespan)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
