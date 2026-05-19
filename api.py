@@ -15,6 +15,9 @@ from __future__ import annotations
 import os
 import sqlite3
 from contextlib import asynccontextmanager
+
+from dotenv import load_dotenv
+load_dotenv(dotenv_path=".env.local", override=False)
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path

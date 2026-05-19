@@ -11,3 +11,4 @@ pyarrow>=14.0
 holidays>=0.46
 google-cloud-storage>=2.14
 python-jose[cryptography]>=3.3
+python-dotenv>=1.0
