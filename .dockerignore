@@ -1,0 +1,87 @@
+# Virtual env
+.venv/
+venv/
+env/
+
+# Datasets de entrenamiento (demasiado grandes)
+data_raw/
+dataset_maestro_*.csv
+dataset_maestro_*.parquet
+dataset_v7_*.parquet
+dataset_v8_*.parquet
+preds_*.csv
+vuelos_*.csv
+
+# Modelos viejos (sólo dejamos 4year_v9 y 4year_v9_recal)
+artifacts/4year_nobal/
+artifacts/4year_v1/
+artifacts/4year_v2_lineage_calib/
+artifacts/4year_v3_full/
+artifacts/4year_v4_full/
+artifacts/4year_v5_lineage_fixed/
+artifacts/4year_v6_full/
+artifacts/4year_v6_recal/
+artifacts/4year_v7_full/
+artifacts/4year_v7_recal/
+artifacts/4year_v8_full/
+artifacts/4year_v8_recal/
+artifacts/4year_v9_smoke/
+artifacts/smoke/
+artifacts/v6_smoke/
+artifacts/backtest_dataset_OOT_100k.parquet
+artifacts/live_period_plots/
+artifacts/live_snapshots/
+
+# Scripts de entrenamiento / análisis (no se usan en runtime)
+train.py
+tune.py
+adversarial_validation.py
+batch_predict_v7.py
+build_airports_universe.py
+build_lineage_fallback.py
+compare_v6_v7.py
+concatenar_masters.py
+construir_dataset_maestro_*.py
+descarga_*.py
+eval_live.py
+eval_predictions.py
+live_backfill*.py
+live_metrics.py
+live_pull*.py
+recalibrate_live.py
+seed_demo.py
+unbiased_sample_live/
+scripts/
+
+# Tests y notebooks
+tests/
+*.ipynb
+.ipynb_checkpoints/
+
+# Logs y estado de cron
+logs/
+*.log
+.last_tick_utc
+.cron_tick.lock
+.cron_disabled
+
+# Docs
+*.md
+AnteProyecto-OnTimeAI.md
+
+# OS / editor
+.DS_Store
+.vscode/
+.idea/
+
+# Secrets
+.env
+.env.*
+
+# Git
+.git/
+.gitignore
+
+# requirements de dev
+requirements.txt
+pyproject.toml
