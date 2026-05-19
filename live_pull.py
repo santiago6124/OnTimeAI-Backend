@@ -161,7 +161,17 @@ def main() -> int:
     n_wx = 0
     if not args.no_weather:
         print("\n[4] IEM METAR refresh...")
-        wx = fetch_iem_obs(AIRPORTS, sched_start - timedelta(hours=2),
+        # Only fetch weather for airports that appear in today's flights (~40-50),
+        # not the full 326-airport universe (would exceed 300s task timeout).
+        active_airports: set[str] = set()
+        for r in sched_rows + arr_sched_rows:
+            if r.get("origin"):
+                active_airports.add(r["origin"])
+            if r.get("dest"):
+                active_airports.add(r["dest"])
+        active_airports &= AIRPORTS  # keep only ones we have IEM network info for
+        print(f"   fetching weather for {len(active_airports)} airports (from today's flights)")
+        wx = fetch_iem_obs(active_airports, sched_start - timedelta(hours=2),
                            sched_end + timedelta(hours=2))
         if not wx.empty:
             n_wx = upsert_weather(conn, wx)

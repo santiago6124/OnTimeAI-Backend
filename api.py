@@ -38,6 +38,25 @@ GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 _TMP_DB = Path("/tmp/live_data.db")
 _BUNDLED_DB = Path(__file__).parent / "live_data.db"
 DB_PATH = _TMP_DB if GCS_BUCKET else _BUNDLED_DB
+_DB_REFRESH_INTERVAL = 1800  # refresh from GCS every 30 min
+_db_last_refresh: float = 0.0
+
+
+def _refresh_db_from_gcs() -> None:
+    global _db_last_refresh
+    import time
+    if not GCS_BUCKET:
+        return
+    if time.time() - _db_last_refresh < _DB_REFRESH_INTERVAL:
+        return
+    try:
+        from google.cloud import storage as gcs
+        client = gcs.Client()
+        blob = client.bucket(GCS_BUCKET).blob("live_data.db")
+        blob.download_to_filename(str(_TMP_DB))
+        _db_last_refresh = time.time()
+    except Exception as e:
+        print(f"[db_refresh] failed: {e}")
 
 MODEL_REGISTRY: dict[str, Path] = {
     "4year_v9":       Path(__file__).parent / "artifacts/4year_v9",
@@ -145,6 +164,7 @@ app.add_middleware(
 
 
 def get_db() -> sqlite3.Connection:
+    _refresh_db_from_gcs()
     con = sqlite3.connect(DB_PATH)
     con.row_factory = sqlite3.Row
     return con

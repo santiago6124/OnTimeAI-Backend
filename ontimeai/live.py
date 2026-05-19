@@ -303,7 +303,11 @@ def fetch_iem_obs(stations: set[str], start_utc: pd.Timestamp, end_utc: pd.Times
             ("report_type", "3"), ("report_type", "4"),
         ] + [("data", v) for v in WX_VARS]
         try:
-            r = requests.get(base, params=params, timeout=120)
+            r = requests.get(base, params=params, timeout=10)
+            if r.status_code == 429:
+                print(f"  IEM {st}: rate-limited, skipping")
+                time.sleep(0.3)
+                continue
             r.raise_for_status()
             lines = r.text.splitlines()
             hdr = next((i for i, ln in enumerate(lines) if ln.lower().startswith("station,valid")), None)
@@ -323,7 +327,7 @@ def fetch_iem_obs(stations: set[str], start_utc: pd.Timestamp, end_utc: pd.Times
                               "wx_precip_flag", "wx_low_vis_flag", "wx_strong_wind_flag"]])
         except Exception as e:
             print(f"  IEM {st}: FAIL ({e})")
-        time.sleep(1)
+        time.sleep(0.3)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True).drop_duplicates(["station", "valid"]).sort_values(["station", "valid"]).reset_index(drop=True)
@@ -637,7 +641,7 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
             conn, params=(wx_min.isoformat(), wx_max.isoformat()),
         )
         if not wx.empty:
-            wx["valid"] = pd.to_datetime(wx["valid_utc"]).astype("datetime64[ns]")
+            wx["valid"] = pd.to_datetime(wx["valid_utc"], format="ISO8601", utc=True).dt.tz_convert(None).astype("datetime64[ns]")
             wx = wx.sort_values(["station", "valid"]).reset_index(drop=True)
             df = _merge_weather_asof(df, wx, "ORIGIN", "EVENT_ORIGIN_UTC", "ORIG")
             df = _merge_weather_asof(df, wx, "DEST", "EVENT_DEST_UTC", "DEST")
@@ -735,7 +739,7 @@ def _add_v7_wind_features(df: pd.DataFrame) -> pd.DataFrame:
         warnings.warn(f"v7 wind features failed: {e}")
         for c in ["BEARING_DEG", "ERA5_U_KT", "ERA5_V_KT", "ERA5_HEADWIND_KT", "ERA5_CROSSWIND_KT"]:
             if c not in df.columns:
-                df[c] = _np.nan if "ERA5" in c or "BEARING" in c else 0
+                df[c] = float("nan") if "ERA5" in c or "BEARING" in c else 0
         if "ERA5_TAILWIND_FLAG" not in df.columns:
             df["ERA5_TAILWIND_FLAG"] = 0
 
@@ -833,14 +837,19 @@ def _merge_weather_asof(left: pd.DataFrame, wx: pd.DataFrame, station_col: str,
     for st in sorted(left[station_col].dropna().unique()):
         lsub = left[left[station_col].eq(st)].sort_values(event_col).copy()
         wsub = wx[wx["station"].eq(st)].sort_values("valid").copy()
+        # pandas 3.0: merge_asof raises on null keys — split, merge valid rows only
+        lsub_null = lsub[lsub[event_col].isna()]
+        lsub = lsub[lsub[event_col].notna()]
         if lsub.empty or wsub.empty:
-            parts.append(lsub)
+            parts.append(pd.concat([lsub, lsub_null]) if not lsub_null.empty else lsub)
             continue
         merged = pd.merge_asof(
             lsub, wsub, left_on=event_col, right_on="valid",
             direction="nearest", tolerance=pd.Timedelta("90min"),
         )
         parts.append(merged)
+        if not lsub_null.empty:
+            parts.append(lsub_null)
     if not parts:
         return left
     out = pd.concat(parts, ignore_index=True)
