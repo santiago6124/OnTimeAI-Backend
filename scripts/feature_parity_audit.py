@@ -91,7 +91,13 @@ def live_nan_rates(feature_cols: list[str], meta: dict, max_flights: int = 2000)
     from ontimeai.lineage_fallback import load_lookups
 
     fallback_path = ARTIFACTS_DIR / "lineage_fallback.joblib"
-    fallback = load_lookups(fallback_path) if fallback_path.exists() else None
+    fallback = None
+    if fallback_path.exists():
+        try:
+            fallback = load_lookups(fallback_path)
+        except Exception as e:
+            print(f"  ⚠ fallback load failed (pickle/pandas version mismatch): {e}")
+            print("  proceeding without lineage fallback — raw NaN rates visible")
 
     # Build features WITHOUT fallback to see raw NaN rates
     X_raw = prepare_inference_frame(

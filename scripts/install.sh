@@ -8,7 +8,7 @@
 
 set -euo pipefail
 
-REPO="/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend"
+REPO="/Users/mateopappalardo/FACU/TEsis/OnTimeAI-Backend"
 AGENTS_DIR="$HOME/Library/LaunchAgents"
 mkdir -p "$AGENTS_DIR"
 

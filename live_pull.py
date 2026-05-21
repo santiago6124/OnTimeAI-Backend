@@ -200,9 +200,51 @@ def main() -> int:
     meta = load_artifact(args.artifact)
 
     fallback_path = ARTIFACTS_DIR / "lineage_fallback.joblib"
-    fallback = load_lookups(fallback_path) if fallback_path.exists() else None
+    fallback = None
+    if fallback_path.exists():
+        try:
+            fallback = load_lookups(fallback_path)
+        except Exception as e:
+            print(f"   ⚠ fallback load failed (pickle/pandas version mismatch): {e}")
+            print("   proceeding without lineage fallback")
     if fallback is not None:
         print(f"   loaded cold-deck fallback ({fallback_path.name})")
+
+    # ---- Feature NaN logging & Quality assertions ----
+    X_raw = prepare_inference_frame(
+        df, meta["feature_cols"], meta["cat_mapping"], fallback_lookup=None,
+    )
+    
+    target_idx = df.index[target_mask]
+    if not target_idx.empty:
+        X_raw_target = X_raw.loc[target_idx].copy()
+        
+        # Ensure numeric columns are parsed as numeric for accurate NaN checks
+        cat_cols_set = set(meta.get("cat_cols", []))
+        for c in X_raw_target.columns:
+            if c not in cat_cols_set:
+                X_raw_target[c] = pd.to_numeric(X_raw_target[c], errors="coerce")
+        
+        print("   Raw Feature NaN Rates (before cold-deck fallback) for target flights:")
+        col_nan_rates = X_raw_target.isna().mean()
+        sorted_col_nans = sorted(col_nan_rates.items(), key=lambda x: x[1], reverse=True)
+        for col, rate in sorted_col_nans:
+            if rate > 0.0:
+                print(f"     - {col}: {rate:.1%}")
+                
+        nan_rates_per_flight = X_raw_target.isna().mean(axis=1)
+        too_many_nans = nan_rates_per_flight[nan_rates_per_flight > 0.6]
+        if not too_many_nans.empty:
+            print(f"   Quality Assertion: Skipping prediction for {len(too_many_nans)} flights with >60% NaN features:")
+            for idx, rate in too_many_nans.items():
+                fl_id = df.loc[idx, "fa_flight_id"]
+                print(f"     - {fl_id}: {rate:.1%} NaN features")
+            
+            # Exclude flights that failed quality assertion from prediction and database insert
+            target_mask = target_mask & (~df.index.isin(too_many_nans.index))
+            print(f"   {target_mask.sum()} target rows remaining after quality filtering")
+    # --------------------------------------------------
+
     X = prepare_inference_frame(
         df, meta["feature_cols"], meta["cat_mapping"], fallback_lookup=fallback,
     )

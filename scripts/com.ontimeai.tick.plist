@@ -8,24 +8,24 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/scripts/cron_tick.sh</string>
+        <string>/Users/mateopappalardo/FACU/TEsis/OnTimeAI-Backend/scripts/cron_tick.sh</string>
     </array>
 
-    <!-- Fire every 90min (5400s). The wrapper gates on UTC active hours,
-         min interval since last tick (80min), and a kill-switch flag, so
+    <!-- Fire every 30min (1800s). The wrapper gates on UTC active hours,
+         min interval since last tick (25min), and a kill-switch flag, so
          off-hours and post-sleep catch-up fires become no-ops. -->
     <key>StartInterval</key>
-    <integer>5400</integer>
+    <integer>1800</integer>
 
     <key>RunAtLoad</key>
     <false/>
 
     <key>StandardOutPath</key>
-    <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/logs/launchd_tick.out</string>
+    <string>/Users/mateopappalardo/FACU/TEsis/OnTimeAI-Backend/logs/launchd_tick.out</string>
     <key>StandardErrorPath</key>
-    <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/logs/launchd_tick.err</string>
+    <string>/Users/mateopappalardo/FACU/TEsis/OnTimeAI-Backend/logs/launchd_tick.err</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend</string>
+    <string>/Users/mateopappalardo/FACU/TEsis/OnTimeAI-Backend</string>
 </dict>
 </plist>

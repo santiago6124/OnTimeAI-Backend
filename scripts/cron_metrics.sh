@@ -5,7 +5,7 @@
 
 set -euo pipefail
 
-REPO="/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend"
+REPO="/Users/mateopappalardo/FACU/TEsis/OnTimeAI-Backend"
 cd "$REPO"
 
 LOG_DIR="$REPO/logs"

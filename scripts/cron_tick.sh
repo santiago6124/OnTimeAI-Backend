@@ -19,7 +19,7 @@
 
 set -euo pipefail
 
-REPO="/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend"
+REPO="/Users/mateopappalardo/FACU/TEsis/OnTimeAI-Backend"
 cd "$REPO"
 
 LOG_DIR="$REPO/logs"
@@ -47,7 +47,7 @@ fi
 
 # ---------- 3. min interval since last tick (avoid catch-up storms after sleep) ----------
 LAST_RUN_FILE="$REPO/.last_tick_utc"
-MIN_DELTA="${ONTIMEAI_MIN_TICK_DELTA:-4800}"
+MIN_DELTA="${ONTIMEAI_MIN_TICK_DELTA:-1500}"
 NOW_S=$(date -u +%s)
 if [ -f "$LAST_RUN_FILE" ]; then
     LAST=$(cat "$LAST_RUN_FILE" 2>/dev/null || echo 0)
@@ -79,8 +79,8 @@ if [ ! -f "$REPO/.env" ]; then
     log "ERROR — no .env file (AEROAPI_KEY=...)"
     exit 1
 fi
-if [ ! -d "$REPO/artifacts/4year_v5_lineage_fixed" ]; then
-    log "ERROR — no model artifact at artifacts/4year_v5_lineage_fixed"
+if [ ! -d "$REPO/artifacts/4year_v9" ]; then
+    log "ERROR — no model artifact at artifacts/4year_v9"
     exit 1
 fi
 
@@ -102,7 +102,7 @@ python live_pull.py \
     --max-pages "$MAX_PAGES" \
     --chain-walk-max "$CHAIN_WALK_MAX" \
     --target-pos-rate "$TARGET_POS_RATE" \
-    --artifact artifacts/4year_v5_lineage_fixed \
+    --artifact artifacts/4year_v9 \
     >> "$LOG" 2>&1
 EXIT_CODE=$?
 set -e

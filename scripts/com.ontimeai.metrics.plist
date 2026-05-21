@@ -8,7 +8,7 @@
     <key>ProgramArguments</key>
     <array>
         <string>/bin/bash</string>
-        <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/scripts/cron_metrics.sh</string>
+        <string>/Users/mateopappalardo/FACU/TEsis/OnTimeAI-Backend/scripts/cron_metrics.sh</string>
     </array>
 
     <!-- Daily at 04:00 LOCAL time (typically late-night so ATL evening
@@ -25,11 +25,11 @@
     <false/>
 
     <key>StandardOutPath</key>
-    <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/logs/launchd_metrics.out</string>
+    <string>/Users/mateopappalardo/FACU/TEsis/OnTimeAI-Backend/logs/launchd_metrics.out</string>
     <key>StandardErrorPath</key>
-    <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend/logs/launchd_metrics.err</string>
+    <string>/Users/mateopappalardo/FACU/TEsis/OnTimeAI-Backend/logs/launchd_metrics.err</string>
 
     <key>WorkingDirectory</key>
-    <string>/Users/lologalaverna/Projects/Tesis/OnTimeAI-Backend</string>
+    <string>/Users/mateopappalardo/FACU/TEsis/OnTimeAI-Backend</string>
 </dict>
 </plist>
