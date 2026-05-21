@@ -665,7 +665,7 @@ _ERA5_GRIDS: dict | None = None
 def _add_v7_wind_features(df: pd.DataFrame) -> pd.DataFrame:
     """Agrega BEARING_DEG y features ERA5 viento 250hPa al inference frame."""
     global _ERA5_GRIDS
-
+    _np = np
     try:
         import sys
         sys.path.insert(0, str(PROJECT_ROOT))

@@ -5,6 +5,9 @@ Usage:
     python3 live_metrics.py --since 24h
     python3 live_metrics.py --since 7d --threshold-min 15
     python3 live_metrics.py --psi             # add PSI drift report (7d vs all-time)
+    python3 live_metrics.py --per-day          # add per-day AUC breakdown
+    python3 live_metrics.py --calibration      # add calibration curve
+    python3 live_metrics.py --min-actuals 100  # filter days with too few actuals
 """
 from __future__ import annotations
 
@@ -60,6 +63,12 @@ def main() -> int:
     p.add_argument("--out", default=None)
     p.add_argument("--psi", action="store_true",
                    help="Compute PSI drift: compare last-7d proba distribution vs all-time baseline")
+    p.add_argument("--per-day", action="store_true",
+                   help="Show per-day AUC breakdown")
+    p.add_argument("--calibration", action="store_true",
+                   help="Show calibration curve")
+    p.add_argument("--min-actuals", type=int, default=0,
+                   help="Filter days with fewer than N settled actuals from aggregate")
     args = p.parse_args()
 
     conn = open_db()
@@ -122,6 +131,65 @@ def main() -> int:
         "pos_rate_true": (g["arr_delay_min"] > args.threshold_min).mean(),
     }), include_groups=False).sort_values("n", ascending=False).head(10)
     print(car.to_string())
+
+    # Per-day breakdown
+    if args.per_day and "fl_date" in df.columns:
+        print("\n--- per-day breakdown ---")
+        print(f"{'Date':<12} {'n':>6} {'AUC':>8} {'Brier':>8} {'Delay%':>8} {'PredPos%':>8}")
+        print("-" * 55)
+        for date_val in sorted(df["fl_date"].unique()):
+            mask = df["fl_date"] == date_val
+            n_d = int(mask.sum())
+            if n_d < 10:
+                continue
+            y_d = y_true[mask.to_numpy()]
+            p_d = y_proba[mask.to_numpy()]
+            l_d = y_pred[mask.to_numpy()]
+            try:
+                auc_d = float(roc_auc_score(y_d, p_d)) if len(np.unique(y_d)) > 1 else None
+            except Exception:
+                auc_d = None
+            brier_d = float(brier_score_loss(y_d, p_d))
+            auc_str = f"{auc_d:.3f}" if auc_d is not None else "N/A"
+            quality = "✅" if n_d >= max(args.min_actuals, 50) else "⚠"
+            print(f"  {quality} {str(date_val):<10} {n_d:>6} {auc_str:>8} {brier_d:>8.3f} "
+                  f"{y_d.mean():>8.1%} {l_d.mean():>8.1%}")
+
+    # Quality-filtered aggregate (exclude incomplete days)
+    if args.min_actuals > 0 and "fl_date" in df.columns:
+        good_dates = []
+        for date_val in df["fl_date"].unique():
+            if (df["fl_date"] == date_val).sum() >= args.min_actuals:
+                good_dates.append(date_val)
+        if good_dates:
+            mask_good = df["fl_date"].isin(good_dates)
+            y_good = y_true[mask_good.to_numpy()]
+            p_good = y_proba[mask_good.to_numpy()]
+            try:
+                auc_good = float(roc_auc_score(y_good, p_good))
+            except Exception:
+                auc_good = None
+            brier_good = float(brier_score_loss(y_good, p_good))
+            print(f"\n--- quality-filtered (>={args.min_actuals} actuals/day, {len(good_dates)} days) ---")
+            print(f"  n: {len(y_good):,}")
+            print(f"  AUC: {auc_good:.4f}" if auc_good is not None else "  AUC: N/A")
+            print(f"  Brier: {brier_good:.4f}")
+
+    # Calibration curve
+    if args.calibration:
+        print("\n--- calibration curve ---")
+        bins = [(0.0, 0.1), (0.1, 0.2), (0.2, 0.3), (0.3, 0.5), (0.5, 0.7), (0.7, 1.0)]
+        print(f"{'Bin':<12} {'n':>7} {'Pred':>7} {'Actual':>7} {'Gap':>7}")
+        print("-" * 45)
+        for lo, hi in bins:
+            mask = (y_proba >= lo) & (y_proba < hi)
+            n_bin = int(mask.sum())
+            if n_bin > 0:
+                mean_p = float(y_proba[mask].mean())
+                actual = float(y_true[mask].mean())
+                gap = actual - mean_p
+                inv = " ← INVERTED" if gap < -0.10 else ""
+                print(f"  [{lo:.1f},{hi:.1f}) {n_bin:>7,} {mean_p:>7.3f} {actual:>7.3f} {gap:>+7.3f}{inv}")
 
     if args.psi:
         print("\n--- PSI drift report (7d window vs all-time baseline) ---")
