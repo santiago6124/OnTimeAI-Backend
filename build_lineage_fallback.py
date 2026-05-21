@@ -28,7 +28,7 @@ def main(argv: list[str] | None = None) -> int:
     args = p.parse_args(argv)
 
     print(f"Loading master from {args.master} ...")
-    master = load_master(args.master)
+    master = load_master(args.master, valid_only=True)
     print(f"  {len(master):,} rows × {len(master.columns)} columns")
 
     print("Computing lookups ...")
