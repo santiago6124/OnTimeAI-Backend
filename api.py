@@ -208,7 +208,9 @@ def _latest_predictions_today(con: sqlite3.Connection) -> list[sqlite3.Row]:
                p.proba_delay,
                p.predicted_delay,
                p.predicted_at_utc,
-               CASE WHEN a.fa_flight_id IS NOT NULL THEN 1 ELSE 0 END AS has_actual
+               CASE WHEN a.fa_flight_id IS NOT NULL THEN 1 ELSE 0 END AS has_actual,
+               a.arr_delay_min,
+               a.departure_delay_min
         FROM flights f
         JOIN (
             SELECT fa_flight_id,
@@ -247,6 +249,8 @@ def _flight_row_to_dict(row: sqlite3.Row) -> dict:
         "predicted_delay": int(row["predicted_delay"]),
         "predicted_at_utc": row["predicted_at_utc"] or "",
         "has_actual":      bool(row["has_actual"]),
+        "arr_delay_min":   float(row["arr_delay_min"]) if row["arr_delay_min"] is not None else None,
+        "departure_delay_min": float(row["departure_delay_min"]) if row["departure_delay_min"] is not None else None,
     }
 
 
