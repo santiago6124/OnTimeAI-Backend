@@ -290,8 +290,7 @@ def list_flights():
 
 
 @app.get("/flight-history/{fa_flight_id:path}")
-def get_flight_history(fa_flight_id: str, request: Request):
-    _require_auth(request)
+def get_flight_history(fa_flight_id: str):
     con = get_db()
     try:
         rows = con.execute(
@@ -651,6 +650,69 @@ def operations(airport_code: str):
             "avg_delay_probability": round(float(np.mean(probas)), 4),
             "congestion_level":      "high" if total > 80 else "medium" if total > 40 else "low",
         }
+    finally:
+        con.close()
+
+
+@app.get("/metrics/routes")
+def metrics_routes():
+    """Puntualidad histórica por ruta (origen→destino) con actuals disponibles."""
+    con = get_db()
+    try:
+        rows = con.execute("""
+            SELECT f.origin, f.dest,
+                   COUNT(*) AS total_flights,
+                   SUM(CASE WHEN a.arr_delay_min <= 15 THEN 1 ELSE 0 END) AS on_time_count,
+                   ROUND(AVG(a.arr_delay_min), 1) AS avg_delay_min
+            FROM flights f
+            JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
+            WHERE a.arr_delay_min IS NOT NULL
+            GROUP BY f.origin, f.dest
+            HAVING COUNT(*) >= 1
+            ORDER BY total_flights DESC
+            LIMIT 30
+        """).fetchall()
+        return [
+            {
+                "origin":        r["origin"],
+                "dest":          r["dest"],
+                "route":         f"{r['origin']} → {r['dest']}",
+                "total_flights": r["total_flights"],
+                "on_time_rate":  round(r["on_time_count"] / r["total_flights"], 4),
+                "avg_delay_min": float(r["avg_delay_min"]) if r["avg_delay_min"] is not None else 0.0,
+            }
+            for r in rows
+        ]
+    finally:
+        con.close()
+
+
+@app.get("/metrics/routes/{origin}/{dest}/history")
+def metrics_route_history(origin: str, dest: str):
+    """Serie diaria de puntualidad para una ruta específica."""
+    con = get_db()
+    try:
+        rows = con.execute("""
+            SELECT date(f.scheduled_out_utc) AS flight_date,
+                   COUNT(*) AS total,
+                   SUM(CASE WHEN a.arr_delay_min <= 15 THEN 1 ELSE 0 END) AS on_time_count,
+                   ROUND(AVG(a.arr_delay_min), 1) AS avg_delay_min
+            FROM flights f
+            JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
+            WHERE f.origin = ? AND f.dest = ?
+              AND a.arr_delay_min IS NOT NULL
+            GROUP BY flight_date
+            ORDER BY flight_date ASC
+        """, (origin.upper(), dest.upper())).fetchall()
+        return [
+            {
+                "date":          r["flight_date"][5:].replace("-", "/"),  # "05/21"
+                "total":         r["total"],
+                "on_time_rate":  round(r["on_time_count"] / r["total"], 4) if r["total"] > 0 else 0.0,
+                "avg_delay_min": float(r["avg_delay_min"]) if r["avg_delay_min"] is not None else 0.0,
+            }
+            for r in rows
+        ]
     finally:
         con.close()
 
