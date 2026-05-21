@@ -285,6 +285,30 @@ def list_flights():
         con.close()
 
 
+@app.get("/flight-history/{fa_flight_id:path}")
+def get_flight_history(fa_flight_id: str, request: Request):
+    _require_auth(request)
+    con = get_db()
+    try:
+        rows = con.execute(
+            """SELECT predicted_at_utc, proba_delay, predicted_delay
+               FROM predictions
+               WHERE fa_flight_id = ?
+               ORDER BY predicted_at_utc ASC""",
+            (fa_flight_id,),
+        ).fetchall()
+        return [
+            {
+                "predicted_at_utc": r["predicted_at_utc"],
+                "delay_probability": round(float(r["proba_delay"]), 4),
+                "predicted_delay": int(r["predicted_delay"]),
+            }
+            for r in rows
+        ]
+    finally:
+        con.close()
+
+
 @app.get("/flights/{fa_flight_id:path}")
 def get_flight(fa_flight_id: str):
     con = get_db()

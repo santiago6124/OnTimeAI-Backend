@@ -34,7 +34,7 @@ def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--artifact", default=ARTIFACTS_DIR / "4year_v9")
     p.add_argument("--airport", default="KATL")
-    p.add_argument("--schedule-hours", type=int, default=2,
+    p.add_argument("--schedule-hours", type=int, default=6,
                    help="Pull scheduled departures for the next N hours")
     p.add_argument("--actuals-hours", type=int, default=4,
                    help="Pull arrivals from the past N hours to settle actuals")
