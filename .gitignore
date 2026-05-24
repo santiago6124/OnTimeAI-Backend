@@ -61,3 +61,4 @@ Thumbs.db
 .cron_disabled
 logs/
 dataset_prepared_v4.parquet
+*.crlf.bak

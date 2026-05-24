@@ -2,15 +2,22 @@
 
 Designed to be cron'd every 30 min. Idempotent: safe to re-run.
 
+Data source modes (env var `LIVE_DATA_SOURCE`):
+    - aeroapi (default): pulls all data from AeroAPI per tick (~$0.10/tick)
+    - harvester: skips AeroAPI; reads flights/actuals already populated by
+                 OnTimeAI-Scrapper into the shared bucket DB (~$0.001/tick).
+
 Usage:
-    python3 live_pull.py                     # default: scheduled +0..+4h, actuals -6..0h
-    python3 live_pull.py --schedule-hours 6  # look 6h ahead instead
-    python3 live_pull.py --no-weather        # skip IEM pull
-    python3 live_pull.py --dry-run           # print plan, skip writes
+    python3 live_pull.py                            # default: AeroAPI mode
+    LIVE_DATA_SOURCE=harvester python3 live_pull.py # uses harvester buffer
+    python3 live_pull.py --schedule-hours 6         # look 6h ahead instead
+    python3 live_pull.py --no-weather               # skip IEM pull
+    python3 live_pull.py --dry-run                  # print plan, skip writes
 """
 from __future__ import annotations
 
 import argparse
+import os
 from datetime import datetime, timedelta, timezone
 
 import pandas as pd
@@ -70,6 +77,13 @@ def main() -> int:
     )
     args = p.parse_args()
 
+    # LIVE_DATA_SOURCE: env-var switch entre AeroAPI (default) y harvester (buffer GCS).
+    # Fase 4 del plan: depreca AeroAPI cuando el harvester demuestre paridad de AUC.
+    data_source = os.getenv("LIVE_DATA_SOURCE", "aeroapi").lower()
+    if data_source not in ("aeroapi", "harvester"):
+        raise SystemExit(f"LIVE_DATA_SOURCE='{data_source}' inválido; usar 'aeroapi' o 'harvester'")
+    is_harvester_mode = data_source == "harvester"
+
     now = datetime.now(timezone.utc)
     sched_start = now
     sched_end = now + timedelta(hours=args.schedule_hours)
@@ -77,11 +91,15 @@ def main() -> int:
     arr_start = arr_end - timedelta(hours=args.actuals_hours)
 
     print(f"Tick {now.isoformat()}")
+    print(f"  data source:     {data_source}")
     print(f"  schedule window: {_iso(sched_start)} → {_iso(sched_end)}")
     print(f"  actuals window:  {_iso(arr_start)} → {_iso(arr_end)}")
 
     if args.dry_run:
-        print("\n[dry-run] would call AeroAPI scheduled_departures + arrivals + IEM")
+        if is_harvester_mode:
+            print("\n[dry-run] would read flights/actuals from shared bucket DB + IEM weather")
+        else:
+            print("\n[dry-run] would call AeroAPI scheduled_departures + arrivals + IEM")
         return 0
 
     conn = open_db()
@@ -91,71 +109,102 @@ def main() -> int:
     run_id = cur.lastrowid
     conn.commit()
 
-    # ---- 1. scheduled departures (KATL) ----
-    print("\n[1] AeroAPI scheduled_departures...")
-    sched = fetch_airport_flights(args.airport, "scheduled_departures",
-                                  _iso(sched_start), _iso(sched_end), args.max_pages)
-    print(f"   pulled {len(sched)} scheduled departures")
-    sched_rows = [r for r in (aeroapi_to_flight_row(rec) for rec in sched) if r]
-    n_sched = upsert_flights(conn, sched_rows)
-    print(f"   upserted {n_sched} flights to DB (after ATL+known-airports filter)")
-
-    arr_sched_rows: list[dict] = []
+    sched: list[dict] = []
     arr_sched: list[dict] = []
-    if not args.skip_arrivals_sched:
-        # ---- 2. scheduled arrivals (KATL) — captures FLOW=ARR_TO_ATL ----
-        print("\n[2] AeroAPI scheduled_arrivals...")
-        arr_sched = fetch_airport_flights(args.airport, "scheduled_arrivals",
-                                          _iso(sched_start), _iso(sched_end), args.max_pages)
-        print(f"   pulled {len(arr_sched)} scheduled arrivals")
-        arr_sched_rows = [r for r in (aeroapi_to_flight_row(rec) for rec in arr_sched) if r]
-        n_arr_sched = upsert_flights(conn, arr_sched_rows)
-        print(f"   upserted {n_arr_sched} flights to DB")
-    else:
-        print("\n[2] (skipped scheduled_arrivals)")
-
+    arrived: list[dict] = []
+    sched_rows: list[dict] = []
+    arr_sched_rows: list[dict] = []
     n_act = 0
-    if not args.skip_actuals:
-        # ---- 3. completed arrivals to KATL → actuals (settles ARR_TO_ATL preds) ----
-        print("\n[3] AeroAPI arrivals (completed at KATL)...")
-        arrived = fetch_airport_flights(args.airport, "arrivals",
-                                        _iso(arr_start), _iso(arr_end), args.max_pages)
-        print(f"   pulled {len(arrived)} arrivals")
-        arrived_filt = [r for r in arrived if r.get("actual_in")]
-        n_act_arr = upsert_actuals_from_aeroapi(conn, arrived_filt)
-        print(f"   wrote {n_act_arr} actuals")
-
-        # ---- 3a. completed departures from KATL → actuals (settles DEP_FROM_ATL preds)
-        # Crucially, AeroAPI's Flight schema includes actual_in + arrival_delay
-        # in the departures payload IF the flight has already landed at destination.
-        print("\n[3a] AeroAPI departures (completed from KATL)...")
-        departed = fetch_airport_flights(args.airport, "departures",
-                                         _iso(arr_start), _iso(arr_end), args.max_pages)
-        landed = [r for r in departed if r.get("actual_in")]
-        print(f"   pulled {len(departed)} departures, {len(landed)} have landed at destination")
-        n_act_dep = upsert_actuals_from_aeroapi(conn, landed)
-        print(f"   wrote {n_act_dep} actuals")
-        n_act = n_act_arr + n_act_dep
-    else:
-        print("\n[3] (skipped actuals)")
-        arrived = []
-
-    # ---- 3b. chain-walk inbound_fa_flight_id → hydrate lineage on demand ----
     n_chain_calls = 0
     n_chain_actuals = 0
-    if args.chain_walk_max > 0:
-        print("\n[3b] Chain-walk inbound_fa_flight_id...")
-        n_chain_calls, n_chain_actuals = chain_walk_inbound(
-            conn,
-            sched_rows + arr_sched_rows,
-            max_calls=args.chain_walk_max,
+
+    if is_harvester_mode:
+        # ---- harvester mode: leemos del buffer poblado por OnTimeAI-Scrapper ----
+        print("\n[1-3b] harvester mode: leyendo flights del buffer GCS (no AeroAPI calls)")
+        # Vuelos KATL en la ventana sched — el harvester ya los pobló
+        # (origin='ATL' OR dest='ATL' en schema IATA del scrapper)
+        # SQLite datetime() normaliza ambos formatos:
+        #   '2026-05-21T20:25:00'       (AeroAPI, sin TZ)
+        #   '2026-05-22T22:00:00+00:00' (FR24, con TZ)
+        cur = conn.execute(
+            """
+            SELECT fa_flight_id, origin, dest, tail_num, op_carrier,
+                   scheduled_out_utc, scheduled_in_utc
+            FROM flights
+            WHERE (origin = 'ATL' OR dest = 'ATL')
+              AND scheduled_out_utc IS NOT NULL
+              AND datetime(scheduled_out_utc) >= datetime(?)
+              AND datetime(scheduled_out_utc) < datetime(?)
+            ORDER BY scheduled_out_utc
+            """,
+            (_iso(sched_start), _iso(sched_end)),
         )
-        print(
-            f"   chain-walk: {n_chain_calls} AeroAPI calls "
-            f"(~${n_chain_calls * 0.005:.2f} USD), {n_chain_actuals} actuals hydrated"
-        )
+        cols = [d[0] for d in cur.description]
+        sched_rows = [dict(zip(cols, r)) for r in cur.fetchall() if r[0]]
+        # Heurística para mantener compat con el código downstream:
+        # tratamos los vuelos cuyo destino es ATL como "arr_sched" y los demás como sched.
+        arr_sched_rows = [r for r in sched_rows if r.get("dest") == "ATL"]
+        sched_rows = [r for r in sched_rows if r.get("origin") == "ATL"]
+        print(f"   buffer hits: {len(sched_rows)} departures + {len(arr_sched_rows)} arrivals (ventana sched)")
+        # n_act y chain_walk: ambos los hace el harvester, no replicamos
     else:
-        print("\n[3b] (chain-walk disabled)")
+        # ---- AeroAPI mode (default, comportamiento original) ----
+        print("\n[1] AeroAPI scheduled_departures...")
+        sched = fetch_airport_flights(args.airport, "scheduled_departures",
+                                      _iso(sched_start), _iso(sched_end), args.max_pages)
+        print(f"   pulled {len(sched)} scheduled departures")
+        sched_rows = [r for r in (aeroapi_to_flight_row(rec) for rec in sched) if r]
+        n_sched = upsert_flights(conn, sched_rows)
+        print(f"   upserted {n_sched} flights to DB (after ATL+known-airports filter)")
+
+        if not args.skip_arrivals_sched:
+            # ---- 2. scheduled arrivals (KATL) — captures FLOW=ARR_TO_ATL ----
+            print("\n[2] AeroAPI scheduled_arrivals...")
+            arr_sched = fetch_airport_flights(args.airport, "scheduled_arrivals",
+                                              _iso(sched_start), _iso(sched_end), args.max_pages)
+            print(f"   pulled {len(arr_sched)} scheduled arrivals")
+            arr_sched_rows = [r for r in (aeroapi_to_flight_row(rec) for rec in arr_sched) if r]
+            n_arr_sched = upsert_flights(conn, arr_sched_rows)
+            print(f"   upserted {n_arr_sched} flights to DB")
+        else:
+            print("\n[2] (skipped scheduled_arrivals)")
+
+        if not args.skip_actuals:
+            # ---- 3. completed arrivals to KATL → actuals (settles ARR_TO_ATL preds) ----
+            print("\n[3] AeroAPI arrivals (completed at KATL)...")
+            arrived = fetch_airport_flights(args.airport, "arrivals",
+                                            _iso(arr_start), _iso(arr_end), args.max_pages)
+            print(f"   pulled {len(arrived)} arrivals")
+            arrived_filt = [r for r in arrived if r.get("actual_in")]
+            n_act_arr = upsert_actuals_from_aeroapi(conn, arrived_filt)
+            print(f"   wrote {n_act_arr} actuals")
+
+            # ---- 3a. completed departures from KATL → actuals (settles DEP_FROM_ATL preds)
+            print("\n[3a] AeroAPI departures (completed from KATL)...")
+            departed = fetch_airport_flights(args.airport, "departures",
+                                             _iso(arr_start), _iso(arr_end), args.max_pages)
+            landed = [r for r in departed if r.get("actual_in")]
+            print(f"   pulled {len(departed)} departures, {len(landed)} have landed at destination")
+            n_act_dep = upsert_actuals_from_aeroapi(conn, landed)
+            print(f"   wrote {n_act_dep} actuals")
+            n_act = n_act_arr + n_act_dep
+        else:
+            print("\n[3] (skipped actuals)")
+
+        # ---- 3b. chain-walk inbound_fa_flight_id → hydrate lineage on demand ----
+        if args.chain_walk_max > 0:
+            print("\n[3b] Chain-walk inbound_fa_flight_id...")
+            n_chain_calls, n_chain_actuals = chain_walk_inbound(
+                conn,
+                sched_rows + arr_sched_rows,
+                max_calls=args.chain_walk_max,
+            )
+            print(
+                f"   chain-walk: {n_chain_calls} AeroAPI calls "
+                f"(~${n_chain_calls * 0.005:.2f} USD), {n_chain_actuals} actuals hydrated"
+            )
+        else:
+            print("\n[3b] (chain-walk disabled)")
 
     # ---- 4. weather ----
     n_wx = 0
@@ -201,7 +250,11 @@ def main() -> int:
 
     fallback_path = ARTIFACTS_DIR / "lineage_fallback.joblib"
     fallback = None
-    if fallback_path.exists():
+    # DISABLE_LINEAGE_FALLBACK=1 bypasses the cold-deck fallback to isolate the
+    # LightGBM SIGSEGV root cause (see SESSION_HALLAZGOS.md §8.1).
+    if os.getenv("DISABLE_LINEAGE_FALLBACK", "").lower() in ("1", "true", "yes"):
+        print("   lineage fallback disabled via DISABLE_LINEAGE_FALLBACK env")
+    elif fallback_path.exists():
         try:
             fallback = load_lookups(fallback_path)
         except Exception as e:
@@ -305,6 +358,9 @@ def main() -> int:
          len(pred_rows), n_act, n_wx, run_id),
     )
     conn.commit()
+    # Close the connection so SQLite flushes cached pages to disk BEFORE the
+    # subsequent GCS upload in live_job.py reads /tmp/live_data.db.
+    conn.close()
 
     print(f"\nDone. run_id={run_id}")
     return 0

@@ -150,7 +150,13 @@ def save_artifact(
 
 def load_artifact(artifact_dir: Path) -> dict[str, Any]:
     artifact_dir = Path(artifact_dir)
-    booster = lgb.Booster(model_file=str(artifact_dir / "model.lgb"))
+    # `params={'num_threads': 1}` forces single-threaded model parse → avoids a
+    # SIGSEGV (with "Model format error, expect a tree here" cascade) we saw in
+    # Cloud Run when lightgbm 4.6 + libgomp1 parsed the booster concurrently.
+    booster = lgb.Booster(
+        model_file=str(artifact_dir / "model.lgb"),
+        params={"num_threads": 1},
+    )
     meta = joblib.load(artifact_dir / "meta.joblib")
     meta["booster"] = booster
     meta.setdefault("calibrator", None)

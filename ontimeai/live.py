@@ -629,8 +629,12 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
     df["EVENT_DEST_UTC"] = pd.to_datetime(df["scheduled_on_utc"], errors="coerce").astype("datetime64[ns]")
     df["DEP_LOCAL_DT"] = df["FL_DATE"] + pd.to_timedelta(df["CRS_DEP_MIN"], unit="m")
 
-    df["FLOW_ATL"] = np.where(df["ORIGIN"].eq("ATL"), "DEP_FROM_ATL", "ARR_TO_ATL")
-    df["PAR_AIRPORT"] = np.where(df["ORIGIN"].eq("ATL"), df["DEST"], df["ORIGIN"])
+    # NA-safe: harvester (FR24) puede traer vuelos privados sin ORIGIN/DEST.
+    # En pandas 3.x, Series.eq() ya no coerce NA → False, así que np.where(NA, ...)
+    # rompe con "TypeError: boolean value of NA is ambiguous".
+    _is_atl_origin = df["ORIGIN"].fillna("").eq("ATL")
+    df["FLOW_ATL"] = np.where(_is_atl_origin, "DEP_FROM_ATL", "ARR_TO_ATL")
+    df["PAR_AIRPORT"] = np.where(_is_atl_origin, df["DEST"], df["ORIGIN"])
 
     # Weather merge_asof from weather_obs table
     if df["EVENT_ORIGIN_UTC"].notna().any():
