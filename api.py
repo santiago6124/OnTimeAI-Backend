@@ -23,6 +23,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Any
 
+import re
 import numpy as np
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -155,12 +156,33 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="OnTimeAI API", version="1.0.0", lifespan=lifespan)
 # Auth is inner; CORS is outer so it wraps 401 responses too
 app.add_middleware(AuthMiddleware)
+_ALLOWED_ORIGINS = [
+    o.strip()
+    for o in os.getenv(
+        "ALLOWED_ORIGINS",
+        "https://ontimeai-frontend-hq7henvhjq-uc.a.run.app,https://ontimeai-frontend-150917658060.us-central1.run.app",
+    ).split(",")
+    if o.strip()
+]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=_ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Authorization", "Content-Type"],
 )
+
+
+_AIRPORT_CODE_RE = re.compile(r"^[A-Z]{3,4}$")
+
+def _validate_airport(code: str) -> str:
+    """Normaliza y valida un código IATA (3 letras) o ICAO (4 letras)."""
+    normalized = code.upper().strip()
+    if not _AIRPORT_CODE_RE.match(normalized):
+        raise HTTPException(
+            status_code=422,
+            detail=f"Código de aeropuerto inválido: '{code}'. Debe ser IATA (3 letras) o ICAO (4 letras).",
+        )
+    return normalized
 
 
 def get_db() -> sqlite3.Connection:
@@ -339,9 +361,10 @@ def _compute_shap(fa_flight_id: str) -> list[dict]:
 
         meta = _load_meta()
         conn = open_db()
-
-        df = build_inference_frame(conn, [fa_flight_id], history_days=7)
-        conn.close()
+        try:
+            df = build_inference_frame(conn, [fa_flight_id], history_days=7)
+        finally:
+            conn.close()
         if df.empty:
             return []
 
@@ -576,6 +599,7 @@ def test_cases():
 @app.get("/weather/{airport_code}")
 def weather(airport_code: str):
     """Latest METAR observation for an airport from the stored weather_obs table."""
+    code = _validate_airport(airport_code)
     con = get_db()
     try:
         row = con.execute("""
@@ -586,9 +610,9 @@ def weather(airport_code: str):
             WHERE station = ?
             ORDER BY valid_utc DESC
             LIMIT 1
-        """, (airport_code.upper(),)).fetchone()
+        """, (code,)).fetchone()
         if row is None:
-            raise HTTPException(status_code=404, detail=f"No weather data for {airport_code}")
+            raise HTTPException(status_code=404, detail=f"No weather data for {code}")
         return {
             "airport_code":      row["station"],
             "valid_utc":         row["valid_utc"],
@@ -613,6 +637,7 @@ def weather(airport_code: str):
 @app.get("/operations/{airport_code}")
 def operations(airport_code: str):
     """Today's operational delay stats for flights departing or arriving at an airport."""
+    code = _validate_airport(airport_code)
     con = get_db()
     try:
         today = today_utc()
@@ -629,18 +654,18 @@ def operations(airport_code: str):
             WHERE f.scheduled_out_utc LIKE ? || '%'
               AND f.cancelled = 0
               AND (f.origin = ? OR f.dest = ?)
-        """, (today, airport_code.upper(), airport_code.upper())).fetchall()
+        """, (today, code, code)).fetchall()
 
         if not rows:
-            raise HTTPException(status_code=404, detail=f"No flight data for {airport_code} today")
+            raise HTTPException(status_code=404, detail=f"No flight data for {code} today")
 
         probas = [float(r["proba_delay"]) for r in rows]
-        departures = [r for r in rows if r["origin"] == airport_code.upper()]
+        departures = [r for r in rows if r["origin"] == code]
         high_risk  = sum(1 for p in probas if p >= 0.35)
         total      = len(rows)
 
         return {
-            "airport_code":          airport_code.upper(),
+            "airport_code":          code,
             "date_utc":              today,
             "total_flights":         total,
             "departures":            len(departures),
