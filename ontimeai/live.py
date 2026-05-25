@@ -624,9 +624,11 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
     df["DIVERTED"] = df["diverted"].fillna(0).astype(int)
     df["ARR_DELAY"] = pd.to_numeric(df["arr_delay_min"], errors="coerce")
 
-    # Event timestamps
-    df["EVENT_ORIGIN_UTC"] = pd.to_datetime(df["scheduled_off_utc"], errors="coerce").astype("datetime64[ns]")
-    df["EVENT_DEST_UTC"] = pd.to_datetime(df["scheduled_on_utc"], errors="coerce").astype("datetime64[ns]")
+    # Event timestamps — harvester FR24 escribe '2026-05-22T22:00:00+00:00' (TZ-aware)
+    # mientras AeroAPI escribe '2026-05-22T22:00:00' (TZ-naive). Normalizamos a naive
+    # UTC para que astype("datetime64[ns]") no rompa con TypeError.
+    df["EVENT_ORIGIN_UTC"] = pd.to_datetime(df["scheduled_off_utc"], errors="coerce", utc=True).dt.tz_localize(None).astype("datetime64[ns]")
+    df["EVENT_DEST_UTC"] = pd.to_datetime(df["scheduled_on_utc"], errors="coerce", utc=True).dt.tz_localize(None).astype("datetime64[ns]")
     df["DEP_LOCAL_DT"] = df["FL_DATE"] + pd.to_timedelta(df["CRS_DEP_MIN"], unit="m")
 
     # NA-safe: harvester (FR24) puede traer vuelos privados sin ORIGIN/DEST.
