@@ -20,6 +20,7 @@ import argparse
 import os
 from datetime import datetime, timedelta, timezone
 
+import numpy as np
 import pandas as pd
 
 from ontimeai.live import (
@@ -250,16 +251,22 @@ def main() -> int:
 
     fallback_path = ARTIFACTS_DIR / "lineage_fallback.joblib"
     fallback = None
-    # DISABLE_LINEAGE_FALLBACK=1 bypasses the cold-deck fallback to isolate the
-    # LightGBM SIGSEGV root cause (see SESSION_HALLAZGOS.md §8.1).
+    # Lineage fallback is default-on. The DISABLE_LINEAGE_FALLBACK env var was a
+    # diagnostic flag during the SIGSEGV hunt (root cause turned out to be CRLF
+    # in model.lgb, not the fallback). Keep the override path for repro
+    # scenarios but never default to bypassing — without the fallback, NaN
+    # lineage features force the model to extrapolate via TAIL_DELAY_DECAY and
+    # other proxies, which sobre-estimates and degrades live AUC.
     if os.getenv("DISABLE_LINEAGE_FALLBACK", "").lower() in ("1", "true", "yes"):
-        print("   lineage fallback disabled via DISABLE_LINEAGE_FALLBACK env")
+        print("   lineage fallback disabled via DISABLE_LINEAGE_FALLBACK env (DIAGNOSTIC ONLY — remove this env var in production)")
     elif fallback_path.exists():
         try:
             fallback = load_lookups(fallback_path)
         except Exception as e:
             print(f"   ⚠ fallback load failed (pickle/pandas version mismatch): {e}")
             print("   proceeding without lineage fallback")
+    else:
+        print(f"   ⚠ lineage fallback artifact missing at {fallback_path} — predictions will use NaN priors (degrades AUC)")
     if fallback is not None:
         print(f"   loaded cold-deck fallback ({fallback_path.name})")
 
@@ -350,6 +357,45 @@ def main() -> int:
     )
     conn.commit()
     print(f"   wrote {len(pred_rows)} predictions")
+
+    # ---- SHAP top-K persistence (Fix D in FIXES_PLAN.md) ----
+    # Compute SHAP values for target rows only, persist top-15 by |shap|.
+    # Disabled if SHAP_TOPK=0. Failure is non-fatal (predictions already written).
+    shap_topk = int(os.getenv("SHAP_TOPK", "15"))
+    if shap_topk > 0 and pred_rows:
+        try:
+            target_indices = df.index[target_mask]
+            X_target = X.loc[target_indices]
+            # LightGBM native: pred_contrib=True returns per-row SHAP vector + bias term.
+            contribs = meta["booster"].predict(X_target, pred_contrib=True)
+            # contribs shape: (n_targets, n_features + 1) — last col is bias
+            feat_names = list(X_target.columns)
+            shap_matrix = contribs[:, :-1]
+
+            shap_rows: list[tuple] = []
+            for row_idx, df_idx in enumerate(target_indices):
+                fa_id = df.loc[df_idx, "fa_flight_id"]
+                row_shap = shap_matrix[row_idx]
+                # Rank by absolute contribution
+                abs_order = np.argsort(-np.abs(row_shap))[:shap_topk]
+                for rank, feat_idx in enumerate(abs_order, start=1):
+                    fname = feat_names[feat_idx]
+                    sval = float(row_shap[feat_idx])
+                    fval = X_target.iloc[row_idx][fname]
+                    fval_str = "NaN" if pd.isna(fval) else str(fval)
+                    shap_rows.append((fa_id, pred_now, fname, sval, fval_str, rank))
+
+            conn.executemany(
+                """INSERT OR REPLACE INTO prediction_shap
+                   (fa_flight_id, predicted_at_utc, feature_name, shap_value,
+                    feature_value, rank)
+                   VALUES (?,?,?,?,?,?)""",
+                shap_rows,
+            )
+            conn.commit()
+            print(f"   wrote {len(shap_rows)} SHAP values (top-{shap_topk} × {len(pred_rows)} preds)")
+        except Exception as e:
+            print(f"   ⚠ SHAP persistence failed (non-fatal): {type(e).__name__}: {e}")
 
     conn.execute(
         "UPDATE runs SET finished_utc=?, flights_pulled=?, flights_predicted=?, actuals_updated=?, weather_obs_added=? WHERE run_id=?",

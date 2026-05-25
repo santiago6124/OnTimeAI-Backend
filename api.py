@@ -344,10 +344,44 @@ def get_flight(fa_flight_id: str):
             raise HTTPException(status_code=404, detail="Flight not found")
 
         result = _flight_row_to_dict(row)
-        result["shap"] = _compute_shap(fa_flight_id)
+        # Fast path: serve cached SHAP from prediction_shap table (Fix D).
+        # Fall back to on-demand compute only if the cache is empty (e.g. for
+        # predictions written before SHAP persistence was rolled out).
+        cached = _load_cached_shap(con, fa_flight_id)
+        result["shap"] = cached if cached else _compute_shap(fa_flight_id)
         return result
     finally:
         con.close()
+
+
+def _load_cached_shap(con: sqlite3.Connection, fa_flight_id: str) -> list[dict]:
+    """Read the most-recent SHAP top-K row set persisted by live_pull.py."""
+    try:
+        cur = con.execute(
+            """SELECT feature_name, shap_value, feature_value
+               FROM prediction_shap
+               WHERE fa_flight_id = ?
+                 AND predicted_at_utc = (
+                     SELECT MAX(predicted_at_utc) FROM prediction_shap
+                     WHERE fa_flight_id = ?
+                 )
+               ORDER BY rank ASC""",
+            (fa_flight_id, fa_flight_id),
+        )
+        out: list[dict] = []
+        for feat_name, shap_val, feat_val in cur.fetchall():
+            contrib = float(shap_val)
+            out.append({
+                "feature":      feat_name,
+                "label":        FEATURE_LABELS.get(feat_name, feat_name.replace("_", " ").title()),
+                "contribution": round(abs(contrib), 4),
+                "direction":    "positive" if contrib >= 0 else "negative",
+                "value":        feat_val,
+            })
+        return out
+    except sqlite3.OperationalError:
+        # Table doesn't exist yet (legacy DB) — fall back to live compute.
+        return []
 
 
 def _compute_shap(fa_flight_id: str) -> list[dict]:

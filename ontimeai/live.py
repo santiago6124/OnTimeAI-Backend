@@ -166,6 +166,21 @@ CREATE TABLE IF NOT EXISTS runs (
     weather_obs_added INTEGER,
     notes TEXT
 );
+
+-- SHAP values for the top-K features by |shap| per prediction.
+-- Persisted so /flights/{id} can render the explanation without re-running
+-- the booster. Top-K (default 15) keeps row count bounded; full vector is
+-- recoverable from the booster + raw feature row if ever needed.
+CREATE TABLE IF NOT EXISTS prediction_shap (
+    fa_flight_id TEXT NOT NULL,
+    predicted_at_utc TEXT NOT NULL,
+    feature_name TEXT NOT NULL,
+    shap_value REAL NOT NULL,
+    feature_value TEXT,           -- string repr; may be NaN for missing
+    rank INTEGER NOT NULL,         -- 1..K by |shap_value| DESC
+    PRIMARY KEY (fa_flight_id, predicted_at_utc, feature_name)
+);
+CREATE INDEX IF NOT EXISTS idx_shap_pred ON prediction_shap(fa_flight_id, predicted_at_utc);
 """
 
 
@@ -479,12 +494,24 @@ def chain_walk_inbound(
     waiting for a 24-48h history backfill. Caller is expected to pass a
     dedup'd list of target flight rows (post `aeroapi_to_flight_row`).
 
+    Targets are sorted by `scheduled_in_utc` ascending (Fix C in FIXES_PLAN.md)
+    so the limited AeroAPI budget (`max_calls`) lands on the imminent flights
+    whose predictions are about to be acted on — not on far-future flights whose
+    inbound chain can be hydrated on a later tick.
+
     Returns (calls_made, actuals_written). Hard caps at `max_calls` to
     protect the AeroAPI budget.
     """
+    # Sort by scheduled arrival ASC so we prioritize the inbounds whose target
+    # vuelo is most imminent. Rows missing scheduled_in_utc go to the end.
+    def _sched_key(r: dict) -> str:
+        return r.get("scheduled_in_utc") or r.get("scheduled_in") or "9999"
+
+    target_rows_sorted = sorted(target_rows, key=_sched_key)
+
     inbound_ids: list[str] = []
     seen: set[str] = set()
-    for r in target_rows:
+    for r in target_rows_sorted:
         inbound = r.get("inbound_fa_flight_id")
         if not inbound or inbound in seen:
             continue
@@ -586,11 +613,23 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
         return pd.DataFrame()
 
     # Pull history: completed flights (have actuals) within the last N days.
-    # JOIN by stable_id (not fa_flight_id) because AeroAPI returns slightly
-    # different fa_flight_id suffixes from /scheduled_* vs /departures-/arrivals
-    # endpoints — the actuals could be orphaned from their flight rows otherwise.
+    # Cross-source reconciliation (Fix B in FIXES_PLAN.md):
+    #   - Harvester FR24 writes stable_id = fa_flight_id (hex, no normalization)
+    #   - AeroAPI writes stable_id = "<IDENT>-<TIMESTAMP>" (stripped suffix)
+    # For the same physical flight, the two sources produce DIFFERENT stable_ids,
+    # so a plain JOIN by stable_id misses cross-source rows: if harvester wrote
+    # `flights` but only AeroAPI captured the actuals (or vice versa), the
+    # inbound's arr_delay is lost and `prev_arr_delay_tail` ends up NaN.
+    #
+    # Strategy:
+    #   1. Primary path: stable_id JOIN (covers same-source rows efficiently)
+    #   2. Fallback: for flights without actuals in path 1, build a lookup
+    #      keyed by (tail_num, scheduled_off_utc rounded to minute) from ANY
+    #      actuals whose parent flight row has those fields populated, then
+    #      enrich the orphans.
     earliest = (datetime.now(timezone.utc) - timedelta(days=history_days)).isoformat()
-    history = pd.read_sql_query(
+
+    history_primary = pd.read_sql_query(
         """SELECT f.*, a.arr_delay_min, a.departure_delay_min, a.cancelled AS act_cancelled,
                   a.diverted AS act_diverted
            FROM flights f
@@ -599,6 +638,56 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
              AND f.stable_id IS NOT NULL""",
         conn, params=(earliest,),
     )
+
+    # Find flights with NO actuals via stable_id — candidates for cross-source rescue.
+    orphans = pd.read_sql_query(
+        """SELECT f.*
+           FROM flights f
+           LEFT JOIN actuals a ON a.stable_id = f.stable_id
+           WHERE f.scheduled_off_utc >= ?
+             AND f.stable_id IS NOT NULL
+             AND f.tail_num IS NOT NULL
+             AND f.scheduled_off_utc IS NOT NULL
+             AND a.stable_id IS NULL""",
+        conn, params=(earliest,),
+    )
+
+    rescued = pd.DataFrame()
+    if not orphans.empty:
+        # Build a (tail_num, scheduled_off_utc) → actuals lookup using any flights
+        # row that DOES have actuals via stable_id JOIN (regardless of source).
+        actuals_lookup = pd.read_sql_query(
+            """SELECT f.tail_num, f.scheduled_off_utc,
+                      a.arr_delay_min, a.departure_delay_min,
+                      a.cancelled AS act_cancelled, a.diverted AS act_diverted
+               FROM flights f
+               JOIN actuals a ON a.stable_id = f.stable_id
+               WHERE f.scheduled_off_utc >= ?
+                 AND f.tail_num IS NOT NULL
+                 AND f.scheduled_off_utc IS NOT NULL
+                 AND a.arr_delay_min IS NOT NULL""",
+            conn, params=(earliest,),
+        )
+        if not actuals_lookup.empty:
+            # Round to minute to absorb tiny epoch-second drift between sources.
+            def _key(s):
+                return pd.to_datetime(s, errors="coerce", utc=True).dt.floor("min")
+
+            orphans["_match_key"] = _key(orphans["scheduled_off_utc"])
+            actuals_lookup["_match_key"] = _key(actuals_lookup["scheduled_off_utc"])
+            # Dedup the lookup: one (tail, time) → first actuals row.
+            actuals_lookup = actuals_lookup.drop_duplicates(subset=["tail_num", "_match_key"])
+            rescued = orphans.merge(
+                actuals_lookup[["tail_num", "_match_key", "arr_delay_min",
+                                "departure_delay_min", "act_cancelled", "act_diverted"]],
+                on=["tail_num", "_match_key"],
+                how="inner",
+            ).drop(columns=["_match_key"])
+            if not rescued.empty:
+                print(f"   cross-source reconciliation: rescued {len(rescued)} orphan flights "
+                      f"({len(rescued) / max(len(orphans), 1):.0%} of orphans)")
+
+    history = pd.concat([history_primary, rescued], ignore_index=True) if not rescued.empty else history_primary
 
     df = pd.concat([
         history.assign(_role="history"),
@@ -625,10 +714,15 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
     df["ARR_DELAY"] = pd.to_numeric(df["arr_delay_min"], errors="coerce")
 
     # Event timestamps — harvester FR24 escribe '2026-05-22T22:00:00+00:00' (TZ-aware)
-    # mientras AeroAPI escribe '2026-05-22T22:00:00' (TZ-naive). Normalizamos a naive
-    # UTC para que astype("datetime64[ns]") no rompa con TypeError.
-    df["EVENT_ORIGIN_UTC"] = pd.to_datetime(df["scheduled_off_utc"], errors="coerce", utc=True).dt.tz_localize(None).astype("datetime64[ns]")
-    df["EVENT_DEST_UTC"] = pd.to_datetime(df["scheduled_on_utc"], errors="coerce", utc=True).dt.tz_localize(None).astype("datetime64[ns]")
+    # mientras AeroAPI escribe '2026-05-22T22:00:00' (TZ-naive).
+    # format='ISO8601' es CRÍTICO: sin esto, pandas con errors='coerce' infiere
+    # un único formato del primer valor de la serie y cae en NaT silencioso los
+    # del otro formato → 22% de las filas pierden EVENT_*_UTC → todas las
+    # lineage/rolling features quedan en NaN (run 857/858 al 100% NaN).
+    # Ver TZ_REGRESSION_DIAGNOSIS.md y comparar con el `format="ISO8601"` que ya
+    # se usa en `_merge_weather_asof` para la misma razón.
+    df["EVENT_ORIGIN_UTC"] = pd.to_datetime(df["scheduled_off_utc"], errors="coerce", utc=True, format="ISO8601").dt.tz_localize(None).astype("datetime64[ns]")
+    df["EVENT_DEST_UTC"] = pd.to_datetime(df["scheduled_on_utc"], errors="coerce", utc=True, format="ISO8601").dt.tz_localize(None).astype("datetime64[ns]")
     df["DEP_LOCAL_DT"] = df["FL_DATE"] + pd.to_timedelta(df["CRS_DEP_MIN"], unit="m")
 
     # NA-safe: harvester (FR24) puede traer vuelos privados sin ORIGIN/DEST.

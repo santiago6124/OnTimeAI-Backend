@@ -1,0 +1,30 @@
+# Force LF endings for files that are parsed by tools that don't handle CRLF.
+# LightGBM 4.x parsers SIGSEGV on CRLF model files (see HALLAZGOS_LIVE_PREDICT_FIX.md §3.4)
+# — model.lgb generated on Windows or re-saved via Notepad would otherwise corrupt the artifact.
+*.lgb text eol=lf
+*.joblib binary
+
+# Python sources — keep LF so docker (Linux) and dev (Windows) agree.
+*.py text eol=lf
+
+# Shell scripts must be LF or bash fails on Linux.
+*.sh text eol=lf
+deploy.sh text eol=lf
+
+# Dockerfiles and YAML configs — LF.
+Dockerfile text eol=lf
+Dockerfile.* text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+
+# Markdown / docs — also LF for diff cleanliness.
+*.md text eol=lf
+
+# JSON artifacts — LF.
+*.json text eol=lf
+
+# SQL — LF.
+*.sql text eol=lf
+
+# Lock files & generated artifacts.
+requirements*.txt text eol=lf

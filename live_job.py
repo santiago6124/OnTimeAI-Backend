@@ -42,8 +42,25 @@ def main() -> int:
         print("[job] GCS_BUCKET no configurado, usando DB local.")
         shutil.copy(BUNDLED_DB, TMP_DB)
 
-    # live_pull.main() usa parse_args() — sys.argv vacío usa todos los defaults
-    sys.argv = [sys.argv[0]]
+    # live_pull.main() usa parse_args() — sys.argv vacío usa defaults.
+    # Permitimos override de args clave via env vars (útil para backfill o
+    # diagnóstico). Si no están seteadas, mantenemos defaults.
+    extra_args: list[str] = []
+    for env_name, flag in (
+        ("ACTUALS_HOURS", "--actuals-hours"),
+        ("ACTUALS_OFFSET_HOURS", "--actuals-offset-hours"),
+        ("SCHEDULE_HOURS", "--schedule-hours"),
+        ("CHAIN_WALK_MAX", "--chain-walk-max"),
+        ("TARGET_POS_RATE", "--target-pos-rate"),
+        ("MAX_PAGES", "--max-pages"),
+    ):
+        val = os.environ.get(env_name)
+        if val:
+            extra_args.extend([flag, val])
+
+    sys.argv = [sys.argv[0]] + extra_args
+    if extra_args:
+        print(f"[job] live_pull args from env: {' '.join(extra_args)}")
     sys.path.insert(0, str(Path(__file__).parent))
     import live_pull
     exit_code = live_pull.main()
