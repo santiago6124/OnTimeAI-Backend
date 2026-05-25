@@ -28,6 +28,7 @@ from ontimeai.live import (
     aeroapi_to_flight_row, upsert_flights, upsert_actuals_from_aeroapi, upsert_weather,
     build_inference_frame, chain_walk_inbound, AIRPORTS, stable_id,
     snapshot_nas_status, latest_nas_status, gdp_post_prediction_adjust,
+    compute_atl_arrival_congestion, carrier_delay_rate_bayesian,
 )
 from ontimeai.lineage_fallback import load_lookups
 from ontimeai.model import load_artifact, predict_label, predict_proba, quantile_threshold
@@ -379,21 +380,30 @@ def main() -> int:
             if gdp_adjust_enabled
             else proba_raw
         )
-        # Recompute label against adjusted proba so the threshold check is
-        # consistent with what we persist. Use the already-computed threshold.
         label_adj = int(proba_adj >= threshold_used)
+        # Diagnostic features (Tier 2 #I, #J) — computed live, NOT in
+        # feature_cols of v9. Persisted for future v9.1 retrain analysis.
+        atl_window = compute_atl_arrival_congestion(
+            conn, df.loc[i, "scheduled_in_utc"], window_minutes=30,
+        )
+        carrier_smooth = carrier_delay_rate_bayesian(
+            conn, df.loc[i, "op_carrier"], df.loc[i, "scheduled_off_utc"],
+            window_hours=24.0, alpha=20.0, prior_window_hours=168.0,
+        )
         pred_rows.append((
             df.loc[i, "fa_flight_id"], stable_id(df.loc[i, "fa_flight_id"]),
             pred_now, float(proba_adj), label_adj,
             float(threshold_used), threshold_strategy,
             proba_raw, float(gdp_orig), float(gdp_dest),
+            int(atl_window), (float(carrier_smooth) if carrier_smooth is not None else None),
         ))
     conn.executemany(
         """INSERT OR REPLACE INTO predictions
            (fa_flight_id, stable_id, predicted_at_utc, proba_delay, predicted_delay,
             threshold_used, threshold_strategy,
-            proba_raw, gdp_orig_delay_min, gdp_dest_delay_min)
-           VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            proba_raw, gdp_orig_delay_min, gdp_dest_delay_min,
+            atl_arrivals_in_window_30min, carrier_delay_rate_smooth)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         pred_rows,
     )
     conn.commit()

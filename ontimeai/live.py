@@ -231,7 +231,13 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
 
 
 def _migrate_predictions_gdp_adjustment(conn: sqlite3.Connection) -> None:
-    """Add proba_raw and GDP context columns to existing predictions table."""
+    """Add proba_raw, GDP context, and diagnostic features (Tier 2 #I, #J).
+
+    The atl_arrivals_in_window_30min and carrier_delay_rate_smooth columns
+    are DIAGNOSTIC: computed per prediction but NOT consumed by the v9
+    booster (which doesn't have them in feature_cols). They build the
+    dataset for a future v9.1 retrain.
+    """
     cols = {row[1] for row in conn.execute("PRAGMA table_info(predictions)").fetchall()}
     if "proba_raw" not in cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN proba_raw REAL")
@@ -239,6 +245,10 @@ def _migrate_predictions_gdp_adjustment(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE predictions ADD COLUMN gdp_orig_delay_min REAL")
     if "gdp_dest_delay_min" not in cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN gdp_dest_delay_min REAL")
+    if "atl_arrivals_in_window_30min" not in cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN atl_arrivals_in_window_30min INTEGER")
+    if "carrier_delay_rate_smooth" not in cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN carrier_delay_rate_smooth REAL")
 
 
 def _migrate_predictions_threshold(conn: sqlite3.Connection) -> None:
@@ -629,6 +639,109 @@ def latest_nas_status(conn: sqlite3.Connection, max_age_minutes: int = 30) -> di
         r[0]: {"program_type": r[1], "delay_min": float(r[2]), "reason": r[3] or ""}
         for r in rows
     }
+
+
+def compute_atl_arrival_congestion(
+    conn: sqlite3.Connection,
+    target_sched_in_utc: str,
+    window_minutes: int = 30,
+) -> int:
+    """Count flights scheduled to arrive at ATL within ±`window_minutes` of
+    `target_sched_in_utc`. Tier 2 #I diagnostic.
+
+    Counts EVERY flight regardless of source (harvester + AeroAPI duplicates
+    inflate this slightly but proportionally; the diagnostic is meant to
+    reflect operational density, not deduplicated truth).
+    """
+    if not target_sched_in_utc:
+        return 0
+    try:
+        # Parse to a millisecond-precision ISO so simple string ranges work.
+        ts = pd.to_datetime(target_sched_in_utc, errors="coerce", utc=True, format="ISO8601")
+        if pd.isna(ts):
+            return 0
+        ts_naive = ts.tz_convert(None) if ts.tzinfo else ts
+        lo = (ts_naive - pd.Timedelta(minutes=window_minutes)).isoformat()
+        hi = (ts_naive + pd.Timedelta(minutes=window_minutes)).isoformat()
+    except Exception:
+        return 0
+
+    # Use SQL substr to ignore the tz suffix during comparison so AeroAPI naive
+    # and FR24 tz-aware times compare consistently.
+    row = conn.execute(
+        """SELECT COUNT(*) FROM flights
+           WHERE dest = 'ATL'
+             AND scheduled_in_utc IS NOT NULL
+             AND substr(scheduled_in_utc, 1, 19) >= substr(?, 1, 19)
+             AND substr(scheduled_in_utc, 1, 19) <= substr(?, 1, 19)""",
+        (lo, hi),
+    ).fetchone()
+    return int(row[0]) if row else 0
+
+
+def carrier_delay_rate_bayesian(
+    conn: sqlite3.Connection,
+    carrier: str,
+    target_sched_off_utc: str,
+    window_hours: float = 24.0,
+    alpha: float = 20.0,
+    prior_window_hours: float = 168.0,
+) -> float | None:
+    """Bayesian-smoothed delay rate for `carrier` over the last `window_hours`.
+
+    Tier 2 #J diagnostic. Formula:
+
+        rate = (n_delayed + alpha * prior) / (n_total + alpha)
+
+    where `prior` is the carrier's rate over `prior_window_hours` (7d default).
+    Resolves the "9E with 4 flights 0/4 = perfect 0%" misleading signal seen
+    in run 856.
+
+    Returns None if carrier is unknown.
+    """
+    if not carrier or not target_sched_off_utc:
+        return None
+    try:
+        ts = pd.to_datetime(target_sched_off_utc, errors="coerce", utc=True, format="ISO8601")
+        if pd.isna(ts):
+            return None
+        ts_naive = (ts.tz_convert(None) if ts.tzinfo else ts).isoformat()
+    except Exception:
+        return None
+
+    short_lo = (pd.to_datetime(ts_naive) - pd.Timedelta(hours=window_hours)).isoformat()
+    prior_lo = (pd.to_datetime(ts_naive) - pd.Timedelta(hours=prior_window_hours)).isoformat()
+
+    # Pull both windows in one query for efficiency.
+    short_row = conn.execute(
+        """SELECT COUNT(*) total, SUM(CASE WHEN a.arr_delay_min > 15 THEN 1 ELSE 0 END) delayed
+           FROM flights f JOIN actuals a ON a.stable_id = f.stable_id
+           WHERE f.op_carrier = ?
+             AND f.scheduled_off_utc IS NOT NULL
+             AND substr(f.scheduled_off_utc, 1, 19) >= substr(?, 1, 19)
+             AND substr(f.scheduled_off_utc, 1, 19) < substr(?, 1, 19)
+             AND a.arr_delay_min IS NOT NULL""",
+        (carrier, short_lo, ts_naive),
+    ).fetchone()
+    n_total = short_row[0] or 0
+    n_delayed = short_row[1] or 0
+
+    prior_row = conn.execute(
+        """SELECT COUNT(*) total, SUM(CASE WHEN a.arr_delay_min > 15 THEN 1 ELSE 0 END) delayed
+           FROM flights f JOIN actuals a ON a.stable_id = f.stable_id
+           WHERE f.op_carrier = ?
+             AND f.scheduled_off_utc IS NOT NULL
+             AND substr(f.scheduled_off_utc, 1, 19) >= substr(?, 1, 19)
+             AND substr(f.scheduled_off_utc, 1, 19) < substr(?, 1, 19)
+             AND a.arr_delay_min IS NOT NULL""",
+        (carrier, prior_lo, ts_naive),
+    ).fetchone()
+    prior_total = prior_row[0] or 0
+    prior_delayed = prior_row[1] or 0
+    prior_rate = (prior_delayed / prior_total) if prior_total > 0 else 0.22  # marginal default
+
+    smoothed = (n_delayed + alpha * prior_rate) / (n_total + alpha)
+    return float(smoothed)
 
 
 def gdp_post_prediction_adjust(proba: float, gdp_orig_min: float, gdp_dest_min: float) -> float:
