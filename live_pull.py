@@ -29,6 +29,7 @@ from ontimeai.live import (
     build_inference_frame, chain_walk_inbound, AIRPORTS, stable_id,
     snapshot_nas_status, latest_nas_status, gdp_post_prediction_adjust,
     compute_atl_arrival_congestion, carrier_delay_rate_bayesian,
+    intermediate_dep_delay_adjust,
 )
 from ontimeai.lineage_fallback import load_lookups
 from ontimeai.model import load_artifact, predict_label, predict_proba, quantile_threshold
@@ -171,6 +172,18 @@ def main() -> int:
             print(f"   upserted {n_arr_sched} flights to DB")
         else:
             print("\n[2] (skipped scheduled_arrivals)")
+
+        # ---- 2b. Intermediate actuals (Tier 3 #1): some scheduled_* records
+        # already have actual_off because the target took off but hasn't
+        # arrived yet. Persist them so the prediction phase can boost proba
+        # using the empirical P(arr_delay|dep_delay) relationship.
+        intermediate_recs = [
+            r for r in (sched + arr_sched if not args.skip_arrivals_sched else sched)
+            if r.get("actual_off")
+        ]
+        if intermediate_recs:
+            n_intermediate = upsert_actuals_from_aeroapi(conn, intermediate_recs)
+            print(f"\n[2b] intermediate dep_delay captures: {n_intermediate} flights already departed")
 
         if not args.skip_actuals:
             # ---- 3. completed arrivals to KATL → actuals (settles ARR_TO_ATL preds) ----
@@ -366,6 +379,24 @@ def main() -> int:
     elif not gdp_adjust_enabled:
         print("   GDP adjustment disabled via GDP_ADJUST env")
 
+    # Pre-fetch intermediate dep_delay for all target stable_ids in one query.
+    target_stable_ids = [stable_id(df.loc[i, "fa_flight_id"]) for i in df.index[target_mask]]
+    dep_delay_map: dict[str, float] = {}
+    if target_stable_ids:
+        placeholders = ",".join("?" for _ in target_stable_ids)
+        for row in conn.execute(
+            f"""SELECT stable_id, departure_delay_min FROM actuals
+               WHERE stable_id IN ({placeholders})
+                 AND departure_delay_min IS NOT NULL
+                 AND actual_in_utc IS NULL""",  # only flights that took off but haven't landed
+            target_stable_ids,
+        ).fetchall():
+            dep_delay_map[row[0]] = float(row[1])
+
+    dep_adjust_enabled = os.getenv("DEP_DELAY_ADJUST", "1").lower() in ("1", "true", "yes")
+    if dep_delay_map and dep_adjust_enabled:
+        print(f"   intermediate dep_delay available for {len(dep_delay_map)} targets")
+
     # Persist only target predictions
     pred_now = datetime.now(timezone.utc).isoformat()
     pred_rows: list[tuple] = []
@@ -375,12 +406,22 @@ def main() -> int:
         dest = df.loc[i, "dest"]
         gdp_orig = nas_state.get(origin, {}).get("delay_min", 0.0) if nas_state else 0.0
         gdp_dest = nas_state.get(dest, {}).get("delay_min", 0.0) if nas_state else 0.0
-        proba_adj = (
+
+        # Adjustment chain: raw → GDP boost → intermediate dep_delay boost.
+        proba_after_gdp = (
             gdp_post_prediction_adjust(proba_raw, gdp_orig, gdp_dest)
             if gdp_adjust_enabled
             else proba_raw
         )
+        sid = stable_id(df.loc[i, "fa_flight_id"])
+        dep_delay = dep_delay_map.get(sid)  # None if target hasn't departed yet
+        proba_adj = (
+            intermediate_dep_delay_adjust(proba_after_gdp, dep_delay)
+            if dep_adjust_enabled
+            else proba_after_gdp
+        )
         label_adj = int(proba_adj >= threshold_used)
+
         # Diagnostic features (Tier 2 #I, #J) — computed live, NOT in
         # feature_cols of v9. Persisted for future v9.1 retrain analysis.
         atl_window = compute_atl_arrival_congestion(
@@ -391,24 +432,28 @@ def main() -> int:
             window_hours=24.0, alpha=20.0, prior_window_hours=168.0,
         )
         pred_rows.append((
-            df.loc[i, "fa_flight_id"], stable_id(df.loc[i, "fa_flight_id"]),
+            df.loc[i, "fa_flight_id"], sid,
             pred_now, float(proba_adj), label_adj,
             float(threshold_used), threshold_strategy,
             proba_raw, float(gdp_orig), float(gdp_dest),
             int(atl_window), (float(carrier_smooth) if carrier_smooth is not None else None),
+            (float(dep_delay) if dep_delay is not None else None),
         ))
     conn.executemany(
         """INSERT OR REPLACE INTO predictions
            (fa_flight_id, stable_id, predicted_at_utc, proba_delay, predicted_delay,
             threshold_used, threshold_strategy,
             proba_raw, gdp_orig_delay_min, gdp_dest_delay_min,
-            atl_arrivals_in_window_30min, carrier_delay_rate_smooth)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            atl_arrivals_in_window_30min, carrier_delay_rate_smooth,
+            intermediate_dep_delay_min)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         pred_rows,
     )
     conn.commit()
-    n_boosted = sum(1 for r in pred_rows if r[7] != r[3])  # proba_raw != proba_delay
-    print(f"   wrote {len(pred_rows)} predictions ({n_boosted} adjusted by GDP)")
+    # r[3] = proba_delay (final adjusted), r[7] = proba_raw, r[12] = intermediate_dep_delay_min
+    n_any = sum(1 for r in pred_rows if r[7] is not None and abs(r[7] - r[3]) > 1e-6)
+    n_dep = sum(1 for r in pred_rows if r[12] is not None and r[12] > 5)
+    print(f"   wrote {len(pred_rows)} predictions ({n_any} adjusted, {n_dep} via dep_delay)")
 
     # ---- SHAP top-K persistence (Fix D in FIXES_PLAN.md) ----
     # Compute SHAP values for target rows only, persist top-15 by |shap|.

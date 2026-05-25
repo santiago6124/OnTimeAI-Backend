@@ -249,6 +249,8 @@ def _migrate_predictions_gdp_adjustment(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE predictions ADD COLUMN atl_arrivals_in_window_30min INTEGER")
     if "carrier_delay_rate_smooth" not in cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN carrier_delay_rate_smooth REAL")
+    if "intermediate_dep_delay_min" not in cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN intermediate_dep_delay_min REAL")
 
 
 def _migrate_predictions_threshold(conn: sqlite3.Connection) -> None:
@@ -744,6 +746,33 @@ def carrier_delay_rate_bayesian(
     return float(smoothed)
 
 
+def intermediate_dep_delay_adjust(proba: float, dep_delay_min: float | None) -> float:
+    """Boost proba when the target has ALREADY departed late (Tier 3 #1).
+
+    Empirical P(arr_delay > 15 | dep_delay) from BTS 2021-2024:
+      dep_delay <  5  min  → no signal yet (could recover or hadn't departed)
+      dep_delay  5..15     → ~25%  (marginal — many recover in air)
+      dep_delay 15..30     → ~75%
+      dep_delay 30..60     → ~90%
+      dep_delay >  60      → ~97%
+
+    Returns proba unchanged if dep_delay is None (target hasn't departed yet
+    or actual_off wasn't captured).
+    """
+    if dep_delay_min is None or dep_delay_min < 5:
+        return proba
+    if dep_delay_min < 15:
+        p_from_dep = 0.25
+    elif dep_delay_min < 30:
+        p_from_dep = 0.75
+    elif dep_delay_min < 60:
+        p_from_dep = 0.90
+    else:
+        p_from_dep = 0.97
+    p_adj = 1.0 - (1.0 - proba) * (1.0 - p_from_dep)
+    return min(max(p_adj, 0.0), 0.999)
+
+
 def gdp_post_prediction_adjust(proba: float, gdp_orig_min: float, gdp_dest_min: float) -> float:
     """Boost the delay probability when origin or destination is under a GDP/GS.
 
@@ -904,6 +933,50 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
                       f"({len(rescued) / max(len(orphans), 1):.0%} of orphans)")
 
     history = pd.concat([history_primary, rescued], ignore_index=True) if not rescued.empty else history_primary
+
+    # Tier 3 #4: Cross-source dedup. Harvester (FR24) and AeroAPI write the
+    # SAME physical flight with different fa_flight_id/stable_id. Without
+    # dedup we inflate tail_flights_today_prior, duplicate the lineage sort
+    # entries, and the "previous flight" picker may pick a same-flight twin.
+    # Key: (tail_num, scheduled_off_utc floored to minute). Keep the row with
+    # non-null arr_delay_min if any (preferring the more-settled version).
+    if len(history) > 0 and "tail_num" in history.columns:
+        before_n = len(history)
+        history = history.copy()
+        history["_dedup_min"] = pd.to_datetime(
+            history["scheduled_off_utc"], errors="coerce", utc=True, format="ISO8601",
+        ).dt.floor("min")
+        history["_has_actual"] = history["arr_delay_min"].notna().astype(int)
+        history = (
+            history.sort_values(["tail_num", "_dedup_min", "_has_actual"],
+                                ascending=[True, True, False])
+                   .drop_duplicates(subset=["tail_num", "_dedup_min"], keep="first")
+                   .drop(columns=["_dedup_min", "_has_actual"])
+        )
+        n_dropped = before_n - len(history)
+        if n_dropped > 0:
+            print(f"   cross-source dedup: dropped {n_dropped} duplicate flight rows "
+                  f"({n_dropped / max(before_n, 1):.1%} of history)")
+
+    # Also exclude history rows that overlap the targets themselves (same
+    # tail+sched_off minute). Otherwise the lineage sort can pick "the target's
+    # own twin" as its previous flight.
+    if not target.empty and len(history) > 0:
+        tgt_keys = set(zip(
+            target["tail_num"],
+            pd.to_datetime(target["scheduled_off_utc"], errors="coerce", utc=True,
+                           format="ISO8601").dt.floor("min").astype("string"),
+        ))
+        hist_keys = list(zip(
+            history["tail_num"],
+            pd.to_datetime(history["scheduled_off_utc"], errors="coerce", utc=True,
+                           format="ISO8601").dt.floor("min").astype("string"),
+        ))
+        keep_mask = [k not in tgt_keys for k in hist_keys]
+        if not all(keep_mask):
+            n_excl = len(history) - sum(keep_mask)
+            history = history[keep_mask].reset_index(drop=True)
+            print(f"   excluded {n_excl} history rows that overlap targets (self-leakage prevention)")
 
     df = pd.concat([
         history.assign(_role="history"),
