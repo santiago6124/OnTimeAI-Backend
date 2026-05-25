@@ -251,6 +251,8 @@ def _migrate_predictions_gdp_adjustment(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE predictions ADD COLUMN carrier_delay_rate_smooth REAL")
     if "intermediate_dep_delay_min" not in cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN intermediate_dep_delay_min REAL")
+    if "adsb_eta_delay_min" not in cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN adsb_eta_delay_min REAL")
 
 
 def _migrate_predictions_threshold(conn: sqlite3.Connection) -> None:
@@ -744,6 +746,122 @@ def carrier_delay_rate_bayesian(
 
     smoothed = (n_delayed + alpha * prior_rate) / (n_total + alpha)
     return float(smoothed)
+
+
+# --- ADS-B ETA (Tier 3 #3) ----------------------------------------------------
+
+_ATL_LAT = 33.6367
+_ATL_LON = -84.4281
+
+
+def _haversine_nm(lat: float, lon: float) -> float:
+    """Great-circle distance in nautical miles from (lat,lon) to KATL."""
+    import math
+    R_NM = 3440.065
+    lat1, lon1 = math.radians(_ATL_LAT), math.radians(_ATL_LON)
+    lat2, lon2 = math.radians(lat), math.radians(lon)
+    dlat, dlon = lat2 - lat1, lon2 - lon1
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) ** 2
+    return R_NM * 2.0 * math.asin(min(1.0, math.sqrt(a)))
+
+
+def compute_adsb_eta_delay(
+    conn: sqlite3.Connection,
+    tail_num: str | None,
+    scheduled_in_utc: str | None,
+    *,
+    dest: str | None = None,
+    max_age_minutes: int = 30,
+) -> float | None:
+    """Compute estimated arrival delay (minutes) from ADS-B position (Tier 3 #3).
+
+    Returns None if:
+      - no recent position for this tail
+      - aircraft is on the ground (taxiing or stopped)
+      - aircraft is too far away (>500nm — probably not the current leg)
+      - velocity too low to derive useful ETA (<50kt → on approach taxiing or
+        gate, not climbing/cruising)
+      - dest != ATL (only arrivals to ATL benefit from in-air ETA boost)
+      - timestamps don't parse
+
+    Positive return = predicted arrival LATER than scheduled (delay).
+    Negative return = predicted EARLIER than scheduled (early).
+    """
+    if not tail_num or not scheduled_in_utc:
+        return None
+    # Only meaningful for arrivals to ATL; departures from ATL haven't reached
+    # cruise yet at our typical capture window.
+    if (dest or "").upper() != "ATL":
+        return None
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)).isoformat()
+    try:
+        row = conn.execute(
+            """SELECT lat, lon, velocity_mps, on_ground, captured_at_utc
+               FROM aircraft_position
+               WHERE registration = ?
+                 AND captured_at_utc >= ?
+                 AND lat IS NOT NULL AND lon IS NOT NULL
+               ORDER BY captured_at_utc DESC LIMIT 1""",
+            (str(tail_num).strip().upper(), cutoff),
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None  # aircraft_position table doesn't exist yet
+    if not row:
+        return None
+
+    lat, lon, v_mps, on_ground, captured = row[0], row[1], row[2], row[3], row[4]
+    if on_ground == 1:
+        return None
+    if v_mps is None or v_mps < 25.7:  # ~50 kt
+        return None
+
+    distance_nm = _haversine_nm(float(lat), float(lon))
+    if distance_nm > 500 or distance_nm < 1:
+        return None
+
+    # Convert m/s to nm/min: 1 m/s = 1.94384 kt = 1.94384/60 nm/min
+    velocity_nm_per_min = float(v_mps) * 1.94384 / 60.0
+    if velocity_nm_per_min < 0.5:
+        return None
+    eta_minutes_from_capture = distance_nm / velocity_nm_per_min
+
+    try:
+        capture_ts = pd.to_datetime(captured, errors="coerce", utc=True, format="ISO8601")
+        sched_ts = pd.to_datetime(scheduled_in_utc, errors="coerce", utc=True, format="ISO8601")
+        if pd.isna(capture_ts) or pd.isna(sched_ts):
+            return None
+        predicted_in = capture_ts + pd.Timedelta(minutes=eta_minutes_from_capture)
+        return float((predicted_in - sched_ts).total_seconds() / 60.0)
+    except Exception:
+        return None
+
+
+def adsb_eta_adjust(proba: float, adsb_delay_min: float | None) -> float:
+    """Boost proba when ADS-B ETA suggests arrival delay (Tier 3 #3).
+
+    In-air ETAs are typically MORE accurate than dep_delay extrapolations
+    because cruise speed + remaining distance leaves little room for
+    recovery. Scale slightly stronger than intermediate_dep_delay.
+
+      adsb_delay <  5     : no boost (on-time or early)
+      adsb_delay  5..15   : 0.30
+      adsb_delay 15..30   : 0.80
+      adsb_delay 30..60   : 0.93
+      adsb_delay >  60    : 0.98
+    """
+    if adsb_delay_min is None or adsb_delay_min < 5:
+        return proba
+    if adsb_delay_min < 15:
+        p_from_eta = 0.30
+    elif adsb_delay_min < 30:
+        p_from_eta = 0.80
+    elif adsb_delay_min < 60:
+        p_from_eta = 0.93
+    else:
+        p_from_eta = 0.98
+    p_adj = 1.0 - (1.0 - proba) * (1.0 - p_from_eta)
+    return min(max(p_adj, 0.0), 0.999)
 
 
 def intermediate_dep_delay_adjust(proba: float, dep_delay_min: float | None) -> float:
