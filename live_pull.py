@@ -27,6 +27,7 @@ from ontimeai.live import (
     open_db, fetch_airport_flights, fetch_iem_obs,
     aeroapi_to_flight_row, upsert_flights, upsert_actuals_from_aeroapi, upsert_weather,
     build_inference_frame, chain_walk_inbound, AIRPORTS, stable_id,
+    snapshot_nas_status, latest_nas_status, gdp_post_prediction_adjust,
 )
 from ontimeai.lineage_fallback import load_lookups
 from ontimeai.model import load_artifact, predict_label, predict_proba, quantile_threshold
@@ -227,6 +228,16 @@ def main() -> int:
             n_wx = upsert_weather(conn, wx)
             print(f"   upserted {n_wx} weather observations")
 
+    # ---- 4b. FAA NAS Status snapshot (Tier 2 #K) ----
+    # Capture programs (GDP/GS/Closure) active right now. Persists into
+    # nas_status table for both historical dataset building and immediate
+    # post-prediction adjustment below.
+    n_nas = snapshot_nas_status(conn)
+    if n_nas > 0:
+        print(f"\n[4b] NAS snapshot: {n_nas} airports under active programs")
+    else:
+        print("\n[4b] NAS snapshot: no active programs (or fetch failed)")
+
     # ---- 5. predict scheduled flights ----
     print("\n[5] Building features and predicting...")
     target_ids = [r["fa_flight_id"] for r in sched_rows + arr_sched_rows]
@@ -340,23 +351,54 @@ def main() -> int:
         else f"   threshold strategy={threshold_strategy} value={threshold_used:.4f} (no targets)"
     )
 
+    # Post-prediction GDP adjustment (Tier 2 #K). The v9 model was trained
+    # without GDP_FLAG in its feature_cols, so even if the live feature
+    # pipeline computes GDP_FLAG it doesn't reach the booster. We compensate
+    # by adjusting `proba` after the fact when ORIGIN or DEST is under a
+    # program. `proba_raw` is preserved so we can A/B test the lift.
+    nas_state = latest_nas_status(conn, max_age_minutes=30)
+    gdp_adjust_enabled = os.getenv("GDP_ADJUST", "1").lower() in ("1", "true", "yes")
+    if nas_state and gdp_adjust_enabled:
+        affected = [a for a in nas_state if a in {df.loc[i, "origin"] for i in df.index[target_mask]} | {df.loc[i, "dest"] for i in df.index[target_mask]}]
+        if affected:
+            print(f"   GDP adjustment: {len(affected)} target-relevant airports under program: {affected}")
+    elif not gdp_adjust_enabled:
+        print("   GDP adjustment disabled via GDP_ADJUST env")
+
     # Persist only target predictions
     pred_now = datetime.now(timezone.utc).isoformat()
-    pred_rows = [
-        (df.loc[i, "fa_flight_id"], stable_id(df.loc[i, "fa_flight_id"]),
-         pred_now, float(proba[i]), int(labels[i]),
-         float(threshold_used), threshold_strategy)
-        for i in df.index[target_mask]
-    ]
+    pred_rows: list[tuple] = []
+    for i in df.index[target_mask]:
+        proba_raw = float(proba[i])
+        origin = df.loc[i, "origin"]
+        dest = df.loc[i, "dest"]
+        gdp_orig = nas_state.get(origin, {}).get("delay_min", 0.0) if nas_state else 0.0
+        gdp_dest = nas_state.get(dest, {}).get("delay_min", 0.0) if nas_state else 0.0
+        proba_adj = (
+            gdp_post_prediction_adjust(proba_raw, gdp_orig, gdp_dest)
+            if gdp_adjust_enabled
+            else proba_raw
+        )
+        # Recompute label against adjusted proba so the threshold check is
+        # consistent with what we persist. Use the already-computed threshold.
+        label_adj = int(proba_adj >= threshold_used)
+        pred_rows.append((
+            df.loc[i, "fa_flight_id"], stable_id(df.loc[i, "fa_flight_id"]),
+            pred_now, float(proba_adj), label_adj,
+            float(threshold_used), threshold_strategy,
+            proba_raw, float(gdp_orig), float(gdp_dest),
+        ))
     conn.executemany(
         """INSERT OR REPLACE INTO predictions
            (fa_flight_id, stable_id, predicted_at_utc, proba_delay, predicted_delay,
-            threshold_used, threshold_strategy)
-           VALUES (?,?,?,?,?,?,?)""",
+            threshold_used, threshold_strategy,
+            proba_raw, gdp_orig_delay_min, gdp_dest_delay_min)
+           VALUES (?,?,?,?,?,?,?,?,?,?)""",
         pred_rows,
     )
     conn.commit()
-    print(f"   wrote {len(pred_rows)} predictions")
+    n_boosted = sum(1 for r in pred_rows if r[7] != r[3])  # proba_raw != proba_delay
+    print(f"   wrote {len(pred_rows)} predictions ({n_boosted} adjusted by GDP)")
 
     # ---- SHAP top-K persistence (Fix D in FIXES_PLAN.md) ----
     # Compute SHAP values for target rows only, persist top-15 by |shap|.
