@@ -30,6 +30,7 @@ from ontimeai.live import (
     snapshot_nas_status, latest_nas_status, gdp_post_prediction_adjust,
     compute_atl_arrival_congestion, carrier_delay_rate_bayesian,
     intermediate_dep_delay_adjust, compute_adsb_eta_delay, adsb_eta_adjust,
+    compute_adsb_holding_min, adsb_holding_adjust,
 )
 from ontimeai.lineage_fallback import load_lookups, build_live_turnaround_lookups
 from ontimeai.model import load_artifact, predict_label, predict_proba, quantile_threshold
@@ -483,7 +484,23 @@ def main() -> int:
             if adsb_enabled
             else None
         )
-        proba_adj = adsb_eta_adjust(proba_after_dep, adsb_delay) if adsb_enabled else proba_after_dep
+        proba_after_eta = (
+            adsb_eta_adjust(proba_after_dep, adsb_delay) if adsb_enabled else proba_after_dep
+        )
+
+        # Mid win #5 — ADS-B holding pattern detection (orbiting near ATL)
+        holding_min = (
+            compute_adsb_holding_min(
+                conn,
+                tail_num=df.loc[i, "tail_num"],
+                dest=df.loc[i, "dest"],
+            )
+            if adsb_enabled
+            else None
+        )
+        proba_adj = (
+            adsb_holding_adjust(proba_after_eta, holding_min) if adsb_enabled else proba_after_eta
+        )
         label_adj = int(proba_adj >= threshold_used)
 
         # Diagnostic features (Tier 2 #I, #J) — computed live, NOT in
@@ -503,6 +520,7 @@ def main() -> int:
             int(atl_window), (float(carrier_smooth) if carrier_smooth is not None else None),
             (float(dep_delay) if dep_delay is not None else None),
             (float(adsb_delay) if adsb_delay is not None else None),
+            (float(holding_min) if holding_min is not None else None),
         ))
     conn.executemany(
         """INSERT OR REPLACE INTO predictions
@@ -510,20 +528,21 @@ def main() -> int:
             threshold_used, threshold_strategy,
             proba_raw, gdp_orig_delay_min, gdp_dest_delay_min,
             atl_arrivals_in_window_30min, carrier_delay_rate_smooth,
-            intermediate_dep_delay_min, adsb_eta_delay_min)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            intermediate_dep_delay_min, adsb_eta_delay_min, adsb_holding_min)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         pred_rows,
     )
     conn.commit()
     # r[3]=proba_delay (final), r[7]=proba_raw, r[12]=intermediate_dep_delay_min,
-    # r[13]=adsb_eta_delay_min
+    # r[13]=adsb_eta_delay_min, r[14]=adsb_holding_min
     n_any = sum(1 for r in pred_rows if r[7] is not None and abs(r[7] - r[3]) > 1e-6)
     n_dep = sum(1 for r in pred_rows if r[12] is not None and r[12] > 5)
     n_adsb_available = sum(1 for r in pred_rows if r[13] is not None)
     n_adsb_boost = sum(1 for r in pred_rows if r[13] is not None and r[13] > 5)
+    n_holding = sum(1 for r in pred_rows if r[14] is not None and r[14] >= 5)
     print(f"   wrote {len(pred_rows)} predictions ({n_any} adjusted, "
           f"{n_dep} via dep_delay, {n_adsb_available} with adsb_eta "
-          f"of which {n_adsb_boost} boosted)")
+          f"of which {n_adsb_boost} boosted, {n_holding} in holding pattern)")
 
     # ---- SHAP top-K persistence (Fix D in FIXES_PLAN.md) ----
     # Compute SHAP values for target rows only, persist top-15 by |shap|.

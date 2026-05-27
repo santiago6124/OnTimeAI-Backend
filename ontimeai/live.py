@@ -226,6 +226,7 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
     _migrate_predictions_threshold(conn)
     _migrate_stable_ids(conn)
     _migrate_predictions_gdp_adjustment(conn)
+    _migrate_nas_status(conn)
     conn.commit()
     return conn
 
@@ -253,6 +254,8 @@ def _migrate_predictions_gdp_adjustment(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE predictions ADD COLUMN intermediate_dep_delay_min REAL")
     if "adsb_eta_delay_min" not in cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN adsb_eta_delay_min REAL")
+    if "adsb_holding_min" not in cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN adsb_holding_min REAL")
 
 
 def _migrate_predictions_threshold(conn: sqlite3.Connection) -> None:
@@ -262,6 +265,15 @@ def _migrate_predictions_threshold(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE predictions ADD COLUMN threshold_used REAL")
     if "threshold_strategy" not in cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN threshold_strategy TEXT")
+
+
+def _migrate_nas_status(conn: sqlite3.Connection) -> None:
+    """Add end_time_utc / max_delay_min columns to nas_status (Mid win #6)."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(nas_status)").fetchall()}
+    if "end_time_utc" not in cols:
+        conn.execute("ALTER TABLE nas_status ADD COLUMN end_time_utc TEXT")
+    if "max_delay_min" not in cols:
+        conn.execute("ALTER TABLE nas_status ADD COLUMN max_delay_min REAL")
 
 
 def _migrate_stable_ids(conn: sqlite3.Connection) -> None:
@@ -613,13 +625,18 @@ def snapshot_nas_status(conn: sqlite3.Connection) -> int:
 
     now_iso = datetime.now(timezone.utc).isoformat()
     rows = [
-        (now_iso, ap, info["type"], float(info["delay_min"]), info.get("reason", ""))
+        (now_iso, ap, info["type"], float(info["delay_min"]),
+         info.get("reason", ""),
+         info.get("end_time_utc"),
+         (float(info["max_delay_min"]) if info.get("max_delay_min") is not None
+          else float(info["delay_min"])))
         for ap, info in snapshot.items()
     ]
     conn.executemany(
         """INSERT OR REPLACE INTO nas_status
-           (captured_at_utc, airport, program_type, delay_min, reason)
-           VALUES (?,?,?,?,?)""",
+           (captured_at_utc, airport, program_type, delay_min, reason,
+            end_time_utc, max_delay_min)
+           VALUES (?,?,?,?,?,?,?)""",
         rows,
     )
     conn.commit()
@@ -627,22 +644,49 @@ def snapshot_nas_status(conn: sqlite3.Connection) -> int:
 
 
 def latest_nas_status(conn: sqlite3.Connection, max_age_minutes: int = 30) -> dict:
-    """Return {airport: {program_type, delay_min, reason}} from the most-recent
-    nas_status snapshot within `max_age_minutes`. Empty dict if stale or absent.
+    """Return {airport: {program_type, delay_min, reason, end_time_utc,
+    max_delay_min}} from the most-recent nas_status snapshot within
+    `max_age_minutes`. Programs whose `end_time_utc` is already in the past
+    are dropped (Mid win #6) so post-prediction adjustment doesn't keep
+    applying delays from programs that have already terminated.
+    Empty dict if stale or absent.
     """
     cutoff = (datetime.now(timezone.utc) - timedelta(minutes=max_age_minutes)).isoformat()
-    rows = conn.execute(
-        """SELECT airport, program_type, delay_min, reason
-           FROM nas_status
-           WHERE captured_at_utc >= ?
-             AND captured_at_utc = (SELECT MAX(captured_at_utc) FROM nas_status
-                                    WHERE captured_at_utc >= ?)""",
-        (cutoff, cutoff),
-    ).fetchall()
-    return {
-        r[0]: {"program_type": r[1], "delay_min": float(r[2]), "reason": r[3] or ""}
-        for r in rows
-    }
+    try:
+        rows = conn.execute(
+            """SELECT airport, program_type, delay_min, reason,
+                      end_time_utc, max_delay_min
+               FROM nas_status
+               WHERE captured_at_utc >= ?
+                 AND captured_at_utc = (SELECT MAX(captured_at_utc) FROM nas_status
+                                        WHERE captured_at_utc >= ?)""",
+            (cutoff, cutoff),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        # Older snapshots predate the end_time_utc / max_delay_min migration.
+        rows = conn.execute(
+            """SELECT airport, program_type, delay_min, reason, NULL, delay_min
+               FROM nas_status
+               WHERE captured_at_utc >= ?
+                 AND captured_at_utc = (SELECT MAX(captured_at_utc) FROM nas_status
+                                        WHERE captured_at_utc >= ?)""",
+            (cutoff, cutoff),
+        ).fetchall()
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    result: dict = {}
+    for r in rows:
+        end_iso = r[4]
+        if end_iso and end_iso < now_iso:
+            continue  # program already terminated
+        result[r[0]] = {
+            "program_type": r[1],
+            "delay_min": float(r[2]),
+            "reason": r[3] or "",
+            "end_time_utc": end_iso,
+            "max_delay_min": float(r[5]) if r[5] is not None else float(r[2]),
+        }
+    return result
 
 
 def compute_atl_arrival_congestion(
@@ -861,6 +905,111 @@ def adsb_eta_adjust(proba: float, adsb_delay_min: float | None) -> float:
     else:
         p_from_eta = 0.98
     p_adj = 1.0 - (1.0 - proba) * (1.0 - p_from_eta)
+    return min(max(p_adj, 0.0), 0.999)
+
+
+def compute_adsb_holding_min(
+    conn: sqlite3.Connection,
+    tail_num: str | None,
+    *,
+    dest: str | None = None,
+    window_minutes: int = 25,
+    min_observations: int = 4,
+    min_time_span_min: float = 7.0,
+    max_distance_nm: float = 80.0,
+    max_net_progress_nm: float = 8.0,
+    max_position_spread_nm: float = 25.0,
+) -> float | None:
+    """Detect ATL-bound aircraft holding/orbiting near the airport (Mid win #5).
+
+    A holding pattern shows up in ADS-B as several positions in a small area,
+    close to but not arriving at the field, with low net progress over time.
+    Returns minutes spent in the holding pattern (lower bound), or None when
+    no holding pattern is detected.
+
+    Heuristic:
+      - registration must match `tail_num` and have >= `min_observations`
+        positions in the last `window_minutes`
+      - flight must be inbound to ATL (`dest == 'ATL'`); otherwise return None
+      - none of the observations may be on the ground
+      - max distance from ATL across all observations must be <= max_distance_nm
+        (otherwise we are still in cruise, not yet holding)
+      - net progress (first_dist - last_dist) must be <= max_net_progress_nm
+        (otherwise it's a normal approach, not a hold)
+      - position spread (max_dist - min_dist) must be <= max_position_spread_nm
+        (otherwise it's transiting through, not orbiting)
+      - returns observed time span in minutes as a lower bound on holding time
+    """
+    if not tail_num:
+        return None
+    if (dest or "").upper() != "ATL":
+        return None
+
+    cutoff = (datetime.now(timezone.utc) - timedelta(minutes=window_minutes)).isoformat()
+    try:
+        rows = conn.execute(
+            """SELECT lat, lon, on_ground, captured_at_utc
+               FROM aircraft_position
+               WHERE registration = ?
+                 AND captured_at_utc >= ?
+                 AND lat IS NOT NULL AND lon IS NOT NULL
+               ORDER BY captured_at_utc ASC""",
+            (str(tail_num).strip().upper(), cutoff),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return None
+    if len(rows) < min_observations:
+        return None
+    if any(r[2] == 1 for r in rows):
+        return None
+
+    distances = [_haversine_nm(float(r[0]), float(r[1])) for r in rows]
+    if max(distances) > max_distance_nm:
+        return None
+    if (max(distances) - min(distances)) > max_position_spread_nm:
+        return None
+    net_progress = distances[0] - distances[-1]
+    if net_progress > max_net_progress_nm:
+        return None
+
+    try:
+        first_ts = pd.to_datetime(rows[0][3], errors="coerce", utc=True, format="ISO8601")
+        last_ts = pd.to_datetime(rows[-1][3], errors="coerce", utc=True, format="ISO8601")
+        if pd.isna(first_ts) or pd.isna(last_ts):
+            return None
+        span_min = float((last_ts - first_ts).total_seconds() / 60.0)
+    except Exception:
+        return None
+    if span_min < min_time_span_min:
+        return None
+    return span_min
+
+
+def adsb_holding_adjust(proba: float, holding_min: float | None) -> float:
+    """Boost proba when ADS-B shows the inbound aircraft is holding (Mid win #5).
+
+    Holding adds late minutes one-for-one (the aircraft is orbiting instead of
+    landing). Bands are less aggressive than `adsb_eta_adjust` because holding
+    can sometimes resolve in a single orbit (~5 min) without crossing the
+    15-minute DOT delay threshold:
+
+      holding <  5      : no boost
+      holding  5..10    : 0.35
+      holding 10..20    : 0.70
+      holding 20..30    : 0.90
+      holding > 30      : 0.97
+    """
+    if holding_min is None or holding_min < 5:
+        return proba
+    if holding_min < 10:
+        p_from_hold = 0.35
+    elif holding_min < 20:
+        p_from_hold = 0.70
+    elif holding_min < 30:
+        p_from_hold = 0.90
+    else:
+        p_from_hold = 0.97
+    p_adj = 1.0 - (1.0 - proba) * (1.0 - p_from_hold)
     return min(max(p_adj, 0.0), 0.999)
 
 
