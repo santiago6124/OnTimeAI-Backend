@@ -44,6 +44,31 @@ _PROGRAM_TYPES_GDP = {
     "Departure Delay",
 }
 
+# Substrings (case-insensitive) inside an Airport_Closure NOTAM reason that
+# indicate the closure only affects General Aviation / non-scheduled traffic
+# and therefore does NOT impact commercial scheduled flights. Without this
+# filter, items like "!LAS 04/141 LAS AD AP CLSD TO NON SKED TRANSIENT GA
+# ACFT..." were being treated as full 180-minute closures and inflating
+# GDP_ORIG for commercial flights (e.g. F91116 LAS->ATL).
+_GA_ONLY_CLOSURE_MARKERS = (
+    "NON SKED",
+    "NON-SKED",
+    "GA ACFT",
+    "GA TRANSIENT",
+    "TRANSIENT GA",
+    "EXC HEL",
+    "EXCEPT HEL",
+)
+
+
+def _is_ga_only_notam(reason: str) -> bool:
+    """True if a closure reason refers only to General Aviation / non-scheduled
+    traffic restrictions (does not affect commercial scheduled flights)."""
+    if not reason:
+        return False
+    upper = reason.upper()
+    return any(marker in upper for marker in _GA_ONLY_CLOSURE_MARKERS)
+
 
 def _parse_delay_minutes(val: Any) -> float:
     """Parse delay strings into minutes.
@@ -145,12 +170,17 @@ class GdpClient:
                         if airport not in new_cache or max_delay > new_cache[airport]["delay_min"]:
                             new_cache[airport] = {"type": type_name, "delay_min": max_delay, "reason": reason}
 
-                # Airport Closures — treat as GDP_FLAG=1, delay=180 min
+                # Airport Closures — treat as GDP_FLAG=1, delay=180 min,
+                # but SKIP NOTAMs that only restrict General Aviation /
+                # non-scheduled traffic (they don't impact commercial flights).
                 for prog in delay_type.findall(".//Airport_Closure_List/Airport"):
                     airport = (prog.findtext("ARPT") or "").upper()
                     reason  = prog.findtext("Reason") or ""
-                    if airport and airport not in new_cache:
-                        new_cache[airport] = {"type": "Airport Closure", "delay_min": 180.0, "reason": reason}
+                    if not airport or airport in new_cache:
+                        continue
+                    if _is_ga_only_notam(reason):
+                        continue
+                    new_cache[airport] = {"type": "Airport Closure", "delay_min": 180.0, "reason": reason}
 
         except Exception as exc:
             warnings.warn(f"GdpClient: XML parse failed — {exc}")
