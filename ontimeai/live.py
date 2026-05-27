@@ -105,6 +105,8 @@ CREATE TABLE IF NOT EXISTS flights (
     scheduled_off_utc TEXT,
     scheduled_on_utc TEXT,
     scheduled_in_utc TEXT,
+    estimated_out_utc TEXT,
+    estimated_in_utc TEXT,
     crs_elapsed_min REAL,
     distance REAL,
     aircraft_type TEXT,
@@ -226,6 +228,7 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
     _migrate_predictions_threshold(conn)
     _migrate_stable_ids(conn)
     _migrate_predictions_gdp_adjustment(conn)
+    _migrate_estimated_times(conn)
     conn.commit()
     return conn
 
@@ -285,6 +288,15 @@ def _migrate_stable_ids(conn: sqlite3.Connection) -> None:
                     f"UPDATE {table} SET stable_id = ? WHERE fa_flight_id = ?",
                     updates,
                 )
+
+
+def _migrate_estimated_times(conn: sqlite3.Connection) -> None:
+    """Add estimated_out_utc and estimated_in_utc columns to the flights table."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(flights)").fetchall()}
+    if "estimated_out_utc" not in cols:
+        conn.execute("ALTER TABLE flights ADD COLUMN estimated_out_utc TEXT")
+    if "estimated_in_utc" not in cols:
+        conn.execute("ALTER TABLE flights ADD COLUMN estimated_in_utc TEXT")
 
 
 # ----------------------------- aeroapi client -----------------------------
@@ -449,6 +461,9 @@ def aeroapi_to_flight_row(rec: dict, *, strict_airport_filter: bool = True) -> d
     fl_date = local_dt.strftime("%Y-%m-%d")
     crs_dep_min = local_dt.hour * 60 + local_dt.minute
 
+    estimated_out = pd.to_datetime(rec.get("estimated_out"), utc=True).tz_convert(None).isoformat() if rec.get("estimated_out") else None
+    estimated_in = pd.to_datetime(rec.get("estimated_in"), utc=True).tz_convert(None).isoformat() if rec.get("estimated_in") else None
+
     return {
         "fa_flight_id": rec["fa_flight_id"],
         "ident_iata": rec.get("ident_iata"),
@@ -464,6 +479,8 @@ def aeroapi_to_flight_row(rec: dict, *, strict_airport_filter: bool = True) -> d
         "scheduled_off_utc": pd.to_datetime(rec["scheduled_off"], utc=True).tz_convert(None).isoformat() if rec.get("scheduled_off") else None,
         "scheduled_on_utc": pd.to_datetime(rec["scheduled_on"], utc=True).tz_convert(None).isoformat() if rec.get("scheduled_on") else None,
         "scheduled_in_utc": sched_in.isoformat() if sched_in is not None else None,
+        "estimated_out_utc": estimated_out,
+        "estimated_in_utc": estimated_in,
         "crs_elapsed_min": elapsed_min,
         "distance": rec.get("route_distance"),
         "aircraft_type": rec.get("aircraft_type"),
@@ -482,6 +499,7 @@ def upsert_flights(conn: sqlite3.Connection, rows: list[dict]) -> int:
          r["tail_num"], r["origin"], r["dest"], r["inbound_fa_flight_id"],
          r["fl_date"], r["crs_dep_min"],
          r["scheduled_out_utc"], r["scheduled_off_utc"], r["scheduled_on_utc"], r["scheduled_in_utc"],
+         r.get("estimated_out_utc"), r.get("estimated_in_utc"),
          r["crs_elapsed_min"], r["distance"], r["aircraft_type"],
          r["cancelled"], r["diverted"], now, now)
         for r in rows
@@ -491,9 +509,10 @@ def upsert_flights(conn: sqlite3.Connection, rows: list[dict]) -> int:
            (fa_flight_id, stable_id, ident_iata, op_carrier, flight_number, tail_num,
             origin, dest, inbound_fa_flight_id, fl_date, crs_dep_min,
             scheduled_out_utc, scheduled_off_utc, scheduled_on_utc, scheduled_in_utc,
+            estimated_out_utc, estimated_in_utc,
             crs_elapsed_min, distance, aircraft_type, cancelled, diverted,
             first_seen_utc, last_updated_utc)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
            ON CONFLICT(fa_flight_id) DO UPDATE SET
              stable_id=excluded.stable_id,
              tail_num=excluded.tail_num,
@@ -501,6 +520,8 @@ def upsert_flights(conn: sqlite3.Connection, rows: list[dict]) -> int:
              scheduled_off_utc=excluded.scheduled_off_utc,
              scheduled_on_utc=excluded.scheduled_on_utc,
              scheduled_in_utc=excluded.scheduled_in_utc,
+             estimated_out_utc=excluded.estimated_out_utc,
+             estimated_in_utc=excluded.estimated_in_utc,
              crs_elapsed_min=excluded.crs_elapsed_min,
              cancelled=excluded.cancelled,
              diverted=excluded.diverted,

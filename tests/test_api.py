@@ -8,6 +8,11 @@ from api import app
 
 client = TestClient(app)
 
+# Login to authenticate subsequent requests
+res = client.post("/auth/login", json={"username": "admin", "password": "ontimeai2026"})
+if res.status_code == 200:
+    client.headers.update({"Authorization": f"Bearer {res.json()['access_token']}"})
+
 
 # ── /flights ───────────────────────────────────────────────────────────────
 

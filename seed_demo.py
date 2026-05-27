@@ -37,6 +37,8 @@ CREATE TABLE IF NOT EXISTS flights (
     scheduled_off_utc TEXT,
     scheduled_on_utc TEXT,
     scheduled_in_utc TEXT,
+    estimated_out_utc TEXT,
+    estimated_in_utc TEXT,
     crs_elapsed_min REAL,
     distance REAL,
     aircraft_type TEXT,
@@ -163,6 +165,11 @@ def run():
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         if "stable_id" not in cols:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN stable_id TEXT")
+    for table in ("flights",):
+        cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        for col in ("estimated_out_utc", "estimated_in_utc"):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} TEXT")
     for table in ("predictions",):
         cols = {r[1] for r in conn.execute(f"PRAGMA table_info({table})").fetchall()}
         for col in ("threshold_used", "threshold_strategy"):
@@ -201,12 +208,20 @@ def run():
         fl_date = local_dep.strftime("%Y-%m-%d")
         crs_dep_min = local_dep.hour * 60 + local_dep.minute
 
+        # Set estimated times (delayed by 30 min if high risk)
+        est_dep = dep_utc
+        est_arr = arr_utc
+        if proba >= 0.35:
+            est_dep = dep_utc + timedelta(minutes=30)
+            est_arr = arr_utc + timedelta(minutes=30)
+
         flight_rows.append((
             fa_id, stbl, ident, carrier, fnum,
             f"N{400+i}DL", origin, dest, None,
             fl_date, crs_dep_min,
             dep_utc.isoformat(), dep_utc.isoformat(),
             arr_utc.isoformat(), arr_utc.isoformat(),
+            est_dep.isoformat(), est_arr.isoformat(),
             float(elapsed), float(dist), acft,
             0, 0, now_iso, now_iso,
         ))
@@ -249,9 +264,10 @@ def run():
            (fa_flight_id, stable_id, ident_iata, op_carrier, flight_number, tail_num,
             origin, dest, inbound_fa_flight_id, fl_date, crs_dep_min,
             scheduled_out_utc, scheduled_off_utc, scheduled_on_utc, scheduled_in_utc,
+            estimated_out_utc, estimated_in_utc,
             crs_elapsed_min, distance, aircraft_type, cancelled, diverted,
             first_seen_utc, last_updated_utc)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         flight_rows,
     )
 
