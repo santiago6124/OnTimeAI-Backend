@@ -26,6 +26,12 @@ def test_open_db_fresh_includes_threshold_columns(tmp_path: Path) -> None:
     assert {"threshold_used", "threshold_strategy"}.issubset(cols)
 
 
+def test_open_db_includes_estimated_time_columns(tmp_path: Path) -> None:
+    conn = open_db(tmp_path / "fresh_est.db")
+    cols = _columns(conn, "flights")
+    assert {"estimated_out_utc", "estimated_in_utc"}.issubset(cols)
+
+
 def test_open_db_migrates_legacy_predictions_table(tmp_path: Path) -> None:
     db_path = tmp_path / "legacy.db"
     legacy = sqlite3.connect(db_path)

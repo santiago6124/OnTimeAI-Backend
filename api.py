@@ -85,6 +85,8 @@ _PUBLIC_PATHS = {"/auth/login", "/docs", "/openapi.json", "/redoc", "/docs/oauth
 
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
+        if request.method == "OPTIONS":
+            return await call_next(request)
         if request.url.path in _PUBLIC_PATHS or request.url.path.startswith("/redoc"):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
@@ -150,6 +152,16 @@ async def lifespan(app: FastAPI):
             print(f"[startup] GCS download failed, using bundled DB: {e}")
             import shutil
             shutil.copy(_BUNDLED_DB, _TMP_DB)
+            
+    # Trigger database migrations on startup
+    try:
+        from ontimeai.live import open_db
+        conn = open_db(DB_PATH)
+        conn.close()
+        print("[startup] Database migrations executed successfully")
+    except Exception as e:
+        print(f"[startup] Database migration failed: {e}")
+        
     yield
 
 
@@ -160,7 +172,7 @@ _ALLOWED_ORIGINS = [
     o.strip()
     for o in os.getenv(
         "ALLOWED_ORIGINS",
-        "https://ontimeai-frontend-hq7henvhjq-uc.a.run.app,https://ontimeai-frontend-150917658060.us-central1.run.app",
+        "http://localhost:3000,http://127.0.0.1:3000,https://ontimeai-frontend-hq7henvhjq-uc.a.run.app,https://ontimeai-frontend-150917658060.us-central1.run.app",
     ).split(",")
     if o.strip()
 ]
@@ -226,13 +238,16 @@ def _latest_predictions_today(con: sqlite3.Connection) -> list[sqlite3.Row]:
                f.dest,
                f.scheduled_out_utc,
                f.scheduled_in_utc,
+               f.estimated_out_utc,
+               f.estimated_in_utc,
                f.aircraft_type,
                p.proba_delay,
                p.predicted_delay,
                p.predicted_at_utc,
-               CASE WHEN a.fa_flight_id IS NOT NULL THEN 1 ELSE 0 END AS has_actual,
+               CASE WHEN a.arr_delay_min IS NOT NULL THEN 1 ELSE 0 END AS has_actual,
                a.arr_delay_min,
-               a.departure_delay_min
+               a.departure_delay_min,
+               a.actual_out_utc
         FROM flights f
         JOIN (
             SELECT fa_flight_id,
@@ -246,7 +261,6 @@ def _latest_predictions_today(con: sqlite3.Connection) -> list[sqlite3.Row]:
             FROM predictions
         ) p ON p.fa_flight_id = f.fa_flight_id AND p.rn = 1
         LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
-                            AND a.arr_delay_min IS NOT NULL
         WHERE f.scheduled_out_utc LIKE ? || '%'
           AND f.cancelled = 0
         ORDER BY f.scheduled_out_utc
@@ -257,6 +271,13 @@ def _latest_predictions_today(con: sqlite3.Connection) -> list[sqlite3.Row]:
 def _flight_row_to_dict(row: sqlite3.Row) -> dict:
     proba = float(row["proba_delay"])
     ident = row["ident_iata"] or row["flight_number"] or row["fa_flight_id"]
+    
+    # Safely get estimated/actual times (default to scheduled if missing/older records)
+    keys = row.keys()
+    est_out = row["estimated_out_utc"] if "estimated_out_utc" in keys else None
+    est_in = row["estimated_in_utc"] if "estimated_in_utc" in keys else None
+    act_out = row["actual_out_utc"] if "actual_out_utc" in keys else None
+
     return {
         "fa_flight_id":    row["fa_flight_id"],
         "flight_number":   ident,
@@ -265,6 +286,9 @@ def _flight_row_to_dict(row: sqlite3.Row) -> dict:
         "destination":     row["dest"] or "",
         "scheduled_out_utc": row["scheduled_out_utc"] or "",
         "scheduled_in_utc":  row["scheduled_in_utc"] or "",
+        "estimated_out_utc": est_out or row["scheduled_out_utc"] or "",
+        "estimated_in_utc":  est_in or row["scheduled_in_utc"] or "",
+        "actual_out_utc":    act_out,
         "aircraft_type":   row["aircraft_type"] or "",
         "risk":            risk_level(proba),
         "delay_probability": round(proba, 4),
@@ -302,11 +326,41 @@ def auth_me(request: Request):
 # ── Protected routes ────────────────────────────────────────────────────────
 
 @app.get("/flights")
-def list_flights():
+def list_flights(status: str = "all", departures_within_min: int = None):
     con = get_db()
     try:
         rows = _latest_predictions_today(con)
-        return [_flight_row_to_dict(r) for r in rows]
+        flights = [_flight_row_to_dict(r) for r in rows]
+        
+        now = datetime.now(timezone.utc)
+        
+        if status == "departed":
+            flights = [f for f in flights if f["actual_out_utc"] is not None or f["departure_delay_min"] is not None]
+        elif status == "scheduled":
+            flights = [f for f in flights if f["actual_out_utc"] is None and f["departure_delay_min"] is None]
+            
+        if departures_within_min is not None:
+            filtered_flights = []
+            for f in flights:
+                est_out_str = f["estimated_out_utc"] or f["scheduled_out_utc"]
+                if est_out_str:
+                    try:
+                        if est_out_str.endswith("Z"):
+                            est_out_str = est_out_str[:-1] + "+00:00"
+                        est_out = datetime.fromisoformat(est_out_str)
+                        if est_out.tzinfo is None:
+                            est_out = est_out.replace(tzinfo=timezone.utc)
+                        else:
+                            est_out = est_out.astimezone(timezone.utc)
+                            
+                        diff_sec = (est_out - now).total_seconds()
+                        if -15 * 60 <= diff_sec <= departures_within_min * 60:
+                            filtered_flights.append(f)
+                    except Exception:
+                        pass
+            flights = filtered_flights
+            
+        return flights
     finally:
         con.close()
 
