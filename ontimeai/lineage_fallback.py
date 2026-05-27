@@ -195,8 +195,25 @@ def apply_lineage_fallback(df: pd.DataFrame, lookups: dict[str, Any]) -> pd.Data
     # ---- defaults for non-rate lineage features ----
     if "tail_flights_today_prior" in out.columns:
         out["tail_flights_today_prior"] = out["tail_flights_today_prior"].fillna(0)
+
+    # ---- prev_turnaround_tail_min: cascade (Layer 3) ----
+    # When the per-tail chain-walk failed (stale cache, unseen tail, NULL tail),
+    # fall back through carrier+route+hour -> carrier+route -> carrier+hour ->
+    # carrier -> hour -> global -> 60.0 default. The lookups come from the live
+    # `flights` table via build_live_turnaround_lookups (loaded at runtime), so
+    # the model gets a more informed prior than the constant 60.0.
     if "prev_turnaround_tail_min" in out.columns:
-        out["prev_turnaround_tail_min"] = out["prev_turnaround_tail_min"].fillna(60.0)
+        layers = [
+            ([carrier], lookups.get("turnaround_carrier_mean")),
+            ([hour], lookups.get("turnaround_hour_mean")),
+            ([carrier, hour], lookups.get("turnaround_carrier_hour_mean")),
+            ([carrier, origin, dest], lookups.get("turnaround_carrier_route_mean")),
+            ([carrier, origin, dest, hour],
+             lookups.get("turnaround_carrier_route_hour_mean")),
+        ]
+        g_turnaround = float(lookups.get("global_turnaround_mean", 60.0))
+        imputed = _hierarchical_lookup(layers, out.index, g_turnaround)
+        out["prev_turnaround_tail_min"] = out["prev_turnaround_tail_min"].fillna(imputed)
 
     # ---- carrier rate features ----
     carrier_rate_cols = [
@@ -258,6 +275,78 @@ def apply_lineage_fallback(df: pd.DataFrame, lookups: dict[str, Any]) -> pd.Data
         imputed_absorb = 1.0 - imputed_late
         out["absorb_score_origin"] = out["absorb_score_origin"].fillna(imputed_absorb)
 
+    return out
+
+
+def build_live_turnaround_lookups(conn, days: int = 14,
+                                  min_count: int = MIN_GROUP_COUNT) -> dict[str, Any]:
+    """Compute turnaround-minutes lookups from the live `flights` table.
+
+    Joins each flight to its inbound leg via `inbound_fa_flight_id` and
+    computes (scheduled_out - scheduled_in_inbound) as the turnaround. Returns
+    a dict shaped like the keys consumed by apply_lineage_fallback for
+    `prev_turnaround_tail_min`.
+
+    Builds five cascading aggregations from most-specific to least-specific:
+      - (op_carrier, origin, dest, hour)
+      - (op_carrier, origin, dest)
+      - (op_carrier, hour)
+      - (op_carrier,)
+      - (hour,)
+    plus a global mean.
+
+    Skipped buckets (< min_count) fall through to the next layer at lookup time.
+    """
+    sql = f"""
+        SELECT f.op_carrier, f.origin, f.dest,
+               CAST(substr(f.scheduled_out_utc, 12, 2) AS INTEGER) AS hour,
+               (julianday(f.scheduled_out_utc) - julianday(p.scheduled_in_utc))
+                 * 24.0 * 60.0 AS turn_min
+        FROM flights f
+        JOIN flights p ON p.fa_flight_id = f.inbound_fa_flight_id
+        WHERE f.scheduled_out_utc IS NOT NULL
+          AND p.scheduled_in_utc IS NOT NULL
+          AND f.op_carrier IS NOT NULL
+          AND f.origin IS NOT NULL
+          AND f.dest IS NOT NULL
+          AND date(f.scheduled_out_utc) >= date('now', '-{int(days)} days')
+    """
+    df = pd.read_sql_query(sql, conn)
+    # Clip wildly implausible values (chain-walk timestamp glitches)
+    df = df[(df["turn_min"] >= 10.0) & (df["turn_min"] <= 720.0)]
+    if df.empty:
+        return {"global_turnaround_mean": 60.0,
+                "_meta": {"n_rows": 0, "source": "live_flights"}}
+
+    out: dict[str, Any] = {}
+    g = df.groupby(["op_carrier", "origin", "dest", "hour"], observed=True)["turn_min"]
+    grp = g.agg(["mean", "count"])
+    out["turnaround_carrier_route_hour_mean"] = (
+        grp[grp["count"] >= min_count]["mean"].astype(float)
+    )
+    g = df.groupby(["op_carrier", "origin", "dest"], observed=True)["turn_min"]
+    grp = g.agg(["mean", "count"])
+    out["turnaround_carrier_route_mean"] = (
+        grp[grp["count"] >= min_count]["mean"].astype(float)
+    )
+    g = df.groupby(["op_carrier", "hour"], observed=True)["turn_min"]
+    grp = g.agg(["mean", "count"])
+    out["turnaround_carrier_hour_mean"] = (
+        grp[grp["count"] >= min_count]["mean"].astype(float)
+    )
+    g = df.groupby(["op_carrier"], observed=True)["turn_min"]
+    grp = g.agg(["mean", "count"])
+    out["turnaround_carrier_mean"] = (
+        grp[grp["count"] >= min_count]["mean"].astype(float)
+    )
+    g = df.groupby(["hour"], observed=True)["turn_min"]
+    grp = g.agg(["mean", "count"])
+    out["turnaround_hour_mean"] = (
+        grp[grp["count"] >= min_count]["mean"].astype(float)
+    )
+    out["global_turnaround_mean"] = float(df["turn_min"].mean())
+    out["_meta"] = {"n_rows": int(len(df)), "source": "live_flights",
+                    "days": int(days)}
     return out
 
 

@@ -31,7 +31,7 @@ from ontimeai.live import (
     compute_atl_arrival_congestion, carrier_delay_rate_bayesian,
     intermediate_dep_delay_adjust, compute_adsb_eta_delay, adsb_eta_adjust,
 )
-from ontimeai.lineage_fallback import load_lookups
+from ontimeai.lineage_fallback import load_lookups, build_live_turnaround_lookups
 from ontimeai.model import load_artifact, predict_label, predict_proba, quantile_threshold
 from predict import prepare_inference_frame
 from ontimeai.config import ARTIFACTS_DIR
@@ -242,6 +242,37 @@ def main() -> int:
             n_wx = upsert_weather(conn, wx)
             print(f"   upserted {n_wx} weather observations")
 
+    # ---- 4a. Bootstrap unseen tails (Layer 2 lineage fix) ----
+    # When a tail appears in today's schedule but is not in `tail_lineage_cache`,
+    # insert a placeholder row with hydrated_until in the past. The harvester's
+    # `select_tails_to_hydrate` prioritizes never > expired, so unseen tails get
+    # chain-walked within ~30 min of first appearance instead of relying on
+    # the fallback for that tail's entire schedule.
+    target_tails = set()
+    for r in sched_rows + arr_sched_rows:
+        t = r.get("tail_num") or r.get("registration")
+        if t and str(t).strip():
+            target_tails.add(str(t).strip())
+    if target_tails:
+        placeholders = ",".join(["?"] * len(target_tails))
+        cur = conn.execute(
+            f"SELECT tail FROM tail_lineage_cache WHERE tail IN ({placeholders})",
+            list(target_tails),
+        )
+        cached_tails = {r[0] for r in cur.fetchall()}
+        new_tails = target_tails - cached_tails
+        if new_tails:
+            conn.executemany(
+                "INSERT OR IGNORE INTO tail_lineage_cache(tail, hydrated_until, "
+                "last_pull_source, last_pull_ok, consecutive_failures) "
+                "VALUES (?, '1970-01-01T00:00:00+00:00', 'bootstrap-request', 0, 0)",
+                [(t,) for t in new_tails],
+            )
+            conn.commit()
+            print(f"\n[4a] bootstrap: queued {len(new_tails)} unseen tails for next harvester tick")
+        else:
+            print(f"\n[4a] bootstrap: all {len(target_tails)} target tails already cached")
+
     # ---- 4b. FAA NAS Status snapshot (Tier 2 #K) ----
     # Capture programs (GDP/GS/Closure) active right now. Persists into
     # nas_status table for both historical dataset building and immediate
@@ -294,6 +325,25 @@ def main() -> int:
         print(f"   ⚠ lineage fallback artifact missing at {fallback_path} — predictions will use NaN priors (degrades AUC)")
     if fallback is not None:
         print(f"   loaded cold-deck fallback ({fallback_path.name})")
+
+    # Layer 3 fallback: enrich `fallback` with live-DB turnaround aggregations
+    # so prev_turnaround_tail_min cascades through (carrier, route, hour)
+    # buckets rather than collapsing to the 60-min constant. Computed each tick
+    # from the local copy of `flights` -- cheap (~50ms) and self-updating.
+    if fallback is None:
+        fallback = {}
+    try:
+        live_turnaround = build_live_turnaround_lookups(conn, days=14)
+        fallback.update(live_turnaround)
+        meta_t = live_turnaround.get("_meta", {})
+        print(
+            f"   live turnaround lookups: n_rows={meta_t.get('n_rows', 0)} "
+            f"global={live_turnaround.get('global_turnaround_mean', 60.0):.1f}min "
+            f"carrier_buckets={len(live_turnaround.get('turnaround_carrier_mean', []))} "
+            f"route_buckets={len(live_turnaround.get('turnaround_carrier_route_mean', []))}"
+        )
+    except Exception as e:
+        print(f"   ⚠ live turnaround lookup build failed: {e} (cascade disabled, falls back to 60.0)")
 
     # ---- Feature NaN logging & Quality assertions ----
     X_raw = prepare_inference_frame(

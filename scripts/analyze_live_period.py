@@ -384,7 +384,7 @@ def generate_plots(report: dict[str, Any], out_dir: Path) -> None:
         ax.set_xlabel("Date")
         ax.set_ylabel("Metric")
         ax.set_title(
-            f"Daily metrics — {report['period']['since']} → {report['period']['until']}"
+            f"Daily metrics - {report['period']['since']} to {report['period']['until']}"
         )
         ax.legend()
         ax.grid(alpha=0.3)
@@ -453,7 +453,7 @@ def generate_plots(report: dict[str, Any], out_dir: Path) -> None:
         ax.set_yticks([0, 1])
         ax.set_xticklabels(["pred 0", "pred 1"])
         ax.set_yticklabels(["true 0", "true 1"])
-        ax.set_title(f"Confusion matrix — n={report['n_settled_predictions']}")
+        ax.set_title(f"Confusion matrix - n={report['n_settled_predictions']}")
         plt.colorbar(im, ax=ax)
         plt.tight_layout()
         fig.savefig(out_dir / "confusion_matrix.png", dpi=110)
@@ -525,14 +525,14 @@ def main() -> int:
         json.dump(report, f, indent=2, default=str)
     print(f"Wrote {json_path}")
 
-    md_path.write_text(render_md(report))
+    md_path.write_text(render_md(report), encoding="utf-8")
     print(f"Wrote {md_path}")
 
     if not args.no_plots:
         try:
             plots_dir = args.out_dir / "live_period_plots"
             generate_plots(report, plots_dir)
-            print(f"Wrote plots → {plots_dir}/")
+            print(f"Wrote plots -> {plots_dir}/")
         except ImportError:
             print("matplotlib not available — skipping plots (re-run with --no-plots to silence)")
         except Exception as e:
