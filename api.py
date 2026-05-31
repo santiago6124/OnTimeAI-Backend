@@ -227,7 +227,12 @@ def _load_meta() -> dict[str, Any]:
 # ── Helpers ────────────────────────────────────────────────────────────────
 
 def _latest_predictions_today(con: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Latest prediction per flight for flights scheduled today."""
+    """Latest prediction per flight for flights scheduled today.
+
+    Only returns the most recent prediction made BEFORE the flight landed.
+    Post-landing batch runs (e.g. calibration backfills) are excluded so that
+    a retro-prediction never overrides the last valid pre-landing prediction.
+    """
     today = today_utc()
     rows = con.execute("""
         SELECT f.fa_flight_id,
@@ -250,15 +255,18 @@ def _latest_predictions_today(con: sqlite3.Connection) -> list[sqlite3.Row]:
                a.actual_out_utc
         FROM flights f
         JOIN (
-            SELECT fa_flight_id,
-                   proba_delay,
-                   predicted_delay,
-                   predicted_at_utc,
+            SELECT p2.fa_flight_id,
+                   p2.proba_delay,
+                   p2.predicted_delay,
+                   p2.predicted_at_utc,
                    ROW_NUMBER() OVER (
-                       PARTITION BY fa_flight_id
-                       ORDER BY predicted_at_utc DESC
+                       PARTITION BY p2.fa_flight_id
+                       ORDER BY p2.predicted_at_utc DESC
                    ) AS rn
-            FROM predictions
+            FROM predictions p2
+            LEFT JOIN actuals a2 ON a2.fa_flight_id = p2.fa_flight_id
+            WHERE a2.actual_in_utc IS NULL
+               OR p2.predicted_at_utc <= a2.actual_in_utc
         ) p ON p.fa_flight_id = f.fa_flight_id AND p.rn = 1
         LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
         WHERE f.scheduled_out_utc LIKE ? || '%'
