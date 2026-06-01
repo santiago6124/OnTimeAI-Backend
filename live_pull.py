@@ -187,9 +187,8 @@ def main() -> int:
             print(f"\n[2b] intermediate dep_delay captures: {n_intermediate} flights already departed")
 
         if not args.skip_actuals:
-            # Actuals only need a few pages — ATL has ~79 arr/hr × 4h = ~316 flights
-            # but we cap at 4 pages (60 flights) to avoid rate-limiting after the
-            # 10+10 pages already spent on scheduled endpoints.
+            # Cap actuals at 4 pages — sufficient for last 4h of ATL arrivals,
+            # and avoids burning API quota needed for scheduled endpoints.
             actuals_pages = min(args.max_pages, 4)
 
             # ---- 3. completed arrivals to KATL → actuals (settles ARR_TO_ATL preds) ----
@@ -202,13 +201,18 @@ def main() -> int:
             print(f"   wrote {n_act_arr} actuals")
 
             # ---- 3a. completed departures from KATL → actuals (settles DEP_FROM_ATL preds)
+            # Non-fatal: if rate-limited after steps 1+2+3, log and continue.
             print("\n[3a] AeroAPI departures (completed from KATL)...")
-            departed = fetch_airport_flights(args.airport, "departures",
-                                             _iso(arr_start), _iso(arr_end), actuals_pages)
-            landed = [r for r in departed if r.get("actual_in")]
-            print(f"   pulled {len(departed)} departures, {len(landed)} have landed at destination")
-            n_act_dep = upsert_actuals_from_aeroapi(conn, landed)
-            print(f"   wrote {n_act_dep} actuals")
+            try:
+                departed = fetch_airport_flights(args.airport, "departures",
+                                                 _iso(arr_start), _iso(arr_end), actuals_pages)
+                landed = [r for r in departed if r.get("actual_in")]
+                print(f"   pulled {len(departed)} departures, {len(landed)} have landed at destination")
+                n_act_dep = upsert_actuals_from_aeroapi(conn, landed)
+                print(f"   wrote {n_act_dep} actuals")
+            except RuntimeError as _e:
+                print(f"   [3a] skipped (rate-limited): {_e}")
+                n_act_dep = 0
             n_act = n_act_arr + n_act_dep
         else:
             print("\n[3] (skipped actuals)")
