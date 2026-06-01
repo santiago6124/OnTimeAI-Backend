@@ -187,10 +187,15 @@ def main() -> int:
             print(f"\n[2b] intermediate dep_delay captures: {n_intermediate} flights already departed")
 
         if not args.skip_actuals:
+            # Actuals only need a few pages — ATL has ~79 arr/hr × 4h = ~316 flights
+            # but we cap at 4 pages (60 flights) to avoid rate-limiting after the
+            # 10+10 pages already spent on scheduled endpoints.
+            actuals_pages = min(args.max_pages, 4)
+
             # ---- 3. completed arrivals to KATL → actuals (settles ARR_TO_ATL preds) ----
             print("\n[3] AeroAPI arrivals (completed at KATL)...")
             arrived = fetch_airport_flights(args.airport, "arrivals",
-                                            _iso(arr_start), _iso(arr_end), args.max_pages)
+                                            _iso(arr_start), _iso(arr_end), actuals_pages)
             print(f"   pulled {len(arrived)} arrivals")
             arrived_filt = [r for r in arrived if r.get("actual_in")]
             n_act_arr = upsert_actuals_from_aeroapi(conn, arrived_filt)
@@ -199,7 +204,7 @@ def main() -> int:
             # ---- 3a. completed departures from KATL → actuals (settles DEP_FROM_ATL preds)
             print("\n[3a] AeroAPI departures (completed from KATL)...")
             departed = fetch_airport_flights(args.airport, "departures",
-                                             _iso(arr_start), _iso(arr_end), args.max_pages)
+                                             _iso(arr_start), _iso(arr_end), actuals_pages)
             landed = [r for r in departed if r.get("actual_in")]
             print(f"   pulled {len(departed)} departures, {len(landed)} have landed at destination")
             n_act_dep = upsert_actuals_from_aeroapi(conn, landed)
