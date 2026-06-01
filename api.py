@@ -229,9 +229,13 @@ def _load_meta() -> dict[str, Any]:
 def _latest_predictions_today(con: sqlite3.Connection) -> list[sqlite3.Row]:
     """Latest prediction per flight for flights scheduled today.
 
-    Only returns the most recent prediction made BEFORE the flight landed.
-    Post-landing batch runs (e.g. calibration backfills) are excluded so that
-    a retro-prediction never overrides the last valid pre-landing prediction.
+    Selection priority per flight:
+      1. The most recent prediction made BEFORE the flight physically departed
+         (predicted_at <= actual_off) — the genuine pre-departure forecast.
+      2. If none exists (e.g. arrivals only seen en-route), fall back to the
+         most recent prediction made before the flight LANDED.
+    Post-landing batch runs (e.g. calibration backfills) are always excluded so
+    a retro-prediction never overrides a valid pre-landing/pre-departure one.
     """
     today = today_utc()
     rows = con.execute("""
@@ -261,7 +265,12 @@ def _latest_predictions_today(con: sqlite3.Connection) -> list[sqlite3.Row]:
                    p2.predicted_at_utc,
                    ROW_NUMBER() OVER (
                        PARTITION BY p2.fa_flight_id
-                       ORDER BY p2.predicted_at_utc DESC
+                       ORDER BY
+                           -- prefer pre-departure predictions (0) over en-route (1)
+                           CASE WHEN a2.actual_off_utc IS NOT NULL
+                                     AND p2.predicted_at_utc > a2.actual_off_utc
+                                THEN 1 ELSE 0 END ASC,
+                           p2.predicted_at_utc DESC
                    ) AS rn
             FROM predictions p2
             LEFT JOIN actuals a2 ON a2.fa_flight_id = p2.fa_flight_id
