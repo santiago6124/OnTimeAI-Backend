@@ -286,7 +286,44 @@ def main() -> int:
 
     # ---- 5. predict scheduled flights ----
     print("\n[5] Building features and predicting...")
-    target_ids = [r["fa_flight_id"] for r in sched_rows + arr_sched_rows]
+    # Decouple the prediction target from this cycle's fetch. Predicting only the
+    # flights pulled this tick means each flight is scored ~once, minutes before
+    # departure (the scheduled_departures feed only surfaces near-term flights).
+    # Instead, every cycle re-predict ALL upcoming ATL departures whose departure
+    # is still AHEAD — so a fresh PRE-departure prediction always exists and
+    # refines as the gate nears.
+    #
+    # "Still upcoming" = wheels-off not yet recorded (actual_off_utc IS NULL) AND
+    # the best available departure estimate is in the future. We use
+    # COALESCE(estimated_out_utc, scheduled_out_utc) so the predicate is
+    # delay-aware: a delayed flight whose estimated_out slips into the future
+    # stays in the target, while a flight that already departed but hasn't been
+    # settled yet (actual_off lag) is correctly excluded — without this, ~125
+    # departed-but-unsettled flights/cycle would get spurious post-departure
+    # predictions.
+    horizon_h = int(os.getenv("PREDICT_HORIZON_HOURS", str(args.schedule_hours)))
+    db_dep_rows = conn.execute(
+        """
+        SELECT f.fa_flight_id
+        FROM flights f
+        LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
+        WHERE f.origin = 'ATL'
+          AND f.scheduled_out_utc IS NOT NULL
+          AND a.actual_off_utc IS NULL
+          AND datetime(COALESCE(f.estimated_out_utc, f.scheduled_out_utc)) > datetime(?)
+          AND datetime(f.scheduled_out_utc) <= datetime(?, ?)
+          AND COALESCE(f.cancelled, 0) = 0
+        """,
+        (_iso(now), _iso(now), f"+{horizon_h} hours"),
+    ).fetchall()
+    # Union the standing upcoming-departures set with this cycle's freshly fetched
+    # flights (keeps arrivals + brand-new departures not yet committed-visible).
+    target_ids = list(
+        {r[0] for r in db_dep_rows}
+        | {r["fa_flight_id"] for r in sched_rows + arr_sched_rows}
+    )
+    print(f"   target: {len(db_dep_rows)} standing upcoming ATL deps + "
+          f"{len(sched_rows) + len(arr_sched_rows)} freshly fetched → {len(target_ids)} unique")
     if not target_ids:
         print("   no flights to predict")
         conn.execute(
