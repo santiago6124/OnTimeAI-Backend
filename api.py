@@ -73,12 +73,16 @@ JWT_SECRET = os.getenv("JWT_SECRET_KEY", "ontimeai-dev-secret-change-in-prod-32c
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 8
 
-_API_USER = os.getenv("API_USERNAME", "admin")
-_API_PASS = os.getenv("API_PASSWORD", "ontimeai2026")
-
-
-def _verify_password(plain: str) -> bool:
-    return secrets.compare_digest(plain.encode(), _API_PASS.encode())
+_USERS: dict[str, dict] = {
+    os.getenv("API_USERNAME", "admin"): {
+        "password": os.getenv("API_PASSWORD", "ontimeai2026"),
+        "role": "admin",
+    },
+}
+_viewer_user = os.getenv("API_USERNAME_VIEWER", "viewer")
+_viewer_pass = os.getenv("API_PASSWORD_VIEWER", "viewer2026")
+if _viewer_user:
+    _USERS[_viewer_user] = {"password": _viewer_pass, "role": "user"}
 
 _PUBLIC_PATHS = {"/auth/login", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"}
 
@@ -312,11 +316,12 @@ def _flight_row_to_dict(row: sqlite3.Row) -> dict:
 
 @app.post("/auth/login")
 def login(body: LoginRequest):
-    if body.username != _API_USER or not _verify_password(body.password):
+    user = _USERS.get(body.username)
+    if not user or not secrets.compare_digest(body.password.encode(), user["password"].encode()):
         raise HTTPException(status_code=401, detail="Credenciales incorrectas")
     expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
     token = jwt.encode(
-        {"sub": body.username, "exp": expire},
+        {"sub": body.username, "role": user["role"], "exp": expire},
         JWT_SECRET,
         algorithm=JWT_ALGORITHM,
     )
@@ -328,7 +333,7 @@ def auth_me(request: Request):
     auth = request.headers.get("Authorization", "")
     token = auth[7:]
     payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    return {"username": payload.get("sub")}
+    return {"username": payload.get("sub"), "role": payload.get("role", "user")}
 
 
 # ── Protected routes ────────────────────────────────────────────────────────
