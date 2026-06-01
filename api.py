@@ -589,7 +589,11 @@ def metrics_model():
         """, con)
         con.close()
         if not df.empty:
-            df = df.sort_values("predicted_at_utc").groupby("fa_flight_id", as_index=False).last()
+            # Use FIRST prediction per flight (pre-departure proxy).
+            # Using .last() would pick post-departure predictions that already
+            # contain intermediate_dep_delay_adjust / adsb_eta_adjust signals,
+            # inflating AUC artificially (~0.92 vs true ~0.71 pre-departure).
+            df = df.sort_values("predicted_at_utc").groupby("fa_flight_id", as_index=False).first()
             y = df["delayed"].to_numpy(dtype=int)
             p = df["proba_delay"].to_numpy(dtype=float)
             if len(y) >= 30 and y.sum() >= 5:
