@@ -912,6 +912,27 @@ def intermediate_dep_delay_adjust(proba: float, dep_delay_min: float | None) -> 
     return min(max(p_adj, 0.0), 0.999)
 
 
+def estimated_dep_delay_adjust(proba: float, est_delay_min: float | None) -> float:
+    """Boost proba when the target flight has not departed yet but has an active estimated delay.
+
+    If the estimated departure delay is significant (> 15m), the arrival delay probability
+    should be scaled accordingly.
+    """
+    if est_delay_min is None or est_delay_min < 5:
+        return proba
+    if est_delay_min < 15:
+        p_from_est = 0.25
+    elif est_delay_min < 30:
+        p_from_est = 0.75
+    elif est_delay_min < 60:
+        p_from_est = 0.90
+    else:
+        p_from_est = 0.98
+    p_adj = 1.0 - (1.0 - proba) * (1.0 - p_from_est)
+    return min(max(p_adj, 0.0), 0.999)
+
+
+
 def gdp_post_prediction_adjust(proba: float, gdp_orig_min: float, gdp_dest_min: float) -> float:
     """Boost the delay probability when origin or destination is under a GDP/GS.
 

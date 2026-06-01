@@ -29,7 +29,8 @@ from ontimeai.live import (
     build_inference_frame, chain_walk_inbound, AIRPORTS, stable_id,
     snapshot_nas_status, latest_nas_status, gdp_post_prediction_adjust,
     compute_atl_arrival_congestion, carrier_delay_rate_bayesian,
-    intermediate_dep_delay_adjust, compute_adsb_eta_delay, adsb_eta_adjust,
+    intermediate_dep_delay_adjust, estimated_dep_delay_adjust,
+    compute_adsb_eta_delay, adsb_eta_adjust,
 )
 from ontimeai.lineage_fallback import load_lookups, build_live_turnaround_lookups
 from ontimeai.model import load_artifact, predict_label, predict_proba, quantile_threshold
@@ -459,7 +460,7 @@ def main() -> int:
         gdp_orig = nas_state.get(origin, {}).get("delay_min", 0.0) if nas_state else 0.0
         gdp_dest = nas_state.get(dest, {}).get("delay_min", 0.0) if nas_state else 0.0
 
-        # Adjustment chain: raw → GDP → intermediate dep_delay → ADS-B ETA.
+        # Adjustment chain: raw → GDP → estimated dep_delay (if not departed) OR intermediate dep_delay (if departed) → ADS-B ETA.
         proba_after_gdp = (
             gdp_post_prediction_adjust(proba_raw, gdp_orig, gdp_dest)
             if gdp_adjust_enabled
@@ -467,11 +468,29 @@ def main() -> int:
         )
         sid = stable_id(df.loc[i, "fa_flight_id"])
         dep_delay = dep_delay_map.get(sid)  # None if target hasn't departed yet
-        proba_after_dep = (
-            intermediate_dep_delay_adjust(proba_after_gdp, dep_delay)
-            if dep_adjust_enabled
-            else proba_after_gdp
-        )
+        if dep_delay is None:
+            sched_out = df.loc[i, "scheduled_out_utc"]
+            est_out = df.loc[i, "estimated_out_utc"]
+            est_delay = None
+            if sched_out and est_out:
+                try:
+                    dt_sched = pd.to_datetime(sched_out, utc=True)
+                    dt_est = pd.to_datetime(est_out, utc=True)
+                    est_delay = float((dt_est - dt_sched).total_seconds() / 60.0)
+                except Exception:
+                    pass
+            est_adjust_enabled = os.getenv("EST_DELAY_ADJUST", "1").lower() in ("1", "true", "yes")
+            proba_after_dep = (
+                estimated_dep_delay_adjust(proba_after_gdp, est_delay)
+                if est_adjust_enabled
+                else proba_after_gdp
+            )
+        else:
+            proba_after_dep = (
+                intermediate_dep_delay_adjust(proba_after_gdp, dep_delay)
+                if dep_adjust_enabled
+                else proba_after_gdp
+            )
         # Tier 3 #3 — ADS-B ETA boost (only for arrivals to ATL in air now)
         adsb_delay = (
             compute_adsb_eta_delay(
