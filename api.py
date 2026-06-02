@@ -1013,6 +1013,8 @@ def metrics_routes():
             FROM flights f
             JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
             WHERE a.arr_delay_min IS NOT NULL
+              AND f.origin IS NOT NULL AND f.origin != ''
+              AND f.dest IS NOT NULL AND f.dest != ''
             GROUP BY f.origin, f.dest
             HAVING COUNT(*) >= 1
             ORDER BY total_flights DESC
