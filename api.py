@@ -226,9 +226,17 @@ def _load_meta() -> dict[str, Any]:
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
-def _latest_predictions_today(con: sqlite3.Connection) -> list[sqlite3.Row]:
-    """Latest prediction per flight for flights scheduled today."""
-    today = today_utc()
+def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
+    """Latest prediction per flight for active/upcoming flights in a sliding window.
+    
+    Includes flights scheduled from 6 hours ago to 18 hours in the future,
+    plus any flight scheduled in the past 24 hours that has not yet departed.
+    """
+    now = datetime.now(timezone.utc)
+    start_window = (now - timedelta(hours=6)).isoformat()
+    end_window = (now + timedelta(hours=18)).isoformat()
+    undeparted_limit = (now - timedelta(hours=24)).isoformat()
+
     rows = con.execute("""
         SELECT f.fa_flight_id,
                f.ident_iata,
@@ -261,10 +269,14 @@ def _latest_predictions_today(con: sqlite3.Connection) -> list[sqlite3.Row]:
             FROM predictions
         ) p ON p.fa_flight_id = f.fa_flight_id AND p.rn = 1
         LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
-        WHERE f.scheduled_out_utc LIKE ? || '%'
-          AND f.cancelled = 0
+        WHERE f.cancelled = 0
+          AND (
+              (datetime(f.scheduled_out_utc) >= datetime(?) AND datetime(f.scheduled_out_utc) <= datetime(?))
+              OR
+              (datetime(f.scheduled_out_utc) >= datetime(?) AND a.actual_out_utc IS NULL)
+          )
         ORDER BY f.scheduled_out_utc
-    """, (today,)).fetchall()
+    """, (start_window, end_window, undeparted_limit)).fetchall()
     return rows
 
 
@@ -329,7 +341,7 @@ def auth_me(request: Request):
 def list_flights(status: str = "all", departures_within_min: int = None):
     con = get_db()
     try:
-        rows = _latest_predictions_today(con)
+        rows = _latest_predictions_active(con)
         flights = [_flight_row_to_dict(r) for r in rows]
         
         now = datetime.now(timezone.utc)
@@ -392,7 +404,7 @@ def get_flight_history(fa_flight_id: str):
 def get_flight(fa_flight_id: str):
     con = get_db()
     try:
-        rows = _latest_predictions_today(con)
+        rows = _latest_predictions_active(con)
         row = next((r for r in rows if r["fa_flight_id"] == fa_flight_id), None)
         if row is None:
             raise HTTPException(status_code=404, detail="Flight not found")
@@ -497,7 +509,7 @@ def _compute_shap(fa_flight_id: str) -> list[dict]:
 def metrics_summary():
     con = get_db()
     try:
-        rows = _latest_predictions_today(con)
+        rows = _latest_predictions_active(con)
         if not rows:
             return {
                 "total_flights": 0, "high_risk": 0, "medium_risk": 0,
@@ -526,7 +538,7 @@ def metrics_summary():
 def metrics_hourly():
     con = get_db()
     try:
-        rows = _latest_predictions_today(con)
+        rows = _latest_predictions_active(con)
         buckets: dict[str, dict] = {}
         for r in rows:
             sched = r["scheduled_out_utc"] or ""
@@ -729,6 +741,11 @@ def operations(airport_code: str):
     con = get_db()
     try:
         today = today_utc()
+        now = datetime.now(timezone.utc)
+        start_window = (now - timedelta(hours=6)).isoformat()
+        end_window = (now + timedelta(hours=18)).isoformat()
+        undeparted_limit = (now - timedelta(hours=24)).isoformat()
+        
         rows = con.execute("""
             SELECT f.origin, f.dest, p.proba_delay, p.predicted_delay
             FROM flights f
@@ -739,13 +756,18 @@ def operations(airport_code: str):
                        ) AS rn
                 FROM predictions
             ) p ON p.fa_flight_id = f.fa_flight_id AND p.rn = 1
-            WHERE f.scheduled_out_utc LIKE ? || '%'
-              AND f.cancelled = 0
+            LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
+            WHERE f.cancelled = 0
               AND (f.origin = ? OR f.dest = ?)
-        """, (today, code, code)).fetchall()
+              AND (
+                  (datetime(f.scheduled_out_utc) >= datetime(?) AND datetime(f.scheduled_out_utc) <= datetime(?))
+                  OR
+                  (datetime(f.scheduled_out_utc) >= datetime(?) AND a.actual_out_utc IS NULL)
+              )
+        """, (code, code, start_window, end_window, undeparted_limit)).fetchall()
 
         if not rows:
-            raise HTTPException(status_code=404, detail=f"No flight data for {code} today")
+            raise HTTPException(status_code=404, detail=f"No flight data for {code} currently")
 
         probas = [float(r["proba_delay"]) for r in rows]
         departures = [r for r in rows if r["origin"] == code]
