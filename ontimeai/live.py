@@ -360,7 +360,7 @@ def fetch_airport_flights(airport_icao: str, kind: str, start_iso: str, end_iso:
         next_cursor = (q.get("cursor") or [None])[0]
         if not next_cursor:
             break
-        time.sleep(7.0)  # Personal plan: 10 result-sets/min → 6s minimum, 7s for margin
+        time.sleep(6.0)  # Personal plan: 10 result-sets/min → 6s minimum
     return out
 
 
