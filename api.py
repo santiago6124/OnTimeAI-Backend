@@ -40,7 +40,7 @@ GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 _TMP_DB = Path("/tmp/live_data.db")
 _BUNDLED_DB = Path(__file__).parent / "live_data.db"
 DB_PATH = _TMP_DB if GCS_BUCKET else _BUNDLED_DB
-_DB_REFRESH_INTERVAL = 1800  # refresh from GCS every 30 min
+_DB_REFRESH_INTERVAL = 1000  # refresh from GCS every ~16 min
 _db_last_refresh: float = 0.0
 
 # Users DB (separate from live_data.db so live job never overwrites it)
