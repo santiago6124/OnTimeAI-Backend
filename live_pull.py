@@ -237,9 +237,16 @@ def main() -> int:
                 departed = fetch_airport_flights(args.airport, "departures",
                                                  _iso(arr_start), _iso(arr_end), actuals_pages)
                 landed = [r for r in departed if r.get("actual_in")]
-                print(f"   pulled {len(departed)} departures, {len(landed)} have landed at destination")
+                en_route = [r for r in departed if r.get("actual_off") and not r.get("actual_in")]
+                print(f"   pulled {len(departed)} departures, {len(landed)} landed, {len(en_route)} en route")
+                # Save arr_delay for landed flights
                 n_act_dep = upsert_actuals_from_aeroapi(conn, landed)
-                print(f"   wrote {n_act_dep} actuals")
+                # Also save actual_off for en-route flights so they leave "Programado" state
+                if en_route:
+                    n_dep_out = upsert_actuals_from_aeroapi(conn, en_route)
+                    print(f"   wrote {n_act_dep} actuals (landed) + {n_dep_out} actual_off (en route)")
+                else:
+                    print(f"   wrote {n_act_dep} actuals")
             except RuntimeError as _e:
                 print(f"   [3a] skipped (rate-limited): {_e}")
                 n_act_dep = 0
