@@ -314,7 +314,7 @@ def _migrate_estimated_times(conn: sqlite3.Connection) -> None:
 # ----------------------------- aeroapi client -----------------------------
 
 def _api_get(path: str, params: dict | None = None, key: str | None = None,
-             retries: int = 3, backoff_s: float = 8.0) -> dict:
+             retries: int = 3, backoff_s: float = 15.0) -> dict:
     key = key or load_aeroapi_key()
     headers = {"x-apikey": key, "Accept": "application/json"}
     url = f"{AEROAPI_BASE}{path}"
@@ -360,7 +360,7 @@ def fetch_airport_flights(airport_icao: str, kind: str, start_iso: str, end_iso:
         next_cursor = (q.get("cursor") or [None])[0]
         if not next_cursor:
             break
-        time.sleep(2.0)  # spread cursor requests under typical rate limits
+        time.sleep(7.0)  # Personal plan: 10 result-sets/min → 6s minimum, 7s for margin
     return out
 
 
@@ -620,7 +620,7 @@ def chain_walk_inbound(
             if flight.get("actual_in"):
                 upsert_actuals_from_aeroapi(conn, [flight])
                 actuals_written += 1
-        time.sleep(2.0)  # respect AeroAPI rate limits
+        time.sleep(7.0)  # Personal plan: 10 result-sets/min → 7s for margin
 
     return calls, actuals_written
 
