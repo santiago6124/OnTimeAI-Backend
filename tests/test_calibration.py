@@ -52,3 +52,24 @@ def test_calibrator_is_monotone_on_sorted_input_isotonic() -> None:
     # Isotonic enforces monotonicity wrt the fitted input order
     diffs = np.diff(out)
     assert (diffs >= -1e-9).all()
+
+
+def test_delay_adjustments() -> None:
+    from ontimeai.live import intermediate_dep_delay_adjust, estimated_dep_delay_adjust
+
+    # Base case: no delay or very small delay should not change probability
+    assert intermediate_dep_delay_adjust(0.1, None) == 0.1
+    assert intermediate_dep_delay_adjust(0.1, 2.0) == 0.1
+    assert estimated_dep_delay_adjust(0.1, None) == 0.1
+    assert estimated_dep_delay_adjust(0.1, 2.0) == 0.1
+
+    # Over 15 mins delay should boost probability
+    p_boosted_dep = intermediate_dep_delay_adjust(0.1, 20.0)
+    p_boosted_est = estimated_dep_delay_adjust(0.1, 20.0)
+    assert p_boosted_dep > 0.1
+    assert p_boosted_est > 0.1
+
+    # Over 60 mins delay should boost probability close to 1.0
+    assert intermediate_dep_delay_adjust(0.1, 70.0) >= 0.97
+    assert estimated_dep_delay_adjust(0.1, 70.0) >= 0.97
+
