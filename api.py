@@ -40,7 +40,7 @@ GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 _TMP_DB = Path("/tmp/live_data.db")
 _BUNDLED_DB = Path(__file__).parent / "live_data.db"
 DB_PATH = _TMP_DB if GCS_BUCKET else _BUNDLED_DB
-_DB_REFRESH_INTERVAL = 1800  # refresh from GCS every 30 min
+_DB_REFRESH_INTERVAL = 1000  # refresh from GCS every ~16 min
 _db_last_refresh: float = 0.0
 
 # Users DB (separate from live_data.db so live job never overwrites it)
@@ -793,14 +793,16 @@ def metrics_model():
     except Exception:
         threshold = 0.0
 
-    # Live AUC/Brier from last 7 days (deduplicated per flight)
+    # Live AUC/Brier — PRE_DEPARTURE predictions only (last 7 days, first pred per flight)
     live_auc = live_brier = n_actuals = None
+    live_auc_enroute = live_brier_enroute = n_actuals_enroute = None
     try:
         from sklearn.metrics import roc_auc_score, brier_score_loss
         con = get_db()
         import pandas as pd
         df = pd.read_sql("""
             SELECT p.fa_flight_id, p.proba_delay, p.predicted_at_utc,
+                   COALESCE(p.prediction_phase, 'PRE_DEPARTURE') AS prediction_phase,
                    CASE WHEN a.arr_delay_min > 15 THEN 1 ELSE 0 END AS delayed
             FROM predictions p
             JOIN actuals a ON p.fa_flight_id = a.fa_flight_id
@@ -810,28 +812,43 @@ def metrics_model():
         """, con)
         con.close()
         if not df.empty:
-            # Use FIRST prediction per flight (pre-departure proxy).
-            # Using .last() would pick post-departure predictions that already
-            # contain intermediate_dep_delay_adjust / adsb_eta_adjust signals,
-            # inflating AUC artificially (~0.92 vs true ~0.71 pre-departure).
-            df = df.sort_values("predicted_at_utc").groupby("fa_flight_id", as_index=False).first()
-            y = df["delayed"].to_numpy(dtype=int)
-            p = df["proba_delay"].to_numpy(dtype=float)
+            # PRE_DEPARTURE: first prediction per flight that is PRE_DEPARTURE
+            pre = (df[df["prediction_phase"] == "PRE_DEPARTURE"]
+                   .sort_values("predicted_at_utc")
+                   .groupby("fa_flight_id", as_index=False).first())
+            if pre.empty:
+                # Fallback: use first prediction (legacy data without phase column)
+                pre = df.sort_values("predicted_at_utc").groupby("fa_flight_id", as_index=False).first()
+            y = pre["delayed"].to_numpy(dtype=int)
+            p = pre["proba_delay"].to_numpy(dtype=float)
             if len(y) >= 30 and y.sum() >= 5:
                 live_auc   = round(float(roc_auc_score(y, p)), 4)
                 live_brier = round(float(brier_score_loss(y, p)), 4)
                 n_actuals  = int(len(y))
+            # EN_ROUTE: for reference, compute separately
+            enroute = (df[df["prediction_phase"] == "EN_ROUTE"]
+                       .sort_values("predicted_at_utc")
+                       .groupby("fa_flight_id", as_index=False).first())
+            if len(enroute) >= 30 and enroute["delayed"].sum() >= 5:
+                y_e = enroute["delayed"].to_numpy(dtype=int)
+                p_e = enroute["proba_delay"].to_numpy(dtype=float)
+                live_auc_enroute   = round(float(roc_auc_score(y_e, p_e)), 4)
+                live_brier_enroute = round(float(brier_score_loss(y_e, p_e)), 4)
+                n_actuals_enroute  = int(len(enroute))
     except Exception:
         pass
 
     version = ACTIVE_MODEL.replace("4year_", "").replace("_", "-")
     return {
-        "active_model": ACTIVE_MODEL,
-        "version":      version,
-        "live_auc":     live_auc,
-        "live_brier":   live_brier,
-        "n_actuals":    n_actuals,
-        "threshold":    threshold,
+        "active_model":         ACTIVE_MODEL,
+        "version":              version,
+        "live_auc":             live_auc,
+        "live_brier":           live_brier,
+        "n_actuals":            n_actuals,
+        "live_auc_enroute":     live_auc_enroute,
+        "live_brier_enroute":   live_brier_enroute,
+        "n_actuals_enroute":    n_actuals_enroute,
+        "threshold":            threshold,
     }
 
 

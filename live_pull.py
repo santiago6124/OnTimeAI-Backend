@@ -509,6 +509,7 @@ def main() -> int:
     # Pre-fetch intermediate dep_delay for all target stable_ids in one query.
     target_stable_ids = [stable_id(df.loc[i, "fa_flight_id"]) for i in df.index[target_mask]]
     dep_delay_map: dict[str, float] = {}
+    landed_ids: set[str] = set()
     if target_stable_ids:
         placeholders = ",".join("?" for _ in target_stable_ids)
         for row in conn.execute(
@@ -519,6 +520,13 @@ def main() -> int:
             target_stable_ids,
         ).fetchall():
             dep_delay_map[row[0]] = float(row[1])
+        for row in conn.execute(
+            f"""SELECT stable_id FROM actuals
+               WHERE stable_id IN ({placeholders})
+                 AND actual_in_utc IS NOT NULL""",
+            target_stable_ids,
+        ).fetchall():
+            landed_ids.add(row[0])
 
     dep_adjust_enabled = os.getenv("DEP_DELAY_ADJUST", "1").lower() in ("1", "true", "yes")
     if dep_delay_map and dep_adjust_enabled:
@@ -597,6 +605,14 @@ def main() -> int:
         )
         label_adj = int(proba_adj >= threshold_used)
 
+        # Prediction phase: classify based on flight departure/landing status
+        if sid in landed_ids:
+            phase = "POST_LANDING"
+        elif sid in dep_delay_map:
+            phase = "EN_ROUTE"
+        else:
+            phase = "PRE_DEPARTURE"
+
         # Diagnostic features (Tier 2 #I, #J) — computed live, NOT in
         # feature_cols of v9. Persisted for future v9.1 retrain analysis.
         atl_window = compute_atl_arrival_congestion(
@@ -615,6 +631,7 @@ def main() -> int:
             (float(dep_delay) if dep_delay is not None else None),
             (float(adsb_delay) if adsb_delay is not None else None),
             (float(holding_min) if holding_min is not None else None),
+            phase,
         ))
     conn.executemany(
         """INSERT OR REPLACE INTO predictions
@@ -622,8 +639,9 @@ def main() -> int:
             threshold_used, threshold_strategy,
             proba_raw, gdp_orig_delay_min, gdp_dest_delay_min,
             atl_arrivals_in_window_30min, carrier_delay_rate_smooth,
-            intermediate_dep_delay_min, adsb_eta_delay_min, adsb_holding_min)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            intermediate_dep_delay_min, adsb_eta_delay_min, adsb_holding_min,
+            prediction_phase)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         pred_rows,
     )
     conn.commit()
