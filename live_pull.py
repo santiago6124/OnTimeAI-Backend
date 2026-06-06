@@ -35,7 +35,7 @@ from ontimeai.live import (
     compute_adsb_holding_min, adsb_holding_adjust,
 )
 from ontimeai.lineage_fallback import load_lookups, build_live_turnaround_lookups
-from ontimeai.model import load_artifact, predict_label, predict_proba, quantile_threshold
+from ontimeai.model import load_artifact, predict_label, predict_proba, select_threshold
 from predict import prepare_inference_frame
 from ontimeai.config import ARTIFACTS_DIR
 
@@ -80,6 +80,18 @@ def main() -> int:
         help=(
             "Target predicted-positive rate for quantile threshold (default 0.22, "
             "matches v4_full test base rate). Set to 0 to fall back to artifact threshold."
+        ),
+    )
+    p.add_argument(
+        "--abs-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Fixed absolute probability cutoff. When > 0 it OVERRIDES --target-pos-rate: "
+            "a flight is flagged delayed iff proba >= this value. Lets the predicted-positive "
+            "rate track live conditions (more alerts on storm days, fewer on calm days) instead "
+            "of forcing a constant ~22%. Backtest on v9 live actuals: abs@0.50 ~doubles precision "
+            "(0.47->0.64) at similar recall vs quantile@0.22. Default 0 = keep quantile behavior."
         ),
     )
     args = p.parse_args()
@@ -464,12 +476,12 @@ def main() -> int:
     # distribution shift); fall back to the artifact's static threshold when
     # --target-pos-rate=0 or when the target batch is too small to estimate.
     target_proba = proba[target_mask.to_numpy()]
-    if args.target_pos_rate > 0 and target_proba.size >= 5:
-        threshold_used = quantile_threshold(target_proba, args.target_pos_rate)
-        threshold_strategy = f"quantile@{args.target_pos_rate:.2f}"
-    else:
-        threshold_used = float(meta["threshold"])
-        threshold_strategy = "artifact"
+    threshold_used, threshold_strategy = select_threshold(
+        target_proba,
+        target_pos_rate=args.target_pos_rate,
+        artifact_threshold=float(meta["threshold"]),
+        abs_threshold=args.abs_threshold,
+    )
     labels = predict_label(proba, threshold_used, "binary")
     print(
         f"   threshold strategy={threshold_strategy} value={threshold_used:.4f} "
