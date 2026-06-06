@@ -52,6 +52,7 @@ def main() -> int:
         ("SCHEDULE_HOURS", "--schedule-hours"),
         ("CHAIN_WALK_MAX", "--chain-walk-max"),
         ("TARGET_POS_RATE", "--target-pos-rate"),
+        ("ABS_THRESHOLD", "--abs-threshold"),
         ("MAX_PAGES", "--max-pages"),
     ):
         val = os.environ.get(env_name)

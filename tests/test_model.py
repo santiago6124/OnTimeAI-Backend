@@ -15,6 +15,7 @@ from ontimeai.model import (
     predict_proba,
     quantile_threshold,
     save_artifact,
+    select_threshold,
     train_booster,
     tune_threshold,
 )
@@ -151,3 +152,46 @@ def test_quantile_threshold_validates_inputs() -> None:
         quantile_threshold(np.array([0.1, 0.5]), 0.0)
     with pytest.raises(ValueError):
         quantile_threshold(np.array([0.1, 0.5]), 1.0)
+
+
+# ── select_threshold: decision-rule precedence (abs > quantile > artifact) ──
+
+def test_select_threshold_abs_overrides_quantile() -> None:
+    proba = np.linspace(0.0, 1.0, 100)
+    thr, strat = select_threshold(
+        proba, target_pos_rate=0.22, artifact_threshold=0.32, abs_threshold=0.5,
+    )
+    assert thr == 0.5
+    assert strat == "abs@0.50"
+
+
+def test_select_threshold_falls_back_to_quantile() -> None:
+    # abs_threshold == 0 (default) → keep existing quantile behavior (no regression).
+    proba = np.linspace(0.0, 1.0, 100)
+    thr, strat = select_threshold(
+        proba, target_pos_rate=0.22, artifact_threshold=0.32,
+    )
+    assert strat == "quantile@0.22"
+    # ~22% of the batch flagged at this threshold.
+    assert abs((proba >= thr).mean() - 0.22) <= 0.03
+
+
+def test_select_threshold_artifact_when_batch_too_small() -> None:
+    proba = np.array([0.1, 0.2, 0.3])  # < 5 finite values
+    thr, strat = select_threshold(
+        proba, target_pos_rate=0.22, artifact_threshold=0.32,
+    )
+    assert thr == 0.32
+    assert strat == "artifact"
+
+
+def test_select_threshold_abs_adapts_positive_rate_to_conditions() -> None:
+    # The core fix: a fixed cutoff flags MORE on storm-like batches and FEWER on
+    # calm batches, instead of forcing a constant ~22% like the quantile rule.
+    calm = np.concatenate([np.full(90, 0.05), np.full(10, 0.6)])   # ~10% truly high
+    storm = np.concatenate([np.full(40, 0.05), np.full(60, 0.6)])  # ~60% truly high
+    t_calm, _ = select_threshold(calm, target_pos_rate=0.22, artifact_threshold=0.32, abs_threshold=0.5)
+    t_storm, _ = select_threshold(storm, target_pos_rate=0.22, artifact_threshold=0.32, abs_threshold=0.5)
+    calm_rate = (calm >= t_calm).mean()
+    storm_rate = (storm >= t_storm).mean()
+    assert calm_rate < 0.22 < storm_rate  # adapts; quantile@0.22 would pin both at 0.22
