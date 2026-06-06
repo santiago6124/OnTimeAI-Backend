@@ -129,6 +129,7 @@ CREATE TABLE IF NOT EXISTS predictions (
     predicted_delay INTEGER NOT NULL,
     threshold_used REAL,
     threshold_strategy TEXT,
+    prediction_phase TEXT,
     PRIMARY KEY (fa_flight_id, predicted_at_utc)
 );
 -- idx_predictions_stable created in _migrate_stable_ids().
@@ -230,8 +231,16 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
     _migrate_predictions_gdp_adjustment(conn)
     _migrate_nas_status(conn)
     _migrate_estimated_times(conn)
+    _migrate_prediction_phase(conn)
     conn.commit()
     return conn
+
+
+def _migrate_prediction_phase(conn: sqlite3.Connection) -> None:
+    """Add prediction_phase column to existing predictions tables."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(predictions)").fetchall()}
+    if "prediction_phase" not in cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN prediction_phase TEXT")
 
 
 def _migrate_predictions_gdp_adjustment(conn: sqlite3.Connection) -> None:
@@ -360,7 +369,7 @@ def fetch_airport_flights(airport_icao: str, kind: str, start_iso: str, end_iso:
         next_cursor = (q.get("cursor") or [None])[0]
         if not next_cursor:
             break
-        time.sleep(7.0)  # Personal plan: 10 result-sets/min → 6s minimum, 7s for margin
+        time.sleep(6.0)  # Personal plan: 10 result-sets/min → 6s minimum
     return out
 
 
