@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -155,31 +156,41 @@ def main() -> int:
     else:
         # ---- AeroAPI mode (default, comportamiento original) ----
         print("\n[1] AeroAPI scheduled_departures...")
-        sched = fetch_airport_flights(args.airport, "scheduled_departures",
-                                      _iso(sched_start), _iso(sched_end), args.max_pages)
-        print(f"   pulled {len(sched)} scheduled departures")
-        sched_rows = [r for r in (aeroapi_to_flight_row(rec) for rec in sched) if r]
-        n_sched = upsert_flights(conn, sched_rows)
-        print(f"   upserted {n_sched} flights to DB (after ATL+known-airports filter)")
+        try:
+            sched = fetch_airport_flights(args.airport, "scheduled_departures",
+                                          _iso(sched_start), _iso(sched_end), args.max_pages)
+            print(f"   pulled {len(sched)} scheduled departures")
+            sched_rows = [r for r in (aeroapi_to_flight_row(rec) for rec in sched) if r]
+            n_sched = upsert_flights(conn, sched_rows)
+            print(f"   upserted {n_sched} flights to DB (after ATL+known-airports filter)")
+        except RuntimeError as _e:
+            print(f"   [1] skipped (rate-limited): {_e}")
+            sched = []
 
         if not args.skip_arrivals_sched:
             # ---- 2. scheduled arrivals (KATL) — captures FLOW=ARR_TO_ATL ----
+            time.sleep(5)
             print("\n[2] AeroAPI scheduled_arrivals...")
-            arr_sched = fetch_airport_flights(args.airport, "scheduled_arrivals",
-                                              _iso(sched_start), _iso(sched_end), args.max_pages)
-            print(f"   pulled {len(arr_sched)} scheduled arrivals")
-            arr_sched_rows = [r for r in (aeroapi_to_flight_row(rec) for rec in arr_sched) if r]
-            n_arr_sched = upsert_flights(conn, arr_sched_rows)
-            print(f"   upserted {n_arr_sched} flights to DB")
+            try:
+                arr_sched = fetch_airport_flights(args.airport, "scheduled_arrivals",
+                                                  _iso(sched_start), _iso(sched_end), args.max_pages)
+                print(f"   pulled {len(arr_sched)} scheduled arrivals")
+                arr_sched_rows = [r for r in (aeroapi_to_flight_row(rec) for rec in arr_sched) if r]
+                n_arr_sched = upsert_flights(conn, arr_sched_rows)
+                print(f"   upserted {n_arr_sched} flights to DB")
+            except RuntimeError as _e:
+                print(f"   [2] skipped (rate-limited): {_e}")
+                arr_sched = []
         else:
             print("\n[2] (skipped scheduled_arrivals)")
+            arr_sched = []
 
         # ---- 2b. Intermediate actuals (Tier 3 #1): some scheduled_* records
         # already have actual_off because the target took off but hasn't
         # arrived yet. Persist them so the prediction phase can boost proba
         # using the empirical P(arr_delay|dep_delay) relationship.
         intermediate_recs = [
-            r for r in (sched + arr_sched if not args.skip_arrivals_sched else sched)
+            r for r in (sched + arr_sched)
             if r.get("actual_off")
         ]
         if intermediate_recs:
@@ -192,16 +203,22 @@ def main() -> int:
             actuals_pages = min(args.max_pages, 4)
 
             # ---- 3. completed arrivals to KATL → actuals (settles ARR_TO_ATL preds) ----
+            time.sleep(5)
             print("\n[3] AeroAPI arrivals (completed at KATL)...")
-            arrived = fetch_airport_flights(args.airport, "arrivals",
-                                            _iso(arr_start), _iso(arr_end), actuals_pages)
-            print(f"   pulled {len(arrived)} arrivals")
-            arrived_filt = [r for r in arrived if r.get("actual_in")]
-            n_act_arr = upsert_actuals_from_aeroapi(conn, arrived_filt)
-            print(f"   wrote {n_act_arr} actuals")
+            try:
+                arrived = fetch_airport_flights(args.airport, "arrivals",
+                                                _iso(arr_start), _iso(arr_end), actuals_pages)
+                print(f"   pulled {len(arrived)} arrivals")
+                arrived_filt = [r for r in arrived if r.get("actual_in")]
+                n_act_arr = upsert_actuals_from_aeroapi(conn, arrived_filt)
+                print(f"   wrote {n_act_arr} actuals")
+            except RuntimeError as _e:
+                print(f"   [3] skipped (rate-limited): {_e}")
+                n_act_arr = 0
 
             # ---- 3a. completed departures from KATL → actuals (settles DEP_FROM_ATL preds)
             # Non-fatal: if rate-limited after steps 1+2+3, log and continue.
+            time.sleep(5)
             print("\n[3a] AeroAPI departures (completed from KATL)...")
             try:
                 departed = fetch_airport_flights(args.airport, "departures",
