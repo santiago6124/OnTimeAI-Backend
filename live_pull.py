@@ -339,15 +339,19 @@ def main() -> int:
     # is still AHEAD — so a fresh PRE-departure prediction always exists and
     # refines as the gate nears.
     #
-    # "Still upcoming" = wheels-off not yet recorded (actual_off_utc IS NULL) AND
-    # the best available departure estimate is in the future. We use
-    # COALESCE(estimated_out_utc, scheduled_out_utc) so the predicate is
-    # delay-aware: a delayed flight whose estimated_out slips into the future
-    # stays in the target, while a flight that already departed but hasn't been
-    # settled yet (actual_off lag) is correctly excluded — without this, ~125
-    # departed-but-unsettled flights/cycle would get spurious post-departure
-    # predictions.
+    # Two cases qualify as "still needs a prediction":
+    #   1. Upcoming: estimated_out is still in the future (AeroAPI updated the estimate).
+    #   2. Delayed on ground: scheduled_out passed but no actual_off yet AND
+    #      the scheduled time is within DELAY_GRACE_H hours — covers flights that
+    #      AeroAPI hasn't updated the estimated_out for (shows stale scheduled time)
+    #      but hasn't departed either (stuck at gate due to delay).
+    # Without case 2, a delayed flight like F93512 stops getting predictions the
+    # moment its scheduled time passes, leaving "Programado" with a stale score.
+    # The grace window excludes departed-but-unsettled flights older than DELAY_GRACE_H
+    # (AeroAPI typically settles actual_off within 30-60 min; beyond 2h it's safe to
+    # assume the lag is too large or the flight is actually airborne and needs no update).
     horizon_h = int(os.getenv("PREDICT_HORIZON_HOURS", str(args.schedule_hours)))
+    delay_grace_h = int(os.getenv("DELAY_GRACE_HOURS", "2"))
     db_dep_rows = conn.execute(
         """
         SELECT f.fa_flight_id
@@ -356,11 +360,14 @@ def main() -> int:
         WHERE f.origin = 'ATL'
           AND f.scheduled_out_utc IS NOT NULL
           AND a.actual_off_utc IS NULL
-          AND datetime(COALESCE(f.estimated_out_utc, f.scheduled_out_utc)) > datetime(?)
+          AND (
+              datetime(COALESCE(f.estimated_out_utc, f.scheduled_out_utc)) > datetime(?)
+              OR datetime(f.scheduled_out_utc) > datetime(?, ?)
+          )
           AND datetime(f.scheduled_out_utc) <= datetime(?, ?)
           AND COALESCE(f.cancelled, 0) = 0
         """,
-        (_iso(now), _iso(now), f"+{horizon_h} hours"),
+        (_iso(now), _iso(now), f"-{delay_grace_h} hours", _iso(now), f"+{horizon_h} hours"),
     ).fetchall()
     # Union the standing upcoming-departures set with this cycle's freshly fetched
     # flights (keeps arrivals + brand-new departures not yet committed-visible).
@@ -368,7 +375,7 @@ def main() -> int:
         {r[0] for r in db_dep_rows}
         | {r["fa_flight_id"] for r in sched_rows + arr_sched_rows}
     )
-    print(f"   target: {len(db_dep_rows)} standing upcoming ATL deps + "
+    print(f"   target: {len(db_dep_rows)} standing ATL deps (upcoming + ≤{delay_grace_h}h delayed) + "
           f"{len(sched_rows) + len(arr_sched_rows)} freshly fetched → {len(target_ids)} unique")
     if not target_ids:
         print("   no flights to predict")
