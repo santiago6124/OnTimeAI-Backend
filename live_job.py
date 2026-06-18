@@ -2,9 +2,15 @@
 from __future__ import annotations
 
 import os
+import resource
 import shutil
 import sys
 from pathlib import Path
+
+
+def _log_mem(label: str) -> None:
+    rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+    print(f"[mem] {label}: peak RSS {rss_mb:.0f} MB")
 
 GCS_BUCKET = os.environ.get("GCS_BUCKET", "")
 GCS_OBJECT = "live_data.db"
@@ -29,13 +35,19 @@ def _gcs_download() -> None:
 
 def _gcs_upload() -> None:
     import sqlite3 as _sqlite3
+    _log_mem("pre-upload")
     try:
         chk = _sqlite3.connect(str(TMP_DB))
-        result = chk.execute("PRAGMA quick_check(1)").fetchone()
-        chk.close()
-        if not result or result[0] != "ok":
-            print(f"[job] ABORT upload — DB integrity check failed: {result}")
+        quick = chk.execute("PRAGMA quick_check(1)").fetchone()
+        if not quick or quick[0] != "ok":
+            # Full integrity check to log exactly what's broken
+            errors = chk.execute("PRAGMA integrity_check(20)").fetchall()
+            chk.close()
+            print(f"[job] ABORT upload — DB corrupted. quick_check: {quick}")
+            for row in errors:
+                print(f"[job]   integrity_check: {row[0]}")
             return
+        chk.close()
     except Exception as e:
         print(f"[job] ABORT upload — DB integrity check error: {e}")
         return
@@ -74,12 +86,15 @@ def main() -> int:
     if extra_args:
         print(f"[job] live_pull args from env: {' '.join(extra_args)}")
     sys.path.insert(0, str(Path(__file__).parent))
+    _log_mem("pre-pipeline")
     import live_pull
     exit_code = live_pull.main()
+    _log_mem("post-pipeline")
 
     if GCS_BUCKET and TMP_DB.exists():
         _gcs_upload()
 
+    _log_mem("end")
     return exit_code
 
 
