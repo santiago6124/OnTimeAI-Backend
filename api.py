@@ -302,9 +302,20 @@ def _validate_airport(code: str) -> str:
 
 
 def get_db() -> sqlite3.Connection:
+    global _db_last_refresh
     _refresh_db_from_gcs()
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(str(DB_PATH))
     con.row_factory = sqlite3.Row
+    if GCS_BUCKET:
+        try:
+            con.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        except sqlite3.DatabaseError:
+            con.close()
+            print("[db] local DB corrupted — forcing re-download from GCS")
+            _db_last_refresh = 0
+            _refresh_db_from_gcs()
+            con = sqlite3.connect(str(DB_PATH))
+            con.row_factory = sqlite3.Row
     return con
 
 
