@@ -28,6 +28,17 @@ def _gcs_download() -> None:
 
 
 def _gcs_upload() -> None:
+    import sqlite3 as _sqlite3
+    try:
+        chk = _sqlite3.connect(str(TMP_DB))
+        result = chk.execute("PRAGMA quick_check(1)").fetchone()
+        chk.close()
+        if not result or result[0] != "ok":
+            print(f"[job] ABORT upload — DB integrity check failed: {result}")
+            return
+    except Exception as e:
+        print(f"[job] ABORT upload — DB integrity check error: {e}")
+        return
     from google.cloud import storage as gcs
     client = gcs.Client()
     blob = client.bucket(GCS_BUCKET).blob(GCS_OBJECT)
