@@ -101,6 +101,35 @@ def quantile_threshold(proba: np.ndarray, target_pos_rate: float) -> float:
     return float(np.quantile(finite, 1.0 - target_pos_rate))
 
 
+def select_threshold(
+    target_proba: np.ndarray,
+    *,
+    target_pos_rate: float,
+    artifact_threshold: float,
+    abs_threshold: float = 0.0,
+) -> tuple[float, str]:
+    """Choose the binary decision threshold for a scoring batch.
+
+    Precedence (first match wins):
+      1. ``abs_threshold > 0``  → fixed absolute probability cutoff (``"abs@T"``).
+         Adapts the predicted-positive rate to live conditions: it flags more on
+         storm days and fewer on calm days, instead of forcing a constant rate.
+      2. ``target_pos_rate`` in (0, 1) and batch has >= 5 finite probabilities
+         → per-batch quantile so ~``target_pos_rate`` is flagged (``"quantile@X"``).
+         Robust to monotone proba shift but mis-fires when the live base rate
+         diverges from ``target_pos_rate``.
+      3. otherwise → the artifact's static training threshold (``"artifact"``).
+
+    Returns ``(threshold, strategy_label)``.
+    """
+    finite = np.asarray(target_proba)[np.isfinite(target_proba)] if target_proba.size else target_proba
+    if abs_threshold > 0:
+        return float(abs_threshold), f"abs@{abs_threshold:.2f}"
+    if 0.0 < target_pos_rate < 1.0 and finite.size >= 5:
+        return quantile_threshold(target_proba, target_pos_rate), f"quantile@{target_pos_rate:.2f}"
+    return float(artifact_threshold), "artifact"
+
+
 def predict_proba(booster: lgb.Booster, X: pd.DataFrame) -> np.ndarray:
     return booster.predict(X, num_iteration=booster.best_iteration or None)
 
