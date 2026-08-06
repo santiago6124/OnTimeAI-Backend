@@ -1131,6 +1131,41 @@ def metrics_route_history(origin: str, dest: str):
         con.close()
 
 
+@app.get("/admin/db-stats")
+def db_stats(request: Request):
+    _require_superadmin(request)
+    db_file = Path(DB_PATH)
+    size_mb = db_file.stat().st_size / 1e6 if db_file.exists() else 0.0
+
+    con = get_db()
+    try:
+        counts = {}
+        for tbl in ["predictions", "actuals", "flights", "runs", "weather_obs", "prediction_shap", "aircraft_position"]:
+            try:
+                row = con.execute(f"SELECT count(*) FROM {tbl}").fetchone()
+                counts[tbl] = row[0] if row else 0
+            except sqlite3.OperationalError:
+                counts[tbl] = 0
+
+        # Get date range of predictions
+        date_range = {"first": None, "last": None}
+        try:
+            row = con.execute("SELECT MIN(predicted_at_utc), MAX(predicted_at_utc) FROM predictions").fetchone()
+            if row:
+                date_range["first"] = row[0]
+                date_range["last"] = row[1]
+        except Exception:
+            pass
+
+        return {
+            "db_size_mb": round(size_mb, 2),
+            "table_counts": counts,
+            "prediction_dates": date_range,
+        }
+    finally:
+        con.close()
+
+
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run("api:app", host="0.0.0.0", port=8000, reload=True)
