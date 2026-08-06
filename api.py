@@ -42,6 +42,8 @@ _BUNDLED_DB = Path(__file__).parent / "live_data.db"
 DB_PATH = _TMP_DB if GCS_BUCKET else _BUNDLED_DB
 _DB_REFRESH_INTERVAL = 1000  # refresh from GCS every ~16 min
 _db_last_refresh: float = 0.0
+_db_last_health_check: float = 0.0
+_DB_HEALTH_INTERVAL = 60  # re-verify DB health every 60 s
 
 # Users DB (separate from live_data.db so live job never overwrites it)
 USERS_DB_PATH = Path("/tmp/users.db") if GCS_BUCKET else Path(__file__).parent / "users.db"
@@ -148,8 +150,20 @@ def _refresh_db_from_gcs() -> None:
         blob = client.bucket(GCS_BUCKET).blob("live_data.db")
         blob.download_to_filename(str(_TMP_DB))
         _db_last_refresh = time.time()
+        print(f"[db] refreshed from GCS ({_TMP_DB.stat().st_size / 1e6:.0f} MB)")
     except Exception as e:
         print(f"[db_refresh] failed: {e}")
+
+
+def _verify_db_health(path: Path) -> bool:
+    """Read an actual data page to catch corruption beyond the schema."""
+    try:
+        chk = sqlite3.connect(str(path))
+        chk.execute("SELECT fa_flight_id FROM flights LIMIT 1")
+        chk.close()
+        return True
+    except Exception:
+        return False
 
 MODEL_REGISTRY: dict[str, Path] = {
     "4year_v9":       Path(__file__).parent / "artifacts/4year_v9",
@@ -302,20 +316,23 @@ def _validate_airport(code: str) -> str:
 
 
 def get_db() -> sqlite3.Connection:
-    global _db_last_refresh
+    global _db_last_refresh, _db_last_health_check
+    import time, shutil
+
     _refresh_db_from_gcs()
-    con = sqlite3.connect(str(DB_PATH))
-    con.row_factory = sqlite3.Row
-    if GCS_BUCKET:
-        try:
-            con.execute("SELECT 1 FROM sqlite_master LIMIT 1")
-        except sqlite3.DatabaseError:
-            con.close()
-            print("[db] local DB corrupted — forcing re-download from GCS")
+
+    if GCS_BUCKET and (time.time() - _db_last_health_check > _DB_HEALTH_INTERVAL):
+        if not _verify_db_health(_TMP_DB):
+            print("[db] health check failed — forcing re-download from GCS")
             _db_last_refresh = 0
             _refresh_db_from_gcs()
-            con = sqlite3.connect(str(DB_PATH))
-            con.row_factory = sqlite3.Row
+            if not _verify_db_health(_TMP_DB):
+                print("[db] GCS DB also corrupt — falling back to bundled DB")
+                shutil.copy(str(_BUNDLED_DB), str(_TMP_DB))
+        _db_last_health_check = time.time()
+
+    con = sqlite3.connect(str(DB_PATH))
+    con.row_factory = sqlite3.Row
     return con
 
 
