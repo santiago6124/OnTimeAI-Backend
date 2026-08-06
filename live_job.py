@@ -33,6 +33,33 @@ def _gcs_download() -> None:
         shutil.copy(BUNDLED_DB, TMP_DB)
 
 
+def _cleanup_old_data() -> None:
+    """Trim stale data to keep DB small. prediction_shap is not needed for retraining."""
+    import sqlite3 as _sqlite3
+    con = _sqlite3.connect(str(TMP_DB))
+    # SHAP values: keep 7 days only (UI only, never used for retraining)
+    con.execute("DELETE FROM prediction_shap WHERE predicted_at_utc < datetime('now', '-7 days')")
+    shap_deleted = con.total_changes
+    # Weather observations: keep 30 days (can be re-pulled from IEM if needed)
+    con.execute("DELETE FROM weather_obs WHERE valid_utc < datetime('now', '-30 days')")
+    weather_deleted = con.total_changes - shap_deleted
+    con.commit()
+    db_mb = TMP_DB.stat().st_size / 1e6
+    print(f"[job] cleanup: -{shap_deleted} SHAP rows, -{weather_deleted} weather rows (DB: {db_mb:.0f} MB)")
+    if db_mb > 800:
+        # First time after cleanup: VACUUM reclaims freed space
+        # (only runs until DB stabilizes below 800 MB)
+        try:
+            print("[job] Running VACUUM to reclaim space...")
+            con.execute("VACUUM")
+            con.commit()
+            db_mb_after = TMP_DB.stat().st_size / 1e6
+            print(f"[job] post-VACUUM: {db_mb_after:.0f} MB (saved {db_mb - db_mb_after:.0f} MB)")
+        except Exception as e:
+            print(f"[job] VACUUM skipped: {e}")
+    con.close()
+
+
 def _gcs_upload() -> None:
     import sqlite3 as _sqlite3
     _log_mem("pre-upload")
@@ -92,6 +119,7 @@ def main() -> int:
     _log_mem("post-pipeline")
 
     if GCS_BUCKET and TMP_DB.exists():
+        _cleanup_old_data()
         _gcs_upload()
 
     _log_mem("end")
