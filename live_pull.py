@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import time
 from datetime import datetime, timedelta, timezone
 
 import numpy as np
@@ -31,9 +32,10 @@ from ontimeai.live import (
     compute_atl_arrival_congestion, carrier_delay_rate_bayesian,
     intermediate_dep_delay_adjust, estimated_dep_delay_adjust,
     compute_adsb_eta_delay, adsb_eta_adjust,
+    compute_adsb_holding_min, adsb_holding_adjust,
 )
 from ontimeai.lineage_fallback import load_lookups, build_live_turnaround_lookups
-from ontimeai.model import load_artifact, predict_label, predict_proba, quantile_threshold
+from ontimeai.model import load_artifact, predict_label, predict_proba, select_threshold
 from predict import prepare_inference_frame
 from ontimeai.config import ARTIFACTS_DIR
 
@@ -78,6 +80,18 @@ def main() -> int:
         help=(
             "Target predicted-positive rate for quantile threshold (default 0.22, "
             "matches v4_full test base rate). Set to 0 to fall back to artifact threshold."
+        ),
+    )
+    p.add_argument(
+        "--abs-threshold",
+        type=float,
+        default=0.0,
+        help=(
+            "Fixed absolute probability cutoff. When > 0 it OVERRIDES --target-pos-rate: "
+            "a flight is flagged delayed iff proba >= this value. Lets the predicted-positive "
+            "rate track live conditions (more alerts on storm days, fewer on calm days) instead "
+            "of forcing a constant ~22%. Backtest on v9 live actuals: abs@0.50 ~doubles precision "
+            "(0.47->0.64) at similar recall vs quantile@0.22. Default 0 = keep quantile behavior."
         ),
     )
     args = p.parse_args()
@@ -155,31 +169,41 @@ def main() -> int:
     else:
         # ---- AeroAPI mode (default, comportamiento original) ----
         print("\n[1] AeroAPI scheduled_departures...")
-        sched = fetch_airport_flights(args.airport, "scheduled_departures",
-                                      _iso(sched_start), _iso(sched_end), args.max_pages)
-        print(f"   pulled {len(sched)} scheduled departures")
-        sched_rows = [r for r in (aeroapi_to_flight_row(rec) for rec in sched) if r]
-        n_sched = upsert_flights(conn, sched_rows)
-        print(f"   upserted {n_sched} flights to DB (after ATL+known-airports filter)")
+        try:
+            sched = fetch_airport_flights(args.airport, "scheduled_departures",
+                                          _iso(sched_start), _iso(sched_end), args.max_pages)
+            print(f"   pulled {len(sched)} scheduled departures")
+            sched_rows = [r for r in (aeroapi_to_flight_row(rec) for rec in sched) if r]
+            n_sched = upsert_flights(conn, sched_rows)
+            print(f"   upserted {n_sched} flights to DB (after ATL+known-airports filter)")
+        except RuntimeError as _e:
+            print(f"   [1] skipped (rate-limited): {_e}")
+            sched = []
 
         if not args.skip_arrivals_sched:
             # ---- 2. scheduled arrivals (KATL) — captures FLOW=ARR_TO_ATL ----
+            time.sleep(5)
             print("\n[2] AeroAPI scheduled_arrivals...")
-            arr_sched = fetch_airport_flights(args.airport, "scheduled_arrivals",
-                                              _iso(sched_start), _iso(sched_end), args.max_pages)
-            print(f"   pulled {len(arr_sched)} scheduled arrivals")
-            arr_sched_rows = [r for r in (aeroapi_to_flight_row(rec) for rec in arr_sched) if r]
-            n_arr_sched = upsert_flights(conn, arr_sched_rows)
-            print(f"   upserted {n_arr_sched} flights to DB")
+            try:
+                arr_sched = fetch_airport_flights(args.airport, "scheduled_arrivals",
+                                                  _iso(sched_start), _iso(sched_end), args.max_pages)
+                print(f"   pulled {len(arr_sched)} scheduled arrivals")
+                arr_sched_rows = [r for r in (aeroapi_to_flight_row(rec) for rec in arr_sched) if r]
+                n_arr_sched = upsert_flights(conn, arr_sched_rows)
+                print(f"   upserted {n_arr_sched} flights to DB")
+            except RuntimeError as _e:
+                print(f"   [2] skipped (rate-limited): {_e}")
+                arr_sched = []
         else:
             print("\n[2] (skipped scheduled_arrivals)")
+            arr_sched = []
 
         # ---- 2b. Intermediate actuals (Tier 3 #1): some scheduled_* records
         # already have actual_off because the target took off but hasn't
         # arrived yet. Persist them so the prediction phase can boost proba
         # using the empirical P(arr_delay|dep_delay) relationship.
         intermediate_recs = [
-            r for r in (sched + arr_sched if not args.skip_arrivals_sched else sched)
+            r for r in (sched + arr_sched)
             if r.get("actual_off")
         ]
         if intermediate_recs:
@@ -187,23 +211,45 @@ def main() -> int:
             print(f"\n[2b] intermediate dep_delay captures: {n_intermediate} flights already departed")
 
         if not args.skip_actuals:
+            # Cap actuals at 4 pages — sufficient for last 4h of ATL arrivals,
+            # and avoids burning API quota needed for scheduled endpoints.
+            actuals_pages = min(args.max_pages, 4)
+
             # ---- 3. completed arrivals to KATL → actuals (settles ARR_TO_ATL preds) ----
+            time.sleep(5)
             print("\n[3] AeroAPI arrivals (completed at KATL)...")
-            arrived = fetch_airport_flights(args.airport, "arrivals",
-                                            _iso(arr_start), _iso(arr_end), args.max_pages)
-            print(f"   pulled {len(arrived)} arrivals")
-            arrived_filt = [r for r in arrived if r.get("actual_in")]
-            n_act_arr = upsert_actuals_from_aeroapi(conn, arrived_filt)
-            print(f"   wrote {n_act_arr} actuals")
+            try:
+                arrived = fetch_airport_flights(args.airport, "arrivals",
+                                                _iso(arr_start), _iso(arr_end), actuals_pages)
+                print(f"   pulled {len(arrived)} arrivals")
+                arrived_filt = [r for r in arrived if r.get("actual_in")]
+                n_act_arr = upsert_actuals_from_aeroapi(conn, arrived_filt)
+                print(f"   wrote {n_act_arr} actuals")
+            except RuntimeError as _e:
+                print(f"   [3] skipped (rate-limited): {_e}")
+                n_act_arr = 0
 
             # ---- 3a. completed departures from KATL → actuals (settles DEP_FROM_ATL preds)
+            # Non-fatal: if rate-limited after steps 1+2+3, log and continue.
+            time.sleep(5)
             print("\n[3a] AeroAPI departures (completed from KATL)...")
-            departed = fetch_airport_flights(args.airport, "departures",
-                                             _iso(arr_start), _iso(arr_end), args.max_pages)
-            landed = [r for r in departed if r.get("actual_in")]
-            print(f"   pulled {len(departed)} departures, {len(landed)} have landed at destination")
-            n_act_dep = upsert_actuals_from_aeroapi(conn, landed)
-            print(f"   wrote {n_act_dep} actuals")
+            try:
+                departed = fetch_airport_flights(args.airport, "departures",
+                                                 _iso(arr_start), _iso(arr_end), actuals_pages)
+                landed = [r for r in departed if r.get("actual_in")]
+                en_route = [r for r in departed if r.get("actual_off") and not r.get("actual_in")]
+                print(f"   pulled {len(departed)} departures, {len(landed)} landed, {len(en_route)} en route")
+                # Save arr_delay for landed flights
+                n_act_dep = upsert_actuals_from_aeroapi(conn, landed)
+                # Also save actual_off for en-route flights so they leave "Programado" state
+                if en_route:
+                    n_dep_out = upsert_actuals_from_aeroapi(conn, en_route)
+                    print(f"   wrote {n_act_dep} actuals (landed) + {n_dep_out} actual_off (en route)")
+                else:
+                    print(f"   wrote {n_act_dep} actuals")
+            except RuntimeError as _e:
+                print(f"   [3a] skipped (rate-limited): {_e}")
+                n_act_dep = 0
             n_act = n_act_arr + n_act_dep
         else:
             print("\n[3] (skipped actuals)")
@@ -286,7 +332,51 @@ def main() -> int:
 
     # ---- 5. predict scheduled flights ----
     print("\n[5] Building features and predicting...")
-    target_ids = [r["fa_flight_id"] for r in sched_rows + arr_sched_rows]
+    # Decouple the prediction target from this cycle's fetch. Predicting only the
+    # flights pulled this tick means each flight is scored ~once, minutes before
+    # departure (the scheduled_departures feed only surfaces near-term flights).
+    # Instead, every cycle re-predict ALL upcoming ATL departures whose departure
+    # is still AHEAD — so a fresh PRE-departure prediction always exists and
+    # refines as the gate nears.
+    #
+    # Two cases qualify as "still needs a prediction":
+    #   1. Upcoming: estimated_out is still in the future (AeroAPI updated the estimate).
+    #   2. Delayed on ground: scheduled_out passed but no actual_off yet AND
+    #      the scheduled time is within DELAY_GRACE_H hours — covers flights that
+    #      AeroAPI hasn't updated the estimated_out for (shows stale scheduled time)
+    #      but hasn't departed either (stuck at gate due to delay).
+    # Without case 2, a delayed flight like F93512 stops getting predictions the
+    # moment its scheduled time passes, leaving "Programado" with a stale score.
+    # The grace window excludes departed-but-unsettled flights older than DELAY_GRACE_H
+    # (AeroAPI typically settles actual_off within 30-60 min; beyond 2h it's safe to
+    # assume the lag is too large or the flight is actually airborne and needs no update).
+    horizon_h = int(os.getenv("PREDICT_HORIZON_HOURS", str(args.schedule_hours)))
+    delay_grace_h = int(os.getenv("DELAY_GRACE_HOURS", "2"))
+    db_dep_rows = conn.execute(
+        """
+        SELECT f.fa_flight_id
+        FROM flights f
+        LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
+        WHERE f.origin = 'ATL'
+          AND f.scheduled_out_utc IS NOT NULL
+          AND a.actual_off_utc IS NULL
+          AND (
+              datetime(COALESCE(f.estimated_out_utc, f.scheduled_out_utc)) > datetime(?)
+              OR datetime(f.scheduled_out_utc) > datetime(?, ?)
+          )
+          AND datetime(f.scheduled_out_utc) <= datetime(?, ?)
+          AND COALESCE(f.cancelled, 0) = 0
+        """,
+        (_iso(now), _iso(now), f"-{delay_grace_h} hours", _iso(now), f"+{horizon_h} hours"),
+    ).fetchall()
+    # Union the standing upcoming-departures set with this cycle's freshly fetched
+    # flights (keeps arrivals + brand-new departures not yet committed-visible).
+    target_ids = list(
+        {r[0] for r in db_dep_rows}
+        | {r["fa_flight_id"] for r in sched_rows + arr_sched_rows}
+    )
+    print(f"   target: {len(db_dep_rows)} standing ATL deps (upcoming + ≤{delay_grace_h}h delayed) + "
+          f"{len(sched_rows) + len(arr_sched_rows)} freshly fetched → {len(target_ids)} unique")
     if not target_ids:
         print("   no flights to predict")
         conn.execute(
@@ -400,12 +490,12 @@ def main() -> int:
     # distribution shift); fall back to the artifact's static threshold when
     # --target-pos-rate=0 or when the target batch is too small to estimate.
     target_proba = proba[target_mask.to_numpy()]
-    if args.target_pos_rate > 0 and target_proba.size >= 5:
-        threshold_used = quantile_threshold(target_proba, args.target_pos_rate)
-        threshold_strategy = f"quantile@{args.target_pos_rate:.2f}"
-    else:
-        threshold_used = float(meta["threshold"])
-        threshold_strategy = "artifact"
+    threshold_used, threshold_strategy = select_threshold(
+        target_proba,
+        target_pos_rate=args.target_pos_rate,
+        artifact_threshold=float(meta["threshold"]),
+        abs_threshold=args.abs_threshold,
+    )
     labels = predict_label(proba, threshold_used, "binary")
     print(
         f"   threshold strategy={threshold_strategy} value={threshold_used:.4f} "
@@ -433,6 +523,7 @@ def main() -> int:
     # Pre-fetch intermediate dep_delay for all target stable_ids in one query.
     target_stable_ids = [stable_id(df.loc[i, "fa_flight_id"]) for i in df.index[target_mask]]
     dep_delay_map: dict[str, float] = {}
+    landed_ids: set[str] = set()
     if target_stable_ids:
         placeholders = ",".join("?" for _ in target_stable_ids)
         for row in conn.execute(
@@ -443,6 +534,13 @@ def main() -> int:
             target_stable_ids,
         ).fetchall():
             dep_delay_map[row[0]] = float(row[1])
+        for row in conn.execute(
+            f"""SELECT stable_id FROM actuals
+               WHERE stable_id IN ({placeholders})
+                 AND actual_in_utc IS NOT NULL""",
+            target_stable_ids,
+        ).fetchall():
+            landed_ids.add(row[0])
 
     dep_adjust_enabled = os.getenv("DEP_DELAY_ADJUST", "1").lower() in ("1", "true", "yes")
     if dep_delay_map and dep_adjust_enabled:
@@ -502,8 +600,32 @@ def main() -> int:
             if adsb_enabled
             else None
         )
-        proba_adj = adsb_eta_adjust(proba_after_dep, adsb_delay) if adsb_enabled else proba_after_dep
+        proba_after_eta = (
+            adsb_eta_adjust(proba_after_dep, adsb_delay) if adsb_enabled else proba_after_dep
+        )
+
+        # Mid win #5 — ADS-B holding pattern detection (orbiting near ATL)
+        holding_min = (
+            compute_adsb_holding_min(
+                conn,
+                tail_num=df.loc[i, "tail_num"],
+                dest=df.loc[i, "dest"],
+            )
+            if adsb_enabled
+            else None
+        )
+        proba_adj = (
+            adsb_holding_adjust(proba_after_eta, holding_min) if adsb_enabled else proba_after_eta
+        )
         label_adj = int(proba_adj >= threshold_used)
+
+        # Prediction phase: classify based on flight departure/landing status
+        if sid in landed_ids:
+            phase = "POST_LANDING"
+        elif sid in dep_delay_map:
+            phase = "EN_ROUTE"
+        else:
+            phase = "PRE_DEPARTURE"
 
         # Diagnostic features (Tier 2 #I, #J) — computed live, NOT in
         # feature_cols of v9. Persisted for future v9.1 retrain analysis.
@@ -522,6 +644,8 @@ def main() -> int:
             int(atl_window), (float(carrier_smooth) if carrier_smooth is not None else None),
             (float(dep_delay) if dep_delay is not None else None),
             (float(adsb_delay) if adsb_delay is not None else None),
+            (float(holding_min) if holding_min is not None else None),
+            phase,
         ))
     conn.executemany(
         """INSERT OR REPLACE INTO predictions
@@ -529,20 +653,22 @@ def main() -> int:
             threshold_used, threshold_strategy,
             proba_raw, gdp_orig_delay_min, gdp_dest_delay_min,
             atl_arrivals_in_window_30min, carrier_delay_rate_smooth,
-            intermediate_dep_delay_min, adsb_eta_delay_min)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            intermediate_dep_delay_min, adsb_eta_delay_min, adsb_holding_min,
+            prediction_phase)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         pred_rows,
     )
     conn.commit()
     # r[3]=proba_delay (final), r[7]=proba_raw, r[12]=intermediate_dep_delay_min,
-    # r[13]=adsb_eta_delay_min
+    # r[13]=adsb_eta_delay_min, r[14]=adsb_holding_min
     n_any = sum(1 for r in pred_rows if r[7] is not None and abs(r[7] - r[3]) > 1e-6)
     n_dep = sum(1 for r in pred_rows if r[12] is not None and r[12] > 5)
     n_adsb_available = sum(1 for r in pred_rows if r[13] is not None)
     n_adsb_boost = sum(1 for r in pred_rows if r[13] is not None and r[13] > 5)
+    n_holding = sum(1 for r in pred_rows if r[14] is not None and r[14] >= 5)
     print(f"   wrote {len(pred_rows)} predictions ({n_any} adjusted, "
           f"{n_dep} via dep_delay, {n_adsb_available} with adsb_eta "
-          f"of which {n_adsb_boost} boosted)")
+          f"of which {n_adsb_boost} boosted, {n_holding} in holding pattern)")
 
     # ---- SHAP top-K persistence (Fix D in FIXES_PLAN.md) ----
     # Compute SHAP values for target rows only, persist top-15 by |shap|.

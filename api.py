@@ -21,7 +21,8 @@ load_dotenv(dotenv_path=".env.local", override=False)
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
+import hashlib
 
 import re
 import numpy as np
@@ -39,8 +40,99 @@ GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 _TMP_DB = Path("/tmp/live_data.db")
 _BUNDLED_DB = Path(__file__).parent / "live_data.db"
 DB_PATH = _TMP_DB if GCS_BUCKET else _BUNDLED_DB
-_DB_REFRESH_INTERVAL = 1800  # refresh from GCS every 30 min
+_DB_REFRESH_INTERVAL = 1000  # refresh from GCS every ~16 min
 _db_last_refresh: float = 0.0
+
+# Users DB (separate from live_data.db so live job never overwrites it)
+USERS_DB_PATH = Path("/tmp/users.db") if GCS_BUCKET else Path(__file__).parent / "users.db"
+
+
+def _hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    h = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000)
+    return f"{salt}${h.hex()}"
+
+
+def _check_password(password: str, stored: str) -> bool:
+    try:
+        salt, h = stored.split("$", 1)
+        expected = hashlib.pbkdf2_hmac("sha256", password.encode(), salt.encode(), 200_000).hex()
+        return secrets.compare_digest(h, expected)
+    except Exception:
+        return False
+
+
+def _get_users_con() -> sqlite3.Connection:
+    con = sqlite3.connect(str(USERS_DB_PATH))
+    con.row_factory = sqlite3.Row
+    return con
+
+
+def _upload_users_db() -> None:
+    if not GCS_BUCKET:
+        return
+    try:
+        from google.cloud import storage as gcs
+        gcs.Client().bucket(GCS_BUCKET).blob("users.db").upload_from_filename(str(USERS_DB_PATH))
+    except Exception as e:
+        print(f"[users_db] upload failed: {e}")
+
+
+def _init_users_db() -> None:
+    if GCS_BUCKET:
+        try:
+            from google.cloud import storage as gcs
+            blob = gcs.Client().bucket(GCS_BUCKET).blob("users.db")
+            if blob.exists():
+                blob.download_to_filename(str(USERS_DB_PATH))
+                print("[users_db] downloaded from GCS")
+        except Exception as e:
+            print(f"[users_db] download failed, creating fresh: {e}")
+
+    con = _get_users_con()
+    con.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'user',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+            updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        );
+        CREATE TABLE IF NOT EXISTS user_preferences (
+            username TEXT PRIMARY KEY,
+            theme TEXT DEFAULT 'dark',
+            palette TEXT DEFAULT 'default',
+            updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+        );
+    """)
+    # Seed initial users from env vars (idempotent)
+    seeds = [
+        (os.getenv("API_USERNAME", "admin"),  os.getenv("API_PASSWORD", "ontimeai2026"),  "superadmin"),
+        (os.getenv("API_USERNAME_VIEWER", "viewer"), os.getenv("API_PASSWORD_VIEWER", "viewer2026"), "user"),
+    ]
+    for username, password, role in seeds:
+        if username and not con.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
+            con.execute(
+                "INSERT INTO users (username, password_hash, role) VALUES (?,?,?)",
+                (username, _hash_password(password), role),
+            )
+    con.commit()
+    con.close()
+    _upload_users_db()
+
+
+def _payload_of(request: Request) -> dict:
+    token = request.headers.get("Authorization", "")[7:]
+    return jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
+
+
+def _require_superadmin(request: Request) -> dict:
+    payload = _payload_of(request)
+    if payload.get("role") != "superadmin":
+        raise HTTPException(status_code=403, detail="Requiere rol superadmin")
+    return payload
 
 
 def _refresh_db_from_gcs() -> None:
@@ -73,12 +165,6 @@ JWT_SECRET = os.getenv("JWT_SECRET_KEY", "ontimeai-dev-secret-change-in-prod-32c
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 8
 
-_API_USER = os.getenv("API_USERNAME", "admin")
-_API_PASS = os.getenv("API_PASSWORD", "ontimeai2026")
-
-
-def _verify_password(plain: str) -> bool:
-    return secrets.compare_digest(plain.encode(), _API_PASS.encode())
 
 _PUBLIC_PATHS = {"/auth/login", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"}
 
@@ -103,6 +189,23 @@ class AuthMiddleware(BaseHTTPMiddleware):
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class UserCreate(BaseModel):
+    username: str
+    password: str
+    role: str = "user"
+
+
+class UserUpdate(BaseModel):
+    password: Optional[str] = None
+    role: Optional[str] = None
+    active: Optional[bool] = None
+
+
+class PreferencesUpdate(BaseModel):
+    theme: Optional[str] = None
+    palette: Optional[str] = None
 
 
 # ── Feature labels ─────────────────────────────────────────────────────────
@@ -161,7 +264,8 @@ async def lifespan(app: FastAPI):
         print("[startup] Database migrations executed successfully")
     except Exception as e:
         print(f"[startup] Database migration failed: {e}")
-        
+
+    _init_users_db()
     yield
 
 
@@ -179,7 +283,7 @@ _ALLOWED_ORIGINS = [
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_ALLOWED_ORIGINS,
-    allow_methods=["GET", "POST"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type"],
 )
 
@@ -198,9 +302,20 @@ def _validate_airport(code: str) -> str:
 
 
 def get_db() -> sqlite3.Connection:
+    global _db_last_refresh
     _refresh_db_from_gcs()
-    con = sqlite3.connect(DB_PATH)
+    con = sqlite3.connect(str(DB_PATH))
     con.row_factory = sqlite3.Row
+    if GCS_BUCKET:
+        try:
+            con.execute("SELECT 1 FROM sqlite_master LIMIT 1")
+        except sqlite3.DatabaseError:
+            con.close()
+            print("[db] local DB corrupted — forcing re-download from GCS")
+            _db_last_refresh = 0
+            _refresh_db_from_gcs()
+            con = sqlite3.connect(str(DB_PATH))
+            con.row_factory = sqlite3.Row
     return con
 
 
@@ -231,6 +346,14 @@ def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
     
     Includes flights scheduled from 6 hours ago to 18 hours in the future,
     plus any flight scheduled in the past 24 hours that has not yet departed.
+
+    Selection priority per flight:
+      1. The most recent prediction made BEFORE the flight physically departed
+         (predicted_at <= actual_off) — the genuine pre-departure forecast.
+      2. If none exists (e.g. arrivals only seen en-route), fall back to the
+         most recent prediction made before the flight LANDED.
+    Post-landing batch runs (e.g. calibration backfills) are always excluded so
+    a retro-prediction never overrides a valid pre-landing/pre-departure one.
     """
     now = datetime.now(timezone.utc)
     start_window = (now - timedelta(hours=6)).isoformat()
@@ -258,15 +381,23 @@ def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
                a.actual_out_utc
         FROM flights f
         JOIN (
-            SELECT fa_flight_id,
-                   proba_delay,
-                   predicted_delay,
-                   predicted_at_utc,
+            SELECT p2.fa_flight_id,
+                   p2.proba_delay,
+                   p2.predicted_delay,
+                   p2.predicted_at_utc,
                    ROW_NUMBER() OVER (
-                       PARTITION BY fa_flight_id
-                       ORDER BY predicted_at_utc DESC
+                       PARTITION BY p2.fa_flight_id
+                       ORDER BY
+                           -- prefer pre-departure predictions (0) over en-route (1)
+                           CASE WHEN a2.actual_off_utc IS NOT NULL
+                                     AND p2.predicted_at_utc > a2.actual_off_utc
+                                THEN 1 ELSE 0 END ASC,
+                           p2.predicted_at_utc DESC
                    ) AS rn
-            FROM predictions
+            FROM predictions p2
+            LEFT JOIN actuals a2 ON a2.fa_flight_id = p2.fa_flight_id
+            WHERE a2.actual_in_utc IS NULL
+               OR p2.predicted_at_utc <= a2.actual_in_utc
         ) p ON p.fa_flight_id = f.fa_flight_id AND p.rn = 1
         LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
         WHERE f.cancelled = 0
@@ -316,23 +447,131 @@ def _flight_row_to_dict(row: sqlite3.Row) -> dict:
 
 @app.post("/auth/login")
 def login(body: LoginRequest):
-    if body.username != _API_USER or not _verify_password(body.password):
+    con = _get_users_con()
+    row = con.execute(
+        "SELECT password_hash, role, active FROM users WHERE username=?", (body.username,)
+    ).fetchone()
+    con.close()
+    if not row or not row["active"] or not _check_password(body.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Credenciales incorrectas")
     expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
     token = jwt.encode(
-        {"sub": body.username, "exp": expire},
-        JWT_SECRET,
-        algorithm=JWT_ALGORITHM,
+        {"sub": body.username, "role": row["role"], "exp": expire},
+        JWT_SECRET, algorithm=JWT_ALGORITHM,
     )
     return {"access_token": token, "token_type": "bearer"}
 
 
 @app.get("/auth/me")
 def auth_me(request: Request):
-    auth = request.headers.get("Authorization", "")
-    token = auth[7:]
-    payload = jwt.decode(token, JWT_SECRET, algorithms=[JWT_ALGORITHM])
-    return {"username": payload.get("sub")}
+    payload = _payload_of(request)
+    return {"username": payload.get("sub"), "role": payload.get("role", "user")}
+
+
+# ── User management (superadmin only) ──────────────────────────────────────
+
+@app.get("/admin/users")
+def list_users(request: Request):
+    _require_superadmin(request)
+    con = _get_users_con()
+    rows = con.execute(
+        "SELECT id, username, role, active, created_at FROM users ORDER BY created_at"
+    ).fetchall()
+    con.close()
+    return [dict(r) for r in rows]
+
+
+@app.post("/admin/users", status_code=201)
+def create_user(request: Request, body: UserCreate):
+    _require_superadmin(request)
+    if body.role not in ("user", "admin", "superadmin"):
+        raise HTTPException(400, "Rol inválido. Válidos: user, admin, superadmin")
+    try:
+        con = _get_users_con()
+        con.execute(
+            "INSERT INTO users (username, password_hash, role) VALUES (?,?,?)",
+            (body.username, _hash_password(body.password), body.role),
+        )
+        con.commit()
+        con.close()
+        _upload_users_db()
+        return {"ok": True}
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "El usuario ya existe")
+
+
+@app.patch("/admin/users/{username}")
+def update_user(request: Request, username: str, body: UserUpdate):
+    payload = _require_superadmin(request)
+    me = payload.get("sub")
+    if username == me:
+        if body.active is False:
+            raise HTTPException(400, "No podés desactivarte a vos mismo")
+        if body.role and body.role != "superadmin":
+            raise HTTPException(400, "No podés cambiar tu propio rol")
+    sets, vals = [], []
+    if body.password is not None:
+        sets.append("password_hash=?"); vals.append(_hash_password(body.password))
+    if body.role is not None:
+        if body.role not in ("user", "admin", "superadmin"):
+            raise HTTPException(400, "Rol inválido")
+        sets.append("role=?"); vals.append(body.role)
+    if body.active is not None:
+        sets.append("active=?"); vals.append(1 if body.active else 0)
+    if not sets:
+        return {"ok": True}
+    sets.append("updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now')")
+    vals.append(username)
+    con = _get_users_con()
+    res = con.execute(f"UPDATE users SET {','.join(sets)} WHERE username=?", vals)
+    if res.rowcount == 0:
+        con.close(); raise HTTPException(404, "Usuario no encontrado")
+    con.commit(); con.close()
+    _upload_users_db()
+    return {"ok": True}
+
+
+@app.delete("/admin/users/{username}", status_code=204)
+def delete_user(request: Request, username: str):
+    payload = _require_superadmin(request)
+    if username == payload.get("sub"):
+        raise HTTPException(400, "No podés eliminarte a vos mismo")
+    con = _get_users_con()
+    res = con.execute("DELETE FROM users WHERE username=?", (username,))
+    if res.rowcount == 0:
+        con.close(); raise HTTPException(404, "Usuario no encontrado")
+    con.commit(); con.close()
+    _upload_users_db()
+
+
+# ── User preferences ────────────────────────────────────────────────────────
+
+@app.get("/users/me/preferences")
+def get_preferences(request: Request):
+    username = _payload_of(request).get("sub")
+    con = _get_users_con()
+    row = con.execute(
+        "SELECT theme, palette FROM user_preferences WHERE username=?", (username,)
+    ).fetchone()
+    con.close()
+    return {"theme": row["theme"], "palette": row["palette"]} if row else {"theme": "dark", "palette": "default"}
+
+
+@app.put("/users/me/preferences")
+def update_preferences(request: Request, body: PreferencesUpdate):
+    username = _payload_of(request).get("sub")
+    con = _get_users_con()
+    con.execute("""
+        INSERT INTO user_preferences (username, theme, palette)
+        VALUES (?,?,?)
+        ON CONFLICT(username) DO UPDATE SET
+            theme    = COALESCE(excluded.theme,   theme),
+            palette  = COALESCE(excluded.palette, palette),
+            updated_at = strftime('%Y-%m-%dT%H:%M:%SZ','now')
+    """, (username, body.theme or "dark", body.palette or "default"))
+    con.commit(); con.close()
+    _upload_users_db()
+    return {"ok": True}
 
 
 # ── Protected routes ────────────────────────────────────────────────────────
@@ -576,14 +815,16 @@ def metrics_model():
     except Exception:
         threshold = 0.0
 
-    # Live AUC/Brier from last 7 days (deduplicated per flight)
+    # Live AUC/Brier — PRE_DEPARTURE predictions only (last 7 days, first pred per flight)
     live_auc = live_brier = n_actuals = None
+    live_auc_enroute = live_brier_enroute = n_actuals_enroute = None
     try:
         from sklearn.metrics import roc_auc_score, brier_score_loss
         con = get_db()
         import pandas as pd
         df = pd.read_sql("""
             SELECT p.fa_flight_id, p.proba_delay, p.predicted_at_utc,
+                   COALESCE(p.prediction_phase, 'PRE_DEPARTURE') AS prediction_phase,
                    CASE WHEN a.arr_delay_min > 15 THEN 1 ELSE 0 END AS delayed
             FROM predictions p
             JOIN actuals a ON p.fa_flight_id = a.fa_flight_id
@@ -593,24 +834,43 @@ def metrics_model():
         """, con)
         con.close()
         if not df.empty:
-            df = df.sort_values("predicted_at_utc").groupby("fa_flight_id", as_index=False).last()
-            y = df["delayed"].to_numpy(dtype=int)
-            p = df["proba_delay"].to_numpy(dtype=float)
+            # PRE_DEPARTURE: first prediction per flight that is PRE_DEPARTURE
+            pre = (df[df["prediction_phase"] == "PRE_DEPARTURE"]
+                   .sort_values("predicted_at_utc")
+                   .groupby("fa_flight_id", as_index=False).first())
+            if pre.empty:
+                # Fallback: use first prediction (legacy data without phase column)
+                pre = df.sort_values("predicted_at_utc").groupby("fa_flight_id", as_index=False).first()
+            y = pre["delayed"].to_numpy(dtype=int)
+            p = pre["proba_delay"].to_numpy(dtype=float)
             if len(y) >= 30 and y.sum() >= 5:
                 live_auc   = round(float(roc_auc_score(y, p)), 4)
                 live_brier = round(float(brier_score_loss(y, p)), 4)
                 n_actuals  = int(len(y))
+            # EN_ROUTE: for reference, compute separately
+            enroute = (df[df["prediction_phase"] == "EN_ROUTE"]
+                       .sort_values("predicted_at_utc")
+                       .groupby("fa_flight_id", as_index=False).first())
+            if len(enroute) >= 30 and enroute["delayed"].sum() >= 5:
+                y_e = enroute["delayed"].to_numpy(dtype=int)
+                p_e = enroute["proba_delay"].to_numpy(dtype=float)
+                live_auc_enroute   = round(float(roc_auc_score(y_e, p_e)), 4)
+                live_brier_enroute = round(float(brier_score_loss(y_e, p_e)), 4)
+                n_actuals_enroute  = int(len(enroute))
     except Exception:
         pass
 
     version = ACTIVE_MODEL.replace("4year_", "").replace("_", "-")
     return {
-        "active_model": ACTIVE_MODEL,
-        "version":      version,
-        "live_auc":     live_auc,
-        "live_brier":   live_brier,
-        "n_actuals":    n_actuals,
-        "threshold":    threshold,
+        "active_model":         ACTIVE_MODEL,
+        "version":              version,
+        "live_auc":             live_auc,
+        "live_brier":           live_brier,
+        "n_actuals":            n_actuals,
+        "live_auc_enroute":     live_auc_enroute,
+        "live_brier_enroute":   live_brier_enroute,
+        "n_actuals_enroute":    n_actuals_enroute,
+        "threshold":            threshold,
     }
 
 
@@ -802,6 +1062,8 @@ def metrics_routes():
             FROM flights f
             JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
             WHERE a.arr_delay_min IS NOT NULL
+              AND f.origin IS NOT NULL AND f.origin != ''
+              AND f.dest IS NOT NULL AND f.dest != ''
             GROUP BY f.origin, f.dest
             HAVING COUNT(*) >= 1
             ORDER BY total_flights DESC
