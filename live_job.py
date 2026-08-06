@@ -118,6 +118,14 @@ def main() -> int:
     exit_code = live_pull.main()
     _log_mem("post-pipeline")
 
+    if TMP_DB.exists():
+        print("[job] Running database pruning...")
+        try:
+            from scripts.prune_db import prune_db
+            prune_db(TMP_DB, days=30, dry_run=False)
+        except Exception as e:
+            print(f"[job] Error running database pruning: {e}")
+
     if GCS_BUCKET and TMP_DB.exists():
         _cleanup_old_data()
         _gcs_upload()
