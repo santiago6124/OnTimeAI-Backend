@@ -16,21 +16,56 @@ GCS_BUCKET = os.environ.get("GCS_BUCKET", "")
 GCS_OBJECT = "live_data.db"
 TMP_DB = Path("/tmp/live_data.db")
 BUNDLED_DB = Path(__file__).parent / "live_data.db"
+GCS_GENERATION_RETRIES = max(0, int(os.environ.get("GCS_GENERATION_RETRIES", "2")))
 
 # Apuntar DB_PATH al /tmp antes de que ontimeai.live se importe
 os.environ["DB_PATH"] = str(TMP_DB)
 
 
-def _gcs_download() -> None:
+class GCSGenerationConflict(RuntimeError):
+    """The shared DB changed after this process selected its base generation."""
+
+
+def _gcs_blob():
     from google.cloud import storage as gcs
+
     client = gcs.Client()
-    blob = client.bucket(GCS_BUCKET).blob(GCS_OBJECT)
-    if blob.exists():
-        blob.download_to_filename(str(TMP_DB))
-        print(f"[job] Descargado {TMP_DB.stat().st_size / 1e6:.1f} MB desde gs://{GCS_BUCKET}/{GCS_OBJECT}")
-    else:
+    return client.bucket(GCS_BUCKET).blob(GCS_OBJECT)
+
+
+def _gcs_download() -> int:
+    """Download one immutable GCS generation and return its generation number.
+
+    Generation ``0`` means the object did not exist when the snapshot was
+    selected.  The matching upload then uses ``if_generation_match=0`` so it
+    can create the object but cannot overwrite a concurrently-created one.
+    """
+    from google.api_core.exceptions import NotFound, PreconditionFailed
+
+    blob = _gcs_blob()
+    try:
+        blob.reload()
+    except NotFound:
         print("[job] No hay DB en GCS todavía, usando la bundleada como base.")
         shutil.copy(BUNDLED_DB, TMP_DB)
+        return 0
+
+    generation = int(blob.generation)
+    try:
+        blob.download_to_filename(
+            str(TMP_DB),
+            if_generation_match=generation,
+        )
+    except PreconditionFailed as exc:
+        raise GCSGenerationConflict(
+            f"la DB cambió durante la descarga de la generación {generation}"
+        ) from exc
+
+    print(
+        f"[job] Descargado {TMP_DB.stat().st_size / 1e6:.1f} MB desde "
+        f"gs://{GCS_BUCKET}/{GCS_OBJECT} (generation={generation})"
+    )
+    return generation
 
 
 def _cleanup_old_data() -> None:
@@ -60,7 +95,14 @@ def _cleanup_old_data() -> None:
     con.close()
 
 
-def _gcs_upload() -> None:
+def _gcs_upload(expected_generation: int) -> int:
+    """Upload only if GCS still contains ``expected_generation``.
+
+    A mismatch is a normal optimistic-concurrency conflict: the caller must
+    restart from the new winning generation instead of overwriting it.
+    """
+    from google.api_core.exceptions import PreconditionFailed
+
     import sqlite3 as _sqlite3
     _log_mem("pre-upload")
     try:
@@ -73,28 +115,33 @@ def _gcs_upload() -> None:
             print(f"[job] ABORT upload — DB corrupted. quick_check: {quick}")
             for row in errors:
                 print(f"[job]   integrity_check: {row[0]}")
-            return
+            raise RuntimeError("DB integrity check failed; refusing GCS upload")
         chk.close()
     except Exception as e:
         print(f"[job] ABORT upload — DB integrity check error: {e}")
-        return
-    from google.cloud import storage as gcs
-    client = gcs.Client()
-    blob = client.bucket(GCS_BUCKET).blob(GCS_OBJECT)
-    blob.upload_from_filename(str(TMP_DB))
-    print(f"[job] Subido {TMP_DB.stat().st_size / 1e6:.1f} MB a gs://{GCS_BUCKET}/{GCS_OBJECT}")
+        raise
+
+    blob = _gcs_blob()
+    try:
+        blob.upload_from_filename(
+            str(TMP_DB),
+            if_generation_match=expected_generation,
+        )
+    except PreconditionFailed as exc:
+        raise GCSGenerationConflict(
+            f"GCS ya no está en generation={expected_generation}"
+        ) from exc
+
+    uploaded_generation = int(blob.generation)
+    print(
+        f"[job] Subido {TMP_DB.stat().st_size / 1e6:.1f} MB a "
+        f"gs://{GCS_BUCKET}/{GCS_OBJECT} (generation={uploaded_generation}, "
+        f"base={expected_generation})"
+    )
+    return uploaded_generation
 
 
-def main() -> int:
-    if GCS_BUCKET:
-        _gcs_download()
-    else:
-        print("[job] GCS_BUCKET no configurado, usando DB local.")
-        shutil.copy(BUNDLED_DB, TMP_DB)
-
-    # live_pull.main() usa parse_args() — sys.argv vacío usa defaults.
-    # Permitimos override de args clave via env vars (útil para backfill o
-    # diagnóstico). Si no están seteadas, mantenemos defaults.
+def _live_pull_args_from_env() -> list[str]:
     extra_args: list[str] = []
     for env_name, flag in (
         ("ACTUALS_HOURS", "--actuals-hours"),
@@ -108,15 +155,23 @@ def main() -> int:
         val = os.environ.get(env_name)
         if val:
             extra_args.extend([flag, val])
+    return extra_args
 
+
+def _run_pipeline_attempt(extra_args: list[str]) -> int:
+    """Run one complete local mutation attempt against the current TMP_DB."""
     sys.argv = [sys.argv[0]] + extra_args
     if extra_args:
         print(f"[job] live_pull args from env: {' '.join(extra_args)}")
     sys.path.insert(0, str(Path(__file__).parent))
     _log_mem("pre-pipeline")
     import live_pull
+
     exit_code = live_pull.main()
     _log_mem("post-pipeline")
+    if exit_code != 0:
+        print(f"[job] live_pull failed with exit_code={exit_code}; upload skipped")
+        return exit_code
 
     if TMP_DB.exists():
         print("[job] Running database pruning...")
@@ -126,12 +181,49 @@ def main() -> int:
         except Exception as e:
             print(f"[job] Error running database pruning: {e}")
 
-    if GCS_BUCKET and TMP_DB.exists():
-        _cleanup_old_data()
-        _gcs_upload()
+    return 0
 
-    _log_mem("end")
-    return exit_code
+
+def main() -> int:
+    extra_args = _live_pull_args_from_env()
+
+    if not GCS_BUCKET:
+        print("[job] GCS_BUCKET no configurado, usando DB local.")
+        shutil.copy(BUNDLED_DB, TMP_DB)
+        exit_code = _run_pipeline_attempt(extra_args)
+        _log_mem("end")
+        return exit_code
+
+    for attempt in range(GCS_GENERATION_RETRIES + 1):
+        try:
+            base_generation = _gcs_download()
+            print(
+                f"[job] mutation attempt {attempt + 1}/"
+                f"{GCS_GENERATION_RETRIES + 1} from generation={base_generation}"
+            )
+            exit_code = _run_pipeline_attempt(extra_args)
+            if exit_code != 0:
+                return exit_code
+            if not TMP_DB.exists():
+                raise FileNotFoundError(f"pipeline did not produce {TMP_DB}")
+
+            _cleanup_old_data()
+            _gcs_upload(base_generation)
+            _log_mem("end")
+            return 0
+        except GCSGenerationConflict as exc:
+            if attempt >= GCS_GENERATION_RETRIES:
+                print(
+                    f"[job] generation conflict after {attempt + 1} attempts; "
+                    f"refusing stale overwrite: {exc}"
+                )
+                return 3
+            print(
+                f"[job] generation conflict: {exc}. Reloading the winning DB "
+                f"and retrying ({attempt + 2}/{GCS_GENERATION_RETRIES + 1})."
+            )
+
+    return 3
 
 
 if __name__ == "__main__":
