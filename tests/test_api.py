@@ -58,6 +58,30 @@ def test_flight_detail_has_shap():
     assert isinstance(r.json()["shap"], list)
 
 
+def test_flight_history_includes_cycle_explanation():
+    flights = client.get("/flights").json()
+    if not flights:
+        pytest.skip("No flights in DB today")
+    fid = flights[0]["fa_flight_id"]
+    r = client.get(f"/flight-history/{fid}")
+    assert r.status_code == 200
+    history = r.json()
+    if not history:
+        pytest.skip("No prediction history for current flight")
+
+    cycle = history[-1]
+    for key in (
+        "predicted_at_utc", "delay_probability", "base_probability",
+        "operational_adjustment", "predicted_delay", "threshold_used",
+        "threshold_strategy", "prediction_phase", "operational_context", "shap",
+    ):
+        assert key in cycle, f"missing history key: {key}"
+    assert isinstance(cycle["shap"], list)
+    if cycle["shap"]:
+        for key in ("feature", "label", "contribution", "direction", "value"):
+            assert key in cycle["shap"][0]
+
+
 # ── /metrics/summary ───────────────────────────────────────────────────────
 
 def test_metrics_summary_keys():

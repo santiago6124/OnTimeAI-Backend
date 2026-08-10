@@ -6,6 +6,7 @@ Serves live predictions from live_data.db.  Swap models without restart:
 Endpoints:
     GET /flights            — today's scheduled flights + latest prediction
     GET /flights/{id}       — single flight detail + SHAP
+    GET /flight-history/{id} — prediction cycles + persisted SHAP/context
     GET /metrics/summary    — today's KPI cards
     GET /metrics/hourly     — predictions grouped by departure hour
     GET /metrics/model      — active model info + live AUC
@@ -637,21 +638,94 @@ def list_flights(status: str = "all", departures_within_min: int = None):
 def get_flight_history(fa_flight_id: str):
     con = get_db()
     try:
-        rows = con.execute(
-            """SELECT predicted_at_utc, proba_delay, predicted_delay
+        prediction_columns = {
+            row["name"] for row in con.execute("PRAGMA table_info(predictions)").fetchall()
+        }
+
+        def optional_prediction_column(name: str) -> str:
+            # Static names supplied below; aliasing keeps legacy bundled DBs
+            # readable before the startup migration has run (notably in tests).
+            return f"p.{name}" if name in prediction_columns else f"NULL AS {name}"
+
+        optional_fields = ", ".join(
+            optional_prediction_column(name)
+            for name in (
+                "proba_raw", "threshold_used", "threshold_strategy",
+                "prediction_phase", "gdp_orig_delay_min", "gdp_dest_delay_min",
+                "intermediate_dep_delay_min", "adsb_eta_delay_min", "adsb_holding_min",
+            )
+        )
+        identity = con.execute(
+            """SELECT stable_id
                FROM predictions
                WHERE fa_flight_id = ?
-               ORDER BY predicted_at_utc ASC""",
+               ORDER BY predicted_at_utc DESC
+               LIMIT 1""",
             (fa_flight_id,),
+        ).fetchone()
+        stable = identity["stable_id"] if identity else None
+
+        rows = con.execute(
+            f"""SELECT p.fa_flight_id, p.predicted_at_utc, p.proba_delay,
+                      p.predicted_delay, {optional_fields},
+                      s.feature_name, s.shap_value, s.feature_value, s.rank
+               FROM predictions p
+               LEFT JOIN prediction_shap s
+                 ON s.fa_flight_id = p.fa_flight_id
+                AND s.predicted_at_utc = p.predicted_at_utc
+               WHERE p.fa_flight_id = ?
+                  OR (? IS NOT NULL AND p.stable_id = ?)
+               ORDER BY p.predicted_at_utc ASC, s.rank ASC""",
+            (fa_flight_id, stable, stable),
         ).fetchall()
-        return [
-            {
-                "predicted_at_utc": r["predicted_at_utc"],
-                "delay_probability": round(float(r["proba_delay"]), 4),
-                "predicted_delay": int(r["predicted_delay"]),
-            }
-            for r in rows
-        ]
+
+        cycles: dict[tuple[str, str], dict[str, Any]] = {}
+        for row in rows:
+            key = (row["fa_flight_id"], row["predicted_at_utc"])
+            if key not in cycles:
+                final_probability = float(row["proba_delay"])
+                base_probability = (
+                    float(row["proba_raw"])
+                    if row["proba_raw"] is not None
+                    else final_probability
+                )
+                cycles[key] = {
+                    "predicted_at_utc": row["predicted_at_utc"],
+                    "delay_probability": round(final_probability, 4),
+                    "base_probability": round(base_probability, 4),
+                    "operational_adjustment": round(final_probability - base_probability, 4),
+                    "predicted_delay": int(row["predicted_delay"]),
+                    "threshold_used": (
+                        round(float(row["threshold_used"]), 4)
+                        if row["threshold_used"] is not None
+                        else None
+                    ),
+                    "threshold_strategy": row["threshold_strategy"],
+                    "prediction_phase": row["prediction_phase"] or "PRE_DEPARTURE",
+                    "operational_context": {
+                        "gdp_origin_delay_min": row["gdp_orig_delay_min"],
+                        "gdp_destination_delay_min": row["gdp_dest_delay_min"],
+                        "intermediate_departure_delay_min": row["intermediate_dep_delay_min"],
+                        "adsb_eta_delay_min": row["adsb_eta_delay_min"],
+                        "adsb_holding_min": row["adsb_holding_min"],
+                    },
+                    "shap": [],
+                }
+
+            if row["feature_name"] is not None:
+                contribution = float(row["shap_value"])
+                cycles[key]["shap"].append({
+                    "feature": row["feature_name"],
+                    "label": FEATURE_LABELS.get(
+                        row["feature_name"],
+                        row["feature_name"].replace("_", " ").title(),
+                    ),
+                    "contribution": round(abs(contribution), 4),
+                    "direction": "positive" if contribution >= 0 else "negative",
+                    "value": row["feature_value"],
+                })
+
+        return list(cycles.values())
     finally:
         con.close()
 
