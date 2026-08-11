@@ -180,10 +180,11 @@ def test_chain_walk_hydrates_unsettled_inbound(tmp_path: Path) -> None:
 
     # Inbound actuals should be in actuals table
     actuals_row = conn.execute(
-        "SELECT arr_delay_min FROM actuals WHERE fa_flight_id = ?",
+        "SELECT arr_delay_min, source_provider FROM actuals WHERE fa_flight_id = ?",
         ("FA_INBOUND_2",),
     ).fetchone()
     assert actuals_row[0] == pytest.approx(18.0, abs=0.01)
+    assert actuals_row[1] == "aeroapi"
 
 
 def test_chain_walk_respects_max_calls_budget(tmp_path: Path) -> None:

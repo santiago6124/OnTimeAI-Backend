@@ -51,6 +51,9 @@ recalibrate_live.py
 seed_demo.py
 unbiased_sample_live/
 scripts/
+!scripts/
+scripts/*
+!scripts/prune_db.py
 
 # Tests y notebooks
 tests/

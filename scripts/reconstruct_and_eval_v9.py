@@ -240,6 +240,7 @@ def populate_database():
                 
         payload_actuals.append((
             r.fa_flight_id, stable_id(r.fa_flight_id),
+            "legacy_snapshot",
             getattr(r, "actual_out_utc", None), getattr(r, "actual_off_utc", None),
             getattr(r, "actual_on_utc", None), getattr(r, "actual_in_utc", None),
             getattr(r, "arr_delay_min", None), getattr(r, "departure_delay_min", None),
@@ -247,7 +248,11 @@ def populate_database():
             settled
         ))
     conn.executemany(
-        """INSERT INTO actuals VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+        """INSERT INTO actuals
+           (fa_flight_id, stable_id, source_provider,
+            actual_out_utc, actual_off_utc, actual_on_utc, actual_in_utc,
+            arr_delay_min, departure_delay_min, cancelled, diverted, settled_at_utc)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         payload_actuals
     )
     conn.commit()

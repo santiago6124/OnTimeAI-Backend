@@ -15,9 +15,42 @@ import sqlite3
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-def prune_db(db_path: Path, days: int = 30, dry_run: bool = False) -> int:
+DEFAULT_VACUUM_MIN_DELETED = 50_000
+
+
+def _vacuum_threshold(configured: int | None) -> int:
+    value = (
+        os.environ.get(
+            "PRUNE_VACUUM_MIN_DELETED",
+            str(DEFAULT_VACUUM_MIN_DELETED),
+        )
+        if configured is None
+        else configured
+    )
+    threshold = int(value)
+    if threshold < 0:
+        raise ValueError("PRUNE_VACUUM_MIN_DELETED must be >= 0")
+    return threshold
+
+
+def _vacuum(con: sqlite3.Connection) -> None:
+    con.execute("VACUUM;")
+
+
+def prune_db(
+    db_path: Path,
+    days: int = 30,
+    dry_run: bool = False,
+    vacuum_min_deleted: int | None = None,
+) -> int:
     if not db_path.exists():
         print(f"Error: Database file not found at {db_path}")
+        return 1
+
+    try:
+        vacuum_threshold = _vacuum_threshold(vacuum_min_deleted)
+    except (TypeError, ValueError) as exc:
+        print(f"Error: invalid VACUUM threshold: {exc}")
         return 1
 
     cutoff_date = datetime.now(timezone.utc) - timedelta(days=days)
@@ -87,6 +120,7 @@ def prune_db(db_path: Path, days: int = 30, dry_run: bool = False) -> int:
         
         # Disable journal/foreign key speed limits if applicable, wrap in transaction
         con.execute("BEGIN TRANSACTION;")
+        changes_before_prune = con.total_changes
         
         con.execute("DELETE FROM prediction_shap WHERE predicted_at_utc < ?", (cutoff_iso,))
         con.execute("DELETE FROM predictions WHERE predicted_at_utc < ?", (cutoff_iso,))
@@ -103,16 +137,31 @@ def prune_db(db_path: Path, days: int = 30, dry_run: bool = False) -> int:
         con.execute("DELETE FROM nas_status WHERE captured_at_utc < ?", (cutoff_iso,))
         con.execute("DELETE FROM aircraft_position WHERE captured_at_utc < ?", (cutoff_iso,))
         
+        total_deleted = con.total_changes - changes_before_prune
         con.commit()
-        print("Data pruned successfully.")
+        print(f"Data pruned successfully ({total_deleted:,} rows deleted).")
 
-        # Reclaim space
-        print("Reclaiming SQLite disk space (VACUUM)...")
-        con.execute("VACUUM;")
-        print("VACUUM completed.")
+        # VACUUM rewrites the complete SQLite file.  Running it every predictor
+        # cycle makes the GCS CAS window unnecessarily long, so only reclaim
+        # pages after a material pruning pass.
+        if total_deleted > vacuum_threshold:
+            print(
+                "Reclaiming SQLite disk space (VACUUM): "
+                f"{total_deleted:,} deleted rows exceed the "
+                f"{vacuum_threshold:,} threshold..."
+            )
+            _vacuum(con)
+            print("VACUUM completed.")
+        else:
+            print(
+                "VACUUM skipped: "
+                f"{total_deleted:,} deleted rows do not exceed the "
+                f"{vacuum_threshold:,} threshold."
+            )
 
     except Exception as e:
-        con.execute("ROLLBACK;")
+        if con.in_transaction:
+            con.rollback()
         print(f"Error during pruning: {e}")
         return 1
     finally:
@@ -130,10 +179,27 @@ def main() -> int:
                     help="Number of days of history to retain (default: 30).")
     ap.add_argument("--dry-run", action="store_true",
                     help="Check row counts to be pruned without deleting them.")
+    ap.add_argument(
+        "--vacuum-min-deleted",
+        type=int,
+        default=None,
+        help=(
+            "Run VACUUM only when deleted rows exceed this value "
+            f"(default: PRUNE_VACUUM_MIN_DELETED or {DEFAULT_VACUUM_MIN_DELETED})."
+        ),
+    )
     args = ap.parse_args()
 
+    if args.vacuum_min_deleted is not None and args.vacuum_min_deleted < 0:
+        ap.error("--vacuum-min-deleted must be >= 0")
+
     db_path = Path(args.db)
-    return prune_db(db_path, args.days, args.dry_run)
+    return prune_db(
+        db_path,
+        args.days,
+        args.dry_run,
+        vacuum_min_deleted=args.vacuum_min_deleted,
+    )
 
 if __name__ == "__main__":
     raise SystemExit(main())
