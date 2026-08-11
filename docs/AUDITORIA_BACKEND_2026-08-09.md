@@ -18,6 +18,22 @@ los jobs.
 
 Este documento no contiene valores de credenciales, secretos, tokens ni hashes.
 
+## Addendum operativo — 2026-08-11
+
+- La corrección CAS de F-02 ya está desplegada en el harvester y en el canary
+  `ontimeai-live-pull-2`; el predictor principal permanece pendiente del canary
+  de 48–72 horas. Se mantiene el stagger `:00/:08/:15/:30/:38/:45` UTC.
+- El harvester nuevo completó su primer ciclo natural y subió la generación
+  ganadora. El primer ciclo del canary también completó correctamente, desde la
+  generación descargada hasta una nueva generación, sin conflicto ni error.
+- El fix de pruning de F-04 está incluido en el canary: `scripts/prune_db.py`
+  forma parte de la imagen y `VACUUM` sólo se ejecuta al superar el umbral de
+  filas borradas. El primer ciclo ejecutó ambos caminos y terminó dentro del
+  timeout.
+- El training store append-only publicó 5.251 eventos en 34 Parquet y un
+  contrato. Los payloads, la SQLite ganadora y sus invariantes se verificaron;
+  esto no cierra la trazabilidad pendiente de la tabla serving `predictions`.
+
 ## Alcance y verificaciones
 
 - Código revisado: API FastAPI, autenticación, SQLite/GCS, Cloud Run Job,
@@ -62,7 +78,7 @@ validar estado/rol del usuario en cada sesión o incorporar revocación.
 ### F-02 — Actualización perdida por escritores concurrentes de la DB compartida
 
 **Severidad:** crítica
-**Estado:** corregido en código; pendiente build/deploy
+**Estado:** desplegado en harvester y canary; predictor principal pendiente
 
 Antes de esta corrección, Backend y Scrapper descargaban la misma SQLite,
 realizaban cambios independientes y subían sin precondición. El último upload
@@ -113,18 +129,17 @@ de GCS en vez de depender solamente de un temporizador.
 ### F-04 — Estado exitoso aunque el upload no se haya realizado y pruning ausente
 
 **Severidad:** alta
-**Estado:** parcialmente corregido
+**Estado:** corregido en canary; predictor principal pendiente
 
 El job original abortaba `_gcs_upload()` ante corrupción pero después retornaba
 el código exitoso de `live_pull`. La corrección de F-02 ahora propaga el fallo de
 integridad y evita un falso verde.
 
-Sigue abierto el pruning: `live_job.py` importa `scripts.prune_db`, pero
-`Dockerfile.job` no copia `scripts/` y `.dockerignore` lo excluye. Producción ya
-registró `No module named 'scripts'`.
-
-**Recomendación:** incluir el módulo de pruning en la imagen, probarlo contra un
-snapshot y propagar su código de error cuando la política lo considere fatal.
+El canary ya incluye `scripts/prune_db.py` en la imagen. El pruning cuenta las
+filas realmente borradas y sólo ejecuta `VACUUM` cuando supera
+`PRUNE_VACUUM_MIN_DELETED`; el primer ciclo productivo verificó ejecución y
+skip sin exceder el timeout. Falta promover el mismo digest al predictor
+principal después de la ventana de observación.
 
 ### F-05 — Diferencia de semántica en `TAIL_DELAY_DECAY`
 

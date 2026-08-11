@@ -1,8 +1,10 @@
 # OnTimeAI — dataset live apto para entrenamiento
 
-> Estado al 2026-08-11: implementación y pruebas locales completas. El bucket,
-> IAM, commit, despliegue y activación productiva todavía están pendientes; el
-> reloj de recolección aún no empezó.
+> Estado al 2026-08-11: implementación publicada en `main` y activada como
+> canary en `ontimeai-live-pull-2`. El primer ciclo natural completó correctamente
+> y publicó 5.251 eventos en 34 Parquet inmutables más su contrato. El reloj de
+> validación empezó a las 14:23 UTC; el predictor principal sigue pendiente del
+> canary de 48–72 horas.
 
 ## Decisión
 
@@ -142,18 +144,23 @@ de predicciones; sólo debe activarse si se acepta explícitamente ese
 acoplamiento de disponibilidad. La durabilidad no depende de `true`: en modo
 opcional el outbox permanece en la SQLite ganadora para reintentar.
 
-El bucket recomendado para el proyecto actual es:
+El bucket creado para el proyecto actual es:
 
 ```text
 gs://ontimeai-150917658060-training-us-central1
 ```
 
-Debe ser regional `us-central1`, con Uniform Bucket-Level Access, Public Access
-Prevention, soft delete de 7 días y una service account de predictor/exporter
-separada. La cuenta default de Compute hoy es `Editor` y la comparten servicios,
-jobs y builds; no es una frontera de seguridad aceptable para el nuevo dataset.
-La SA del exporter necesita crear y leer objetos —la lectura verifica colisiones
-idempotentes—, pero no borrarlos. La SA del materializador debe ser sólo lectora.
+Está configurado como regional `us-central1`, con Uniform Bucket-Level Access,
+Public Access Prevention y soft delete de 7 días. También se crearon cuentas
+dedicadas de exporter y lectura con permisos sobre este bucket.
+
+El canary conserva temporalmente la cuenta default de Compute porque la cuenta
+exporter todavía no pudo recibir el binding administrativo para leer el secreto
+operativo existente. Esa cuenta default sigue teniendo rol `Editor` y la
+comparten servicios, jobs y builds; es deuda de mínimo privilegio. No migrar el
+runtime a la SA dedicada hasta completar ese acceso. El exporter necesita crear
+y leer objetos —la lectura verifica colisiones idempotentes—, pero no borrarlos;
+la SA del materializador debe seguir siendo sólo lectora.
 
 ## Materialización causal
 
@@ -245,17 +252,23 @@ La promoción de un challenger exige además:
 - métricas por ARR/DEP, carrier, ruta, hora y estación;
 - una o dos semanas de shadow frente al champion productivo.
 
-## Operación recomendada
+## Estado del rollout y operación siguiente
 
-1. Crear bucket y service accounts dedicados con permisos mínimos.
-2. Desplegar por digest primero en `ontimeai-live-pull-2`, con
-   `TRAINING_STORE_REQUIRED=false`, y observar 48–72 h.
-3. Medir duración/memoria/backlog y verificar Parquet, hashes, categorías,
-   probabilidades, causalidad y round-trip a silver.
-4. Activar el mismo digest en ambos predictores manteniendo inicialmente
-   `TRAINING_STORE_REQUIRED=false`; cambiarlo sólo si se acepta el tradeoff.
-5. Ejecutar un materializado semanal de control y un scorecard diario.
-6. Recién a las cuatro semanas considerar recalibración; a las 8–12 semanas,
+1. Completado: bucket regional y cuentas dedicadas creados con UBLA, PAP y soft
+   delete de 7 días.
+2. Completado: digest nuevo desplegado primero en `ontimeai-live-pull-2`, con
+   `TRAINING_STORE_REQUIRED=false`; primer ciclo natural exitoso en 7m45s.
+3. Completado en el primer ciclo: 5.000 revisiones de outcome y 251 snapshots,
+   sin IDs duplicados, hashes de payload verificados y contrato `4year_v9` con
+   84 features raw/model. La SQLite ganadora pasó `quick_check` e
+   `integrity_check`.
+4. En curso: observar 48–72 h, medir duración, memoria y drenaje del backlog, y
+   ejecutar un round-trip de control a silver cuando maduren los primeros labels.
+5. Pendiente: activar el mismo digest en el predictor principal manteniendo
+   inicialmente `TRAINING_STORE_REQUIRED=false`; cambiarlo sólo si se acepta el
+   tradeoff de disponibilidad.
+6. Pendiente recurrente: materializado semanal de control y scorecard diario.
+7. Recién a las cuatro semanas considerar recalibración; a las 8–12 semanas,
    entrenar un challenger combinado con BTS.
 
 El materializador inicial concatena los shards seleccionados en memoria. Para
