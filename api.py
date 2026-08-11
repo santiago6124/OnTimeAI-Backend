@@ -14,7 +14,11 @@ Endpoints:
 from __future__ import annotations
 
 import os
+import shutil
 import sqlite3
+import tempfile
+import threading
+import time
 from contextlib import asynccontextmanager
 
 from dotenv import load_dotenv
@@ -45,6 +49,9 @@ _DB_REFRESH_INTERVAL = 1000  # refresh from GCS every ~16 min
 _db_last_refresh: float = 0.0
 _db_last_health_check: float = 0.0
 _DB_HEALTH_INTERVAL = 60  # re-verify DB health every 60 s
+_DB_REFRESH_LOCK = threading.Lock()
+_DB_REFRESH_THREAD_LOCK = threading.Lock()
+_db_refresh_thread: threading.Thread | None = None
 
 # Users DB (separate from live_data.db so live job never overwrites it)
 USERS_DB_PATH = Path("/tmp/users.db") if GCS_BUCKET else Path(__file__).parent / "users.db"
@@ -138,32 +145,136 @@ def _require_superadmin(request: Request) -> dict:
     return payload
 
 
-def _refresh_db_from_gcs() -> None:
-    global _db_last_refresh
-    import time
-    if not GCS_BUCKET:
-        return
-    if time.time() - _db_last_refresh < _DB_REFRESH_INTERVAL:
-        return
+def _sqlite_readonly_uri(path: Path) -> str:
+    """Return an immutable URI so API reads never create WAL sidecars."""
+    return f"{path.resolve().as_uri()}?mode=ro&immutable=1"
+
+
+def _verify_db_snapshot(path: Path) -> bool:
+    """Validate a standalone SQLite snapshot before making it visible."""
     try:
-        from google.cloud import storage as gcs
-        client = gcs.Client()
-        blob = client.bucket(GCS_BUCKET).blob("live_data.db")
-        blob.download_to_filename(str(_TMP_DB))
-        _db_last_refresh = time.time()
-        print(f"[db] refreshed from GCS ({_TMP_DB.stat().st_size / 1e6:.0f} MB)")
+        with sqlite3.connect(_sqlite_readonly_uri(path), uri=True) as con:
+            result = con.execute("PRAGMA quick_check(1)").fetchone()
+        return bool(result and result[0] == "ok")
+    except (OSError, sqlite3.Error):
+        return False
+
+
+def _download_db_snapshot(destination: Path) -> int:
+    """Download one immutable GCS generation into ``destination``."""
+    from google.cloud import storage as gcs
+
+    blob = gcs.Client().bucket(GCS_BUCKET).blob("live_data.db")
+    blob.reload()
+    generation = int(blob.generation)
+    blob.download_to_filename(
+        str(destination),
+        if_generation_match=generation,
+    )
+    return generation
+
+
+def _temporary_db_path(target: Path) -> Path:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    descriptor, filename = tempfile.mkstemp(
+        prefix=f".{target.name}.",
+        suffix=".tmp",
+        dir=target.parent,
+    )
+    os.close(descriptor)
+    return Path(filename)
+
+
+def _install_local_db_copy(source: Path, target: Path) -> None:
+    """Atomically install a verified local fallback snapshot."""
+    snapshot_path = _temporary_db_path(target)
+    try:
+        shutil.copyfile(source, snapshot_path)
+        if not _verify_db_snapshot(snapshot_path):
+            raise sqlite3.DatabaseError(f"fallback snapshot is invalid: {source}")
+        os.replace(snapshot_path, target)
+    finally:
+        snapshot_path.unlink(missing_ok=True)
+
+
+def _refresh_db_from_gcs(*, force: bool = False) -> bool:
+    """Install a verified GCS snapshot without exposing a partial file.
+
+    A regular refresh never waits behind another refresh: it keeps serving the
+    previous immutable snapshot. Forced refreshes (startup/recovery) wait for
+    the in-flight installer because no known-good snapshot may be available.
+    """
+    global _db_last_refresh
+    if not GCS_BUCKET:
+        return False
+
+    now = time.monotonic()
+    if not force and now - _db_last_refresh < _DB_REFRESH_INTERVAL:
+        return False
+
+    blocking = force or not _TMP_DB.exists()
+    if not _DB_REFRESH_LOCK.acquire(blocking=blocking):
+        return False
+
+    snapshot_path: Path | None = None
+    try:
+        # Another request may have completed the refresh while this one waited.
+        now = time.monotonic()
+        if not force and now - _db_last_refresh < _DB_REFRESH_INTERVAL:
+            return False
+
+        snapshot_path = _temporary_db_path(_TMP_DB)
+        generation = _download_db_snapshot(snapshot_path)
+        if not _verify_db_snapshot(snapshot_path):
+            raise sqlite3.DatabaseError(
+                f"downloaded generation {generation} failed PRAGMA quick_check"
+            )
+
+        # POSIX replacement is atomic. Existing immutable readers keep their
+        # old file descriptor; new requests open the complete new snapshot.
+        os.replace(snapshot_path, _TMP_DB)
+        snapshot_path = None
+        _db_last_refresh = time.monotonic()
+        print(
+            f"[db] refreshed from GCS generation={generation} "
+            f"({_TMP_DB.stat().st_size / 1e6:.0f} MB)"
+        )
+        return True
     except Exception as e:
         print(f"[db_refresh] failed: {e}")
+        return False
+    finally:
+        if snapshot_path is not None:
+            snapshot_path.unlink(missing_ok=True)
+        _DB_REFRESH_LOCK.release()
+
+
+def _start_db_refresh() -> None:
+    """Start at most one non-blocking periodic refresh per API process."""
+    global _db_refresh_thread
+    if not GCS_BUCKET or not _TMP_DB.exists():
+        return
+    if time.monotonic() - _db_last_refresh < _DB_REFRESH_INTERVAL:
+        return
+
+    with _DB_REFRESH_THREAD_LOCK:
+        if _db_refresh_thread is not None and _db_refresh_thread.is_alive():
+            return
+        _db_refresh_thread = threading.Thread(
+            target=_refresh_db_from_gcs,
+            name="ontimeai-db-refresh",
+            daemon=True,
+        )
+        _db_refresh_thread.start()
 
 
 def _verify_db_health(path: Path) -> bool:
     """Read an actual data page to catch corruption beyond the schema."""
     try:
-        chk = sqlite3.connect(str(path))
-        chk.execute("SELECT fa_flight_id FROM flights LIMIT 1")
-        chk.close()
+        with sqlite3.connect(_sqlite_readonly_uri(path), uri=True) as chk:
+            chk.execute("SELECT fa_flight_id FROM flights LIMIT 1").fetchone()
         return True
-    except Exception:
+    except (OSError, sqlite3.Error):
         return False
 
 MODEL_REGISTRY: dict[str, Path] = {
@@ -258,28 +369,32 @@ FEATURE_LABELS: dict[str, str] = {
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    global _db_last_refresh, _db_last_health_check
+
     if GCS_BUCKET:
-        try:
-            from google.cloud import storage as gcs
-            client = gcs.Client()
-            blob = client.bucket(GCS_BUCKET).blob("live_data.db")
-            blob.download_to_filename(str(_TMP_DB))
-            mb = _TMP_DB.stat().st_size / 1e6
-            print(f"[startup] DB downloaded from gs://{GCS_BUCKET}/live_data.db ({mb:.1f} MB)")
-        except Exception as e:
-            print(f"[startup] GCS download failed, using bundled DB: {e}")
-            import shutil
-            shutil.copy(_BUNDLED_DB, _TMP_DB)
-            
+        if not _refresh_db_from_gcs(force=True):
+            print("[startup] GCS snapshot unavailable; using bundled DB")
+            _install_local_db_copy(_BUNDLED_DB, _TMP_DB)
+            # Avoid a download storm if GCS is temporarily unavailable.
+            _db_last_refresh = time.monotonic()
+
     # Trigger database migrations on startup
     try:
         from ontimeai.live import open_db
         conn = open_db(DB_PATH)
-        conn.close()
+        try:
+            # The shared snapshot is produced in WAL mode. Checkpoint migrations
+            # and switch the API's local copy to DELETE before immutable reads.
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            conn.execute("PRAGMA journal_mode=DELETE")
+            conn.commit()
+        finally:
+            conn.close()
         print("[startup] Database migrations executed successfully")
     except Exception as e:
         print(f"[startup] Database migration failed: {e}")
 
+    _db_last_health_check = time.monotonic()
     _init_users_db()
     yield
 
@@ -318,21 +433,23 @@ def _validate_airport(code: str) -> str:
 
 def get_db() -> sqlite3.Connection:
     global _db_last_refresh, _db_last_health_check
-    import time, shutil
 
-    _refresh_db_from_gcs()
+    if GCS_BUCKET and not _TMP_DB.exists():
+        _refresh_db_from_gcs(force=True)
+    else:
+        _start_db_refresh()
 
-    if GCS_BUCKET and (time.time() - _db_last_health_check > _DB_HEALTH_INTERVAL):
+    if GCS_BUCKET and (time.monotonic() - _db_last_health_check > _DB_HEALTH_INTERVAL):
         if not _verify_db_health(_TMP_DB):
             print("[db] health check failed — forcing re-download from GCS")
-            _db_last_refresh = 0
-            _refresh_db_from_gcs()
+            _refresh_db_from_gcs(force=True)
             if not _verify_db_health(_TMP_DB):
                 print("[db] GCS DB also corrupt — falling back to bundled DB")
-                shutil.copy(str(_BUNDLED_DB), str(_TMP_DB))
-        _db_last_health_check = time.time()
+                _install_local_db_copy(_BUNDLED_DB, _TMP_DB)
+                _db_last_refresh = time.monotonic()
+        _db_last_health_check = time.monotonic()
 
-    con = sqlite3.connect(str(DB_PATH))
+    con = sqlite3.connect(_sqlite_readonly_uri(DB_PATH), uri=True)
     con.row_factory = sqlite3.Row
     return con
 
