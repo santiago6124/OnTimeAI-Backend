@@ -13,6 +13,7 @@ RUN pip install --no-cache-dir -r requirements-api.txt
 COPY api.py predict.py live_pull.py live_job.py ./
 COPY ontimeai/ ./ontimeai/
 COPY feature_engineering_v7/ ./feature_engineering_v7/
+COPY scripts/prune_db.py ./scripts/prune_db.py
 
 # Artefactos del modelo activo
 COPY artifacts/4year_v9/ ./artifacts/4year_v9/

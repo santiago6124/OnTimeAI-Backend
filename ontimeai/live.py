@@ -137,6 +137,7 @@ CREATE TABLE IF NOT EXISTS predictions (
 CREATE TABLE IF NOT EXISTS actuals (
     fa_flight_id TEXT PRIMARY KEY,
     stable_id TEXT,
+    source_provider TEXT,
     actual_out_utc TEXT,
     actual_off_utc TEXT,
     actual_on_utc TEXT,
@@ -152,6 +153,7 @@ CREATE TABLE IF NOT EXISTS actuals (
 CREATE TABLE IF NOT EXISTS weather_obs (
     station TEXT NOT NULL,
     valid_utc TEXT NOT NULL,
+    ingested_at_utc TEXT,
     tmpc REAL, dwpc REAL, relh REAL, drct REAL, sknt REAL, alti REAL,
     p01m REAL, vsby REAL, gust REAL, wxcodes TEXT,
     wx_precip_flag INTEGER, wx_low_vis_flag INTEGER, wx_strong_wind_flag INTEGER,
@@ -232,6 +234,8 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
     _migrate_nas_status(conn)
     _migrate_estimated_times(conn)
     _migrate_prediction_phase(conn)
+    _migrate_weather_provenance(conn)
+    _migrate_actuals_provenance(conn)
     conn.commit()
     return conn
 
@@ -241,6 +245,20 @@ def _migrate_prediction_phase(conn: sqlite3.Connection) -> None:
     cols = {row[1] for row in conn.execute("PRAGMA table_info(predictions)").fetchall()}
     if "prediction_phase" not in cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN prediction_phase TEXT")
+
+
+def _migrate_weather_provenance(conn: sqlite3.Connection) -> None:
+    """Track when a METAR first became available to the live pipeline."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(weather_obs)").fetchall()}
+    if "ingested_at_utc" not in cols:
+        conn.execute("ALTER TABLE weather_obs ADD COLUMN ingested_at_utc TEXT")
+
+
+def _migrate_actuals_provenance(conn: sqlite3.Connection) -> None:
+    """Preserve which upstream provider supplied each observed outcome."""
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(actuals)").fetchall()}
+    if "source_provider" not in cols:
+        conn.execute("ALTER TABLE actuals ADD COLUMN source_provider TEXT")
 
 
 def _migrate_predictions_gdp_adjustment(conn: sqlite3.Connection) -> None:
@@ -425,18 +443,29 @@ def fetch_iem_obs(stations: set[str], start_utc: pd.Timestamp, end_utc: pd.Times
 def upsert_weather(conn: sqlite3.Connection, wx: pd.DataFrame) -> int:
     if wx.empty:
         return 0
+    ingested_at = datetime.now(timezone.utc).isoformat()
     rows = [
-        (r.station, r.valid.isoformat(),
+        (r.station, r.valid.isoformat(), ingested_at,
          _f(r.tmpc), _f(r.dwpc), _f(r.relh), _f(r.drct), _f(r.sknt), _f(r.alti),
          _f(r.p01m), _f(r.vsby), _f(r.gust), r.wxcodes if pd.notna(r.wxcodes) else None,
          int(r.wx_precip_flag), int(r.wx_low_vis_flag), int(r.wx_strong_wind_flag))
         for r in wx.itertuples(index=False)
     ]
     cur = conn.executemany(
-        """INSERT OR REPLACE INTO weather_obs
-           (station, valid_utc, tmpc, dwpc, relh, drct, sknt, alti, p01m, vsby, gust, wxcodes,
+        """INSERT INTO weather_obs
+           (station, valid_utc, ingested_at_utc,
+            tmpc, dwpc, relh, drct, sknt, alti, p01m, vsby, gust, wxcodes,
             wx_precip_flag, wx_low_vis_flag, wx_strong_wind_flag)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+           ON CONFLICT(station, valid_utc) DO UPDATE SET
+             ingested_at_utc=COALESCE(weather_obs.ingested_at_utc, excluded.ingested_at_utc),
+             tmpc=excluded.tmpc, dwpc=excluded.dwpc, relh=excluded.relh,
+             drct=excluded.drct, sknt=excluded.sknt, alti=excluded.alti,
+             p01m=excluded.p01m, vsby=excluded.vsby, gust=excluded.gust,
+             wxcodes=excluded.wxcodes,
+             wx_precip_flag=excluded.wx_precip_flag,
+             wx_low_vis_flag=excluded.wx_low_vis_flag,
+             wx_strong_wind_flag=excluded.wx_strong_wind_flag""",
         rows,
     )
     conn.commit()
@@ -685,7 +714,7 @@ def latest_nas_status(conn: sqlite3.Connection, max_age_minutes: int = 30) -> di
     try:
         rows = conn.execute(
             """SELECT airport, program_type, delay_min, reason,
-                      end_time_utc, max_delay_min
+                      end_time_utc, max_delay_min, captured_at_utc
                FROM nas_status
                WHERE captured_at_utc >= ?
                  AND captured_at_utc = (SELECT MAX(captured_at_utc) FROM nas_status
@@ -695,7 +724,8 @@ def latest_nas_status(conn: sqlite3.Connection, max_age_minutes: int = 30) -> di
     except sqlite3.OperationalError:
         # Older snapshots predate the end_time_utc / max_delay_min migration.
         rows = conn.execute(
-            """SELECT airport, program_type, delay_min, reason, NULL, delay_min
+            """SELECT airport, program_type, delay_min, reason, NULL, delay_min,
+                      captured_at_utc
                FROM nas_status
                WHERE captured_at_utc >= ?
                  AND captured_at_utc = (SELECT MAX(captured_at_utc) FROM nas_status
@@ -715,6 +745,7 @@ def latest_nas_status(conn: sqlite3.Connection, max_age_minutes: int = 30) -> di
             "reason": r[3] or "",
             "end_time_utc": end_iso,
             "max_delay_min": float(r[5]) if r[5] is not None else float(r[2]),
+            "captured_at_utc": r[6],
         }
     return result
 
@@ -1133,6 +1164,7 @@ def upsert_actuals_from_aeroapi(conn: sqlite3.Connection, recs: list[dict]) -> i
         rows.append((
             r["fa_flight_id"],
             stable_id(r["fa_flight_id"]),
+            "aeroapi",
             r.get("actual_out"),
             r.get("actual_off"),
             r.get("actual_on"),
@@ -1145,10 +1177,10 @@ def upsert_actuals_from_aeroapi(conn: sqlite3.Connection, recs: list[dict]) -> i
         ))
     conn.executemany(
         """INSERT OR REPLACE INTO actuals
-           (fa_flight_id, stable_id,
+           (fa_flight_id, stable_id, source_provider,
             actual_out_utc, actual_off_utc, actual_on_utc, actual_in_utc,
             arr_delay_min, departure_delay_min, cancelled, diverted, settled_at_utc)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
         rows,
     )
     conn.commit()
@@ -1562,6 +1594,7 @@ def _merge_weather_asof(left: pd.DataFrame, wx: pd.DataFrame, station_col: str,
     out = pd.concat(parts, ignore_index=True)
     rename = {
         "valid": f"{prefix}_WX_VALID_UTC",
+        "ingested_at_utc": f"{prefix}_WX_INGESTED_AT_UTC",
         "tmpc": f"{prefix}_WX_TMPC", "dwpc": f"{prefix}_WX_DWPC",
         "relh": f"{prefix}_WX_RELH", "drct": f"{prefix}_WX_DRCT",
         "sknt": f"{prefix}_WX_SKNT", "alti": f"{prefix}_WX_ALTI",

@@ -36,6 +36,12 @@ from ontimeai.live import (
 )
 from ontimeai.lineage_fallback import load_lookups, build_live_turnaround_lookups
 from ontimeai.model import load_artifact, predict_label, predict_proba, select_threshold
+from ontimeai.training_store import (
+    enqueue_prediction_snapshots,
+    enqueue_recent_outcomes,
+    training_store_enabled,
+    training_store_required,
+)
 from predict import prepare_inference_frame
 from ontimeai.config import ARTIFACTS_DIR
 
@@ -377,6 +383,32 @@ def main() -> int:
     )
     print(f"   target: {len(db_dep_rows)} standing ATL deps (upcoming + ≤{delay_grace_h}h delayed) + "
           f"{len(sched_rows) + len(arr_sched_rows)} freshly fetched → {len(target_ids)} unique")
+
+    # Export labels independently from feature snapshots.  The rolling lookback
+    # makes the outbox self-healing after scheduler gaps, while deterministic
+    # outcome event IDs keep retries idempotent.
+    if training_store_enabled():
+        try:
+            outcome_lookback_days = max(
+                1, int(os.getenv("TRAINING_OUTCOME_LOOKBACK_DAYS", "7")),
+            )
+            n_outcomes_queued = enqueue_recent_outcomes(
+                conn,
+                # Use a fresh timestamp after API sleeps/upserts.  The tick's
+                # start time can precede actuals.settled_at_utc (or even cross
+                # midnight), which would invert revision causality/partitioning.
+                observed_at_utc=datetime.now(timezone.utc),
+                lookback_days=outcome_lookback_days,
+            )
+            print(f"   training store: queued {n_outcomes_queued} new outcome revisions")
+        except Exception as exc:
+            print(
+                "   ⚠ training outcome enqueue failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            if training_store_required():
+                raise
+
     if not target_ids:
         print("   no flights to predict")
         conn.execute(
@@ -384,11 +416,22 @@ def main() -> int:
             (datetime.now(timezone.utc).isoformat(), len(sched) + len(arr_sched), 0, n_act, n_wx, run_id),
         )
         conn.commit()
+        conn.close()
         return 0
 
     df = build_inference_frame(conn, target_ids, history_days=7)
     if df.empty:
         print("   inference frame empty")
+        conn.execute(
+            """UPDATE runs SET finished_utc=?, flights_pulled=?, flights_predicted=?,
+                      actuals_updated=?, weather_obs_added=? WHERE run_id=?""",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                len(sched) + len(arr_sched), 0, n_act, n_wx, run_id,
+            ),
+        )
+        conn.commit()
+        conn.close()
         return 0
 
     target_mask = df["fa_flight_id"].isin(target_ids) & df["ARR_DELAY"].isna()
@@ -438,26 +481,30 @@ def main() -> int:
 
     # ---- Feature NaN logging & Quality assertions ----
     X_raw = prepare_inference_frame(
-        df, meta["feature_cols"], meta["cat_mapping"], fallback_lookup=None,
+        df,
+        meta["feature_cols"],
+        meta["cat_mapping"],
+        fallback_lookup=None,
+        apply_category_mapping=False,
     )
-    
+
     target_idx = df.index[target_mask]
     if not target_idx.empty:
         X_raw_target = X_raw.loc[target_idx].copy()
-        
+
         # Ensure numeric columns are parsed as numeric for accurate NaN checks
         cat_cols_set = set(meta.get("cat_cols", []))
         for c in X_raw_target.columns:
             if c not in cat_cols_set:
                 X_raw_target[c] = pd.to_numeric(X_raw_target[c], errors="coerce")
-        
+
         print("   Raw Feature NaN Rates (before cold-deck fallback) for target flights:")
         col_nan_rates = X_raw_target.isna().mean()
         sorted_col_nans = sorted(col_nan_rates.items(), key=lambda x: x[1], reverse=True)
         for col, rate in sorted_col_nans:
             if rate > 0.0:
                 print(f"     - {col}: {rate:.1%}")
-                
+
         nan_rates_per_flight = X_raw_target.isna().mean(axis=1)
         too_many_nans = nan_rates_per_flight[nan_rates_per_flight > 0.6]
         if not too_many_nans.empty:
@@ -465,7 +512,7 @@ def main() -> int:
             for idx, rate in too_many_nans.items():
                 fl_id = df.loc[idx, "fa_flight_id"]
                 print(f"     - {fl_id}: {rate:.1%} NaN features")
-            
+
             # Exclude flights that failed quality assertion from prediction and database insert
             target_mask = target_mask & (~df.index.isin(too_many_nans.index))
             print(f"   {target_mask.sum()} target rows remaining after quality filtering")
@@ -482,9 +529,13 @@ def main() -> int:
             continue
         if X[c].dtype == object:
             X[c] = pd.to_numeric(X[c], errors="coerce")
-    proba = predict_proba(meta["booster"], X)
+    booster_proba = predict_proba(meta["booster"], X)
+    calibrated_proba = booster_proba.copy()
     if meta.get("calibrator") is not None and meta["target"] == "binary":
-        proba = meta["calibrator"].transform(proba)
+        calibrated_proba = meta["calibrator"].transform(calibrated_proba)
+    # Keep the existing variable name for the operational adjustment path.  The
+    # training snapshot stores booster/calibrated/final probabilities separately.
+    proba = calibrated_proba
 
     # Threshold strategy: quantile-target on the target subset (robust to live
     # distribution shift); fall back to the artifact's static threshold when
@@ -521,7 +572,8 @@ def main() -> int:
         print("   GDP adjustment disabled via GDP_ADJUST env")
 
     # Pre-fetch intermediate dep_delay for all target stable_ids in one query.
-    target_stable_ids = [stable_id(df.loc[i, "fa_flight_id"]) for i in df.index[target_mask]]
+    target_indices = list(df.index[target_mask])
+    target_stable_ids = [stable_id(df.loc[i, "fa_flight_id"]) for i in target_indices]
     dep_delay_map: dict[str, float] = {}
     landed_ids: set[str] = set()
     if target_stable_ids:
@@ -547,11 +599,37 @@ def main() -> int:
         print(f"   intermediate dep_delay available for {len(dep_delay_map)} targets")
 
     adsb_enabled = os.getenv("ADSB_ADJUST", "1").lower() in ("1", "true", "yes")
+    adsb_capture_by_tail: dict[str, str] = {}
+    target_tails = sorted(
+        {
+            str(df.loc[i, "tail_num"]).strip().upper()
+            for i in target_indices
+            if pd.notna(df.loc[i, "tail_num"]) and str(df.loc[i, "tail_num"]).strip()
+        }
+    )
+    if target_tails:
+        try:
+            placeholders = ",".join("?" for _ in target_tails)
+            adsb_capture_by_tail = {
+                str(row[0]).strip().upper(): row[1]
+                for row in conn.execute(
+                    f"""SELECT UPPER(TRIM(registration)), MAX(captured_at_utc)
+                        FROM aircraft_position
+                        WHERE UPPER(TRIM(registration)) IN ({placeholders})
+                        GROUP BY UPPER(TRIM(registration))""",
+                    target_tails,
+                ).fetchall()
+                if row[0] and row[1]
+            }
+        except Exception:
+            # Older DB snapshots may not contain aircraft_position yet.
+            adsb_capture_by_tail = {}
 
     # Persist only target predictions
     pred_now = datetime.now(timezone.utc).isoformat()
     pred_rows: list[tuple] = []
-    for i in df.index[target_mask]:
+    snapshot_contexts: dict[object, dict[str, object]] = {}
+    for i in target_indices:
         proba_raw = float(proba[i])
         origin = df.loc[i, "origin"]
         dest = df.loc[i, "dest"]
@@ -566,10 +644,10 @@ def main() -> int:
         )
         sid = stable_id(df.loc[i, "fa_flight_id"])
         dep_delay = dep_delay_map.get(sid)  # None if target hasn't departed yet
+        est_delay = None
         if dep_delay is None:
             sched_out = df.loc[i, "scheduled_out_utc"]
             est_out = df.loc[i, "estimated_out_utc"]
-            est_delay = None
             if sched_out and est_out:
                 try:
                     dt_sched = pd.to_datetime(sched_out, utc=True)
@@ -647,6 +725,49 @@ def main() -> int:
             (float(holding_min) if holding_min is not None else None),
             phase,
         ))
+        snapshot_contexts[i] = {
+            "prediction_phase": phase,
+            "booster_probability": float(booster_proba[i]),
+            "calibrated_probability": float(calibrated_proba[i]),
+            "final_probability": float(proba_adj),
+            "predicted_label": label_adj,
+            "threshold_used": float(threshold_used),
+            "threshold_strategy": threshold_strategy,
+            "probability_after_gdp": float(proba_after_gdp),
+            "probability_after_departure": float(proba_after_dep),
+            "probability_after_adsb_eta": float(proba_after_eta),
+            "gdp_orig_delay_min": float(gdp_orig),
+            "gdp_dest_delay_min": float(gdp_dest),
+            "estimated_dep_delay_min": est_delay,
+            "intermediate_dep_delay_min": dep_delay,
+            "adsb_eta_delay_min": adsb_delay,
+            "adsb_holding_min": holding_min,
+            "atl_arrivals_in_window_30min": int(atl_window),
+            "carrier_delay_rate_smooth": carrier_smooth,
+            "fallback_applied": fallback is not None,
+            "gdp_adjust_enabled": gdp_adjust_enabled,
+            "estimated_delay_adjust_enabled": (
+                est_adjust_enabled if dep_delay is None else False
+            ),
+            "departure_delay_adjust_enabled": dep_adjust_enabled,
+            "adsb_adjust_enabled": adsb_enabled,
+            "nas_snapshot_captured_at_utc": max(
+                (
+                    state.get("captured_at_utc")
+                    for state in (
+                        nas_state.get(origin, {}) if nas_state else {},
+                        nas_state.get(dest, {}) if nas_state else {},
+                    )
+                    if state.get("captured_at_utc")
+                ),
+                default=None,
+            ),
+            "adsb_latest_captured_at_utc": adsb_capture_by_tail.get(
+                str(df.loc[i, "tail_num"]).strip().upper()
+                if pd.notna(df.loc[i, "tail_num"])
+                else ""
+            ),
+        }
     conn.executemany(
         """INSERT OR REPLACE INTO predictions
            (fa_flight_id, stable_id, predicted_at_utc, proba_delay, predicted_delay,
@@ -658,6 +779,35 @@ def main() -> int:
            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         pred_rows,
     )
+
+    # The exact X rows and prediction metadata enter the same SQLite transaction
+    # as the serving predictions.  live_job publishes only the winning DB
+    # generation, so a generation-conflict retry cannot leak orphan snapshots.
+    if training_store_enabled() and pred_rows:
+        try:
+            n_snapshots_queued = enqueue_prediction_snapshots(
+                conn,
+                flight_frame=df,
+                raw_features=X_raw,
+                model_features=X,
+                target_indices=target_indices,
+                contexts=snapshot_contexts,
+                predicted_at_utc=pred_now,
+                run_id=run_id,
+                data_source=data_source,
+                artifact_dir=args.artifact,
+                feature_cols=meta["feature_cols"],
+                cat_cols=meta.get("cat_cols", []),
+                cat_mapping=meta.get("cat_mapping", {}),
+            )
+            print(f"   training store: queued {n_snapshots_queued} causal feature snapshots")
+        except Exception as exc:
+            print(
+                "   ⚠ training snapshot enqueue failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            if training_store_required():
+                raise
     conn.commit()
     # r[3]=proba_delay (final), r[7]=proba_raw, r[12]=intermediate_dep_delay_min,
     # r[13]=adsb_eta_delay_min, r[14]=adsb_holding_min
@@ -676,7 +826,6 @@ def main() -> int:
     shap_topk = int(os.getenv("SHAP_TOPK", "15"))
     if shap_topk > 0 and pred_rows:
         try:
-            target_indices = df.index[target_mask]
             X_target = X.loc[target_indices]
             # LightGBM native: pred_contrib=True returns per-row SHAP vector + bias term.
             contribs = meta["booster"].predict(X_target, pred_contrib=True)

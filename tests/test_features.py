@@ -138,3 +138,31 @@ def test_apply_categorical_mapping_round_trips() -> None:
     assert list(out["col"].cat.categories) == ["a", "b", "c"]
     # unknown values become NaN
     assert pd.isna(out["col"].iloc[3])
+
+
+def test_inference_can_preserve_unknown_category_for_challenger_capture() -> None:
+    from predict import prepare_inference_frame
+
+    source = pd.DataFrame(
+        {
+            "OP_CARRIER": ["ZZ"],
+            "FL_DATE": ["2026-08-11"],
+            "CRS_DEP_MIN": [720],
+            "ORIGIN": ["ATL"],
+            "DEST": ["MCO"],
+            "DAY_OF_WEEK": [2],
+            "MONTH": [8],
+        }
+    )
+    mapping = {"OP_CARRIER": ["AA", "DL"]}
+
+    raw = prepare_inference_frame(
+        source,
+        ["OP_CARRIER"],
+        mapping,
+        apply_category_mapping=False,
+    )
+    champion = prepare_inference_frame(source, ["OP_CARRIER"], mapping)
+
+    assert raw.loc[0, "OP_CARRIER"] == "ZZ"
+    assert pd.isna(champion.loc[0, "OP_CARRIER"])

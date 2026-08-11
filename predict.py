@@ -36,6 +36,8 @@ def prepare_inference_frame(
     feature_cols: list[str],
     cat_mapping: dict[str, list],
     fallback_lookup: dict | None = None,
+    *,
+    apply_category_mapping: bool = True,
 ) -> pd.DataFrame:
     df = df_raw.copy()
     has_history = (
@@ -86,6 +88,8 @@ def prepare_inference_frame(
         if col not in df.columns:
             df[col] = pd.NA
     X = df[feature_cols].copy()
+    if not apply_category_mapping:
+        return X
     return apply_categorical_mapping(X, cat_mapping)
 
 
