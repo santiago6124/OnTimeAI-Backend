@@ -539,6 +539,7 @@ def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
         ) p ON p.fa_flight_id = f.fa_flight_id AND p.rn = 1
         LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
         WHERE f.cancelled = 0
+          AND f.origin = 'ATL'
           AND (
               (datetime(f.scheduled_out_utc) >= datetime(?) AND datetime(f.scheduled_out_utc) <= datetime(?))
               OR
@@ -856,16 +857,61 @@ def get_flight_history(fa_flight_id: str):
         con.close()
 
 
+def _get_historical_flight(con: sqlite3.Connection, fa_flight_id: str):
+    """Fallback: fetch flight+latest prediction without time-window constraints.
+
+    Used when a flight has already departed and is no longer in the active
+    sliding window returned by _latest_predictions_active().
+    """
+    return con.execute("""
+        SELECT f.fa_flight_id,
+               f.ident_iata,
+               f.op_carrier,
+               f.flight_number,
+               f.origin,
+               f.dest,
+               f.scheduled_out_utc,
+               f.scheduled_in_utc,
+               f.estimated_out_utc,
+               f.estimated_in_utc,
+               f.aircraft_type,
+               p.proba_delay,
+               p.predicted_delay,
+               p.predicted_at_utc,
+               CASE WHEN a.arr_delay_min IS NOT NULL THEN 1 ELSE 0 END AS has_actual,
+               a.arr_delay_min,
+               a.departure_delay_min,
+               a.actual_out_utc
+        FROM flights f
+        JOIN (
+            SELECT fa_flight_id, proba_delay, predicted_delay, predicted_at_utc,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY fa_flight_id ORDER BY predicted_at_utc DESC
+                   ) AS rn
+            FROM predictions
+            WHERE fa_flight_id = ?
+        ) p ON p.fa_flight_id = f.fa_flight_id AND p.rn = 1
+        LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
+        WHERE f.fa_flight_id = ?
+          AND f.origin = 'ATL'
+          AND f.cancelled = 0
+    """, (fa_flight_id, fa_flight_id)).fetchone()
+
+
 @app.get("/flights/{fa_flight_id:path}")
 def get_flight(fa_flight_id: str):
     con = get_db()
     try:
         rows = _latest_predictions_active(con)
         row = next((r for r in rows if r["fa_flight_id"] == fa_flight_id), None)
+        is_historical = row is None
+        if is_historical:
+            row = _get_historical_flight(con, fa_flight_id)
         if row is None:
             raise HTTPException(status_code=404, detail="Flight not found")
 
         result = _flight_row_to_dict(row)
+        result["is_historical"] = is_historical
         # Fast path: serve cached SHAP from prediction_shap table (Fix D).
         # Fall back to on-demand compute only if the cache is empty (e.g. for
         # predictions written before SHAP persistence was rolled out).

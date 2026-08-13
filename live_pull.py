@@ -357,7 +357,10 @@ def main() -> int:
     # (AeroAPI typically settles actual_off within 30-60 min; beyond 2h it's safe to
     # assume the lag is too large or the flight is actually airborne and needs no update).
     horizon_h = int(os.getenv("PREDICT_HORIZON_HOURS", str(args.schedule_hours)))
-    delay_grace_h = int(os.getenv("DELAY_GRACE_HOURS", "2"))
+    # Only predict ATL departures whose scheduled_out is still in the future.
+    # Arrivals (dest=ATL) are fetched for actuals/tail-lineage only — not predicted.
+    # Delayed departures that already passed their scheduled_out are excluded:
+    # once the scheduled window closes, the pre-departure prediction is final.
     db_dep_rows = conn.execute(
         """
         SELECT f.fa_flight_id
@@ -365,24 +368,20 @@ def main() -> int:
         LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
         WHERE f.origin = 'ATL'
           AND f.scheduled_out_utc IS NOT NULL
-          AND a.actual_off_utc IS NULL
-          AND (
-              datetime(COALESCE(f.estimated_out_utc, f.scheduled_out_utc)) > datetime(?)
-              OR datetime(f.scheduled_out_utc) > datetime(?, ?)
-          )
+          AND datetime(f.scheduled_out_utc) > datetime(?)
           AND datetime(f.scheduled_out_utc) <= datetime(?, ?)
           AND COALESCE(f.cancelled, 0) = 0
         """,
-        (_iso(now), _iso(now), f"-{delay_grace_h} hours", _iso(now), f"+{horizon_h} hours"),
+        (_iso(now), _iso(now), f"+{horizon_h} hours"),
     ).fetchall()
-    # Union the standing upcoming-departures set with this cycle's freshly fetched
-    # flights (keeps arrivals + brand-new departures not yet committed-visible).
+    # Departures only — arr_sched_rows fetched for lineage/actuals, not predicted.
     target_ids = list(
         {r[0] for r in db_dep_rows}
-        | {r["fa_flight_id"] for r in sched_rows + arr_sched_rows}
+        | {r["fa_flight_id"] for r in sched_rows}
     )
-    print(f"   target: {len(db_dep_rows)} standing ATL deps (upcoming + ≤{delay_grace_h}h delayed) + "
-          f"{len(sched_rows) + len(arr_sched_rows)} freshly fetched → {len(target_ids)} unique")
+    print(f"   target: {len(db_dep_rows)} standing ATL deps (scheduled_out ahead) + "
+          f"{len(sched_rows)} freshly fetched deps → {len(target_ids)} unique "
+          f"(arrivals: {len(arr_sched_rows)} fetched for lineage only)")
 
     # Export labels independently from feature snapshots.  The rolling lookback
     # makes the outbox self-healing after scheduler gaps, while deterministic
@@ -408,7 +407,6 @@ def main() -> int:
             )
             if training_store_required():
                 raise
-
     if not target_ids:
         print("   no flights to predict")
         conn.execute(
