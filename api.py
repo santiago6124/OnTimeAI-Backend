@@ -513,7 +513,10 @@ def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
                CASE WHEN a.arr_delay_min IS NOT NULL THEN 1 ELSE 0 END AS has_actual,
                a.arr_delay_min,
                a.departure_delay_min,
-               a.actual_out_utc
+               a.actual_out_utc,
+               a.actual_off_utc,
+               a.actual_on_utc,
+               a.actual_in_utc
         FROM flights f
         JOIN (
             SELECT p2.fa_flight_id,
@@ -555,6 +558,9 @@ def _flight_row_to_dict(row: sqlite3.Row) -> dict:
     est_out = row["estimated_out_utc"] if "estimated_out_utc" in keys else None
     est_in = row["estimated_in_utc"] if "estimated_in_utc" in keys else None
     act_out = row["actual_out_utc"] if "actual_out_utc" in keys else None
+    act_off = row["actual_off_utc"] if "actual_off_utc" in keys else None
+    act_on = row["actual_on_utc"] if "actual_on_utc" in keys else None
+    act_in = row["actual_in_utc"] if "actual_in_utc" in keys else None
 
     return {
         "fa_flight_id":    row["fa_flight_id"],
@@ -567,6 +573,9 @@ def _flight_row_to_dict(row: sqlite3.Row) -> dict:
         "estimated_out_utc": est_out or row["scheduled_out_utc"] or "",
         "estimated_in_utc":  est_in or row["scheduled_in_utc"] or "",
         "actual_out_utc":    act_out,
+        "actual_off_utc":    act_off,
+        "actual_on_utc":     act_on,
+        "actual_in_utc":     act_in,
         "aircraft_type":   row["aircraft_type"] or "",
         "risk":            risk_level(proba),
         "delay_probability": round(proba, 4),
