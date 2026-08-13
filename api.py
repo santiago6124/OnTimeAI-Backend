@@ -1041,29 +1041,38 @@ def metrics_hourly():
     con = get_db()
     try:
         rows = _latest_predictions_active(con)
+        flights = [_flight_row_to_dict(r) for r in rows]
         buckets: dict[str, dict] = {}
-        for r in rows:
-            sched = r["scheduled_out_utc"] or ""
+        for f in flights:
+            sched = f.get("scheduled_out_utc") or ""
             if len(sched) >= 16:
                 hour = sched[11:13] + ":00"
             else:
                 hour = "??"
             if hour not in buckets:
-                buckets[hour] = {"hour": hour, "total": 0, "high_risk": 0, "sum_proba": 0.0}
+                buckets[hour] = {"hour": hour, "total": 0, "high_risk": 0, "medium_risk": 0, "low_risk": 0, "sum_proba": 0.0}
             b = buckets[hour]
             b["total"] += 1
-            b["sum_proba"] += float(r["proba_delay"])
-            if float(r["proba_delay"]) >= 0.35:
+            p = float(f.get("delay_probability", 0))
+            b["sum_proba"] += p
+            risk = f.get("risk", "low")
+            if risk == "high":
                 b["high_risk"] += 1
+            elif risk == "medium":
+                b["medium_risk"] += 1
+            else:
+                b["low_risk"] += 1
 
         result = []
         for hour in sorted(buckets):
             b = buckets[hour]
             result.append({
-                "hour":      hour,
-                "total":     b["total"],
-                "high_risk": b["high_risk"],
-                "avg_proba": round(b["sum_proba"] / b["total"], 4) if b["total"] else 0.0,
+                "hour":        hour,
+                "total":       b["total"],
+                "high_risk":   b["high_risk"],
+                "medium_risk": b["medium_risk"],
+                "low_risk":    b["low_risk"],
+                "avg_proba":   round(b["sum_proba"] / b["total"], 4) if b["total"] else 0.0,
             })
         return result
     finally:
