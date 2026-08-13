@@ -29,7 +29,10 @@ def test_flights_schema():
         pytest.skip("No flights in DB today")
     flight = data[0]
     for key in ("fa_flight_id", "flight_number", "origin", "destination",
-                "delay_probability", "risk", "predicted_delay"):
+                "delay_probability", "risk", "predicted_delay",
+                "estimated_out_utc", "estimated_in_utc",
+                "actual_out_utc", "actual_off_utc",
+                "actual_on_utc", "actual_in_utc"):
         assert key in flight, f"missing key: {key}"
 
 
