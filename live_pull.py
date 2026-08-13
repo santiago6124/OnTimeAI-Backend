@@ -128,6 +128,25 @@ def main() -> int:
         return 0
 
     conn = open_db()
+
+    # Limpieza: eliminar predicciones realizadas después del scheduled_out_utc del vuelo.
+    # Estas predicciones son ruido — el vuelo ya debía haber salido cuando se predijo.
+    # Es idempotente; el pipeline ya no genera nuevas (corte en scheduled_out_utc).
+    deleted = conn.execute(
+        """
+        DELETE FROM predictions
+        WHERE EXISTS (
+            SELECT 1 FROM flights f
+            WHERE f.fa_flight_id = predictions.fa_flight_id
+              AND f.scheduled_out_utc IS NOT NULL
+              AND datetime(predictions.predicted_at_utc) > datetime(f.scheduled_out_utc)
+        )
+        """
+    ).rowcount
+    conn.commit()
+    if deleted:
+        print(f"   cleanup: {deleted} predicciones post-salida eliminadas")
+
     cur = conn.execute(
         "INSERT INTO runs (started_utc) VALUES (?)", (now.isoformat(),),
     )
