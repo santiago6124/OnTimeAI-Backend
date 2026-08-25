@@ -293,13 +293,22 @@ JWT_EXPIRE_HOURS = 8
 
 
 _PUBLIC_PATHS = {"/auth/login", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"}
+# Endpoints accesibles sin autenticación para la vista pública /live
+_LITE_PUBLIC_PATHS = {"/flights", "/metrics/hourly"}
+_LITE_PUBLIC_PREFIXES = ("/weather/",)
 
 
 class AuthMiddleware(BaseHTTPMiddleware):
     async def dispatch(self, request: Request, call_next):
         if request.method == "OPTIONS":
             return await call_next(request)
-        if request.url.path in _PUBLIC_PATHS or request.url.path.startswith("/redoc"):
+        path = request.url.path
+        if path in _PUBLIC_PATHS or path.startswith("/redoc"):
+            return await call_next(request)
+        if request.method == "GET" and (
+            path in _LITE_PUBLIC_PATHS
+            or any(path.startswith(pfx) for pfx in _LITE_PUBLIC_PREFIXES)
+        ):
             return await call_next(request)
         auth = request.headers.get("Authorization", "")
         if not auth.startswith("Bearer "):
@@ -1144,6 +1153,71 @@ def metrics_model():
         "n_actuals_enroute":    n_actuals_enroute,
         "threshold":            threshold,
     }
+
+
+@app.get("/metrics/classification")
+def metrics_classification():
+    """Precision, recall, F1 y confusion matrix sobre predicciones con actuals (últimos 7 días)."""
+    try:
+        from sklearn.metrics import (
+            precision_score, recall_score, f1_score,
+            confusion_matrix, roc_auc_score, brier_score_loss,
+        )
+        con = get_db()
+        import pandas as pd
+        df = pd.read_sql("""
+            SELECT p.fa_flight_id, p.proba_delay, p.predicted_delay, p.predicted_at_utc,
+                   COALESCE(p.prediction_phase, 'PRE_DEPARTURE') AS prediction_phase,
+                   CASE WHEN a.arr_delay_min > 15 THEN 1 ELSE 0 END AS delayed
+            FROM predictions p
+            JOIN actuals a ON p.fa_flight_id = a.fa_flight_id
+            WHERE a.arr_delay_min IS NOT NULL AND a.cancelled = 0
+              AND p.predicted_at_utc >= datetime('now', '-7 days')
+        """, con)
+        con.close()
+
+        if df.empty or len(df) < 30:
+            return {"error": "Datos insuficientes", "n_actuals": len(df)}
+
+        # PRE_DEPARTURE: primera predicción por vuelo
+        pre = (df[df["prediction_phase"] == "PRE_DEPARTURE"]
+               .sort_values("predicted_at_utc")
+               .groupby("fa_flight_id", as_index=False).first())
+        if pre.empty:
+            pre = df.sort_values("predicted_at_utc").groupby("fa_flight_id", as_index=False).first()
+
+        y_true = pre["delayed"].to_numpy(dtype=int)
+        y_pred = pre["predicted_delay"].fillna(0).to_numpy(dtype=int)
+        y_prob = pre["proba_delay"].to_numpy(dtype=float)
+
+        tn, fp, fn, tp = confusion_matrix(y_true, y_pred, labels=[0, 1]).ravel()
+        prec   = float(precision_score(y_true, y_pred, zero_division=0))
+        rec    = float(recall_score(y_true, y_pred, zero_division=0))
+        f1     = float(f1_score(y_true, y_pred, zero_division=0))
+        acc    = float((tp + tn) / len(y_true))
+        fpr    = float(fp / (fp + tn)) if (fp + tn) > 0 else 0.0
+        auc    = float(roc_auc_score(y_true, y_prob)) if y_true.sum() >= 5 else None
+        brier  = float(brier_score_loss(y_true, y_prob))
+        actual_delay_rate = float(y_true.mean())
+
+        return {
+            "n_actuals":         int(len(y_true)),
+            "actual_delay_rate": round(actual_delay_rate, 4),
+            "predicted_pos_rate": round(float(y_pred.mean()), 4),
+            "auc":               round(auc, 4) if auc else None,
+            "brier":             round(brier, 4),
+            "precision":         round(prec, 4),
+            "recall":            round(rec, 4),
+            "f1":                round(f1, 4),
+            "accuracy":          round(acc, 4),
+            "false_positive_rate": round(fpr, 4),
+            "confusion_matrix": {
+                "TP": int(tp), "FP": int(fp),
+                "TN": int(tn), "FN": int(fn),
+            },
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 @app.get("/test-cases")

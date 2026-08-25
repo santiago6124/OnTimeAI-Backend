@@ -1,0 +1,30 @@
+.gcloudignore
+.git
+.venv
+venv
+env
+ENV
+__pycache__
+*.py[cod]
+*.egg-info
+.pytest_cache
+.mypy_cache
+.ruff_cache
+node_modules
+*.log
+.env.local
+# Raw training data (15 GB, not needed in Docker)
+data_raw/
+# Large datasets
+dataset_maestro_*.csv
+dataset_maestro_*.parquet
+dataset_v7_optimized.parquet
+dataset_v7_10M.parquet
+dataset_v8_optimized.parquet
+preds_2021_*.csv
+# Optuna study DBs (live_data.db sí se incluye)
+*.db
+!live_data.db
+# Other
+unbiased_sample_live/
+logs/

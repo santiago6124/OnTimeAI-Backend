@@ -394,14 +394,25 @@ def fetch_airport_flights(airport_icao: str, kind: str, start_iso: str, end_iso:
 # ----------------------------- weather from IEM ---------------------------
 
 def fetch_iem_obs(stations: set[str], start_utc: pd.Timestamp, end_utc: pd.Timestamp) -> pd.DataFrame:
+    """Fetches ASOS observations from IEM, batching all stations per network into one request.
+
+    Batching by network reduces ~120 individual requests to ~10-15 network requests,
+    eliminating rate-limit issues entirely.
+    """
     base = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
     frames = []
+
+    # Group stations by IEM network to batch into one request per network
+    by_network: dict[str, list[str]] = {}
     for st in sorted(stations):
-        if st not in NETWORK_BY_AIRPORT:
-            continue
-        params = [
-            ("network", NETWORK_BY_AIRPORT[st]),
-            ("station", st),
+        net = NETWORK_BY_AIRPORT.get(st)
+        if net:
+            by_network.setdefault(net, []).append(st)
+
+    print(f"  IEM: {len(stations)} airports → {len(by_network)} network requests")
+
+    for net, net_stations in sorted(by_network.items()):
+        common = [
             ("year1", str(start_utc.year)), ("month1", str(start_utc.month)), ("day1", str(start_utc.day)),
             ("year2", str(end_utc.year)), ("month2", str(end_utc.month)), ("day2", str(end_utc.day)),
             ("tz", "Etc/UTC"), ("format", "onlycomma"),
@@ -409,32 +420,38 @@ def fetch_iem_obs(stations: set[str], start_utc: pd.Timestamp, end_utc: pd.Times
             ("missing", "M"), ("trace", "T"), ("direct", "no"),
             ("report_type", "3"), ("report_type", "4"),
         ] + [("data", v) for v in WX_VARS]
-        try:
-            r = requests.get(base, params=params, timeout=10)
-            if r.status_code == 429:
-                print(f"  IEM {st}: rate-limited, skipping")
-                time.sleep(0.3)
-                continue
-            r.raise_for_status()
-            lines = r.text.splitlines()
-            hdr = next((i for i, ln in enumerate(lines) if ln.lower().startswith("station,valid")), None)
-            if hdr is None:
-                continue
-            df = pd.read_csv(StringIO("\n".join(lines[hdr:])))
-            df.columns = [c.strip().lower() for c in df.columns]
-            df["station"] = df["station"].astype("string").str.strip().str.upper()
-            df["valid"] = pd.to_datetime(df["valid"], errors="coerce", utc=True).dt.tz_convert(None).astype("datetime64[ns]")
-            for c in ["tmpc", "dwpc", "relh", "drct", "sknt", "alti", "p01m", "vsby", "gust"]:
-                df[c] = pd.to_numeric(df[c].replace({"M": np.nan, "T": 0.001}), errors="coerce")
-            df["wx_precip_flag"] = (df["p01m"].fillna(0) > 0).astype(int)
-            df["wx_low_vis_flag"] = (df["vsby"] < 3).astype(int)
-            df["wx_strong_wind_flag"] = ((df["sknt"] >= 20) | (df["gust"] >= 30)).astype(int)
-            frames.append(df[["station", "valid", "tmpc", "dwpc", "relh", "drct", "sknt", "alti",
-                              "p01m", "vsby", "gust", "wxcodes",
-                              "wx_precip_flag", "wx_low_vis_flag", "wx_strong_wind_flag"]])
-        except Exception as e:
-            print(f"  IEM {st}: FAIL ({e})")
-        time.sleep(0.3)
+        params = [("network", net)] + [("station", st) for st in net_stations] + common
+
+        for attempt in range(2):
+            try:
+                r = requests.get(base, params=params, timeout=30)
+                if r.status_code == 429:
+                    wait = 5 * (attempt + 1)
+                    print(f"  IEM {net}: rate-limited, sleeping {wait}s (attempt {attempt+1}/2)")
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                lines = r.text.splitlines()
+                hdr = next((i for i, ln in enumerate(lines) if ln.lower().startswith("station,valid")), None)
+                if hdr is None:
+                    break
+                df = pd.read_csv(StringIO("\n".join(lines[hdr:])))
+                df.columns = [c.strip().lower() for c in df.columns]
+                df["station"] = df["station"].astype("string").str.strip().str.upper()
+                df["valid"] = pd.to_datetime(df["valid"], errors="coerce", utc=True).dt.tz_convert(None).astype("datetime64[ns]")
+                for c in ["tmpc", "dwpc", "relh", "drct", "sknt", "alti", "p01m", "vsby", "gust"]:
+                    df[c] = pd.to_numeric(df[c].replace({"M": np.nan, "T": 0.001}), errors="coerce")
+                df["wx_precip_flag"] = (df["p01m"].fillna(0) > 0).astype(int)
+                df["wx_low_vis_flag"] = (df["vsby"] < 3).astype(int)
+                df["wx_strong_wind_flag"] = ((df["sknt"] >= 20) | (df["gust"] >= 30)).astype(int)
+                frames.append(df[["station", "valid", "tmpc", "dwpc", "relh", "drct", "sknt", "alti",
+                                  "p01m", "vsby", "gust", "wxcodes",
+                                  "wx_precip_flag", "wx_low_vis_flag", "wx_strong_wind_flag"]])
+                break
+            except Exception as e:
+                print(f"  IEM {net}: FAIL ({e})")
+                break
+        time.sleep(0.5)
     if not frames:
         return pd.DataFrame()
     return pd.concat(frames, ignore_index=True).drop_duplicates(["station", "valid"]).sort_values(["station", "valid"]).reset_index(drop=True)
@@ -1348,6 +1365,32 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
     df["CRS_DEP_TIME"] = (df["CRS_DEP_MIN"] // 60) * 100 + (df["CRS_DEP_MIN"] % 60)
     df["CRS_ELAPSED_TIME"] = pd.to_numeric(df["crs_elapsed_min"], errors="coerce")
     df["DISTANCE"] = pd.to_numeric(df["distance"], errors="coerce")
+    # FR24 always sends distance=None → fill via haversine from airport coords
+    # airport_lookup now extends its table with airportsdata (11,700+ IATA codes)
+    # so international and small regional airports that weren't in airports_universe.csv
+    # are also covered.
+    _dist_nan = df["DISTANCE"].isna()
+    if _dist_nan.any():
+        try:
+            import sys as _sys
+            _sys.path.insert(0, str(PROJECT_ROOT))
+            from feature_engineering_v7.airport_lookup import great_circle_distance_nm as _gc_dist
+            df.loc[_dist_nan, "DISTANCE"] = [
+                (_gc_dist(str(o), str(d)) or float("nan")) * 1.15078
+                if pd.notna(o) and pd.notna(d) else float("nan")
+                for o, d in zip(df.loc[_dist_nan, "ORIGIN"], df.loc[_dist_nan, "DEST"])
+            ]
+            _filled = _dist_nan.sum() - df["DISTANCE"].isna().sum()
+            print(f"  DISTANCE: haversine filled {_filled}/{_dist_nan.sum()} rows")
+        except Exception as _e:
+            print(f"  DISTANCE haversine fallback failed: {_e}")
+    # Final fill: airports unknown even to airportsdata → use frame median
+    _dist_still = df["DISTANCE"].isna()
+    if _dist_still.any():
+        _dist_med = df["DISTANCE"].median()
+        if pd.notna(_dist_med):
+            df.loc[_dist_still, "DISTANCE"] = _dist_med
+            print(f"  DISTANCE: filled {_dist_still.sum()} unknown airports with frame median ({_dist_med:.0f} mi)")
     df["CANCELLED"] = df["cancelled"].fillna(0).astype(int)
     df["DIVERTED"] = df["diverted"].fillna(0).astype(int)
     df["ARR_DELAY"] = pd.to_numeric(df["arr_delay_min"], errors="coerce")
@@ -1372,9 +1415,15 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
     df["PAR_AIRPORT"] = np.where(_is_atl_origin, df["DEST"], df["ORIGIN"])
 
     # Weather merge_asof from weather_obs table
+    # For far-future flights (CAPTURE_FUTURE_LEGS) we clamp the merge key to NOW
+    # so merge_asof can match the most recent available METAR rather than a
+    # non-existent future observation.
     if df["EVENT_ORIGIN_UTC"].notna().any():
-        wx_min = df["EVENT_ORIGIN_UTC"].min() - timedelta(hours=2)
-        wx_max = df["EVENT_DEST_UTC"].max() + timedelta(hours=2)
+        _now_utc = pd.Timestamp.utcnow().tz_localize(None)
+        df["_WX_KEY_ORIG"] = df["EVENT_ORIGIN_UTC"].clip(upper=_now_utc)
+        df["_WX_KEY_DEST"] = df["EVENT_DEST_UTC"].clip(upper=_now_utc)
+        wx_min = df["_WX_KEY_ORIG"].min() - timedelta(hours=2)
+        wx_max = _now_utc + timedelta(hours=1)
         wx = pd.read_sql_query(
             "SELECT * FROM weather_obs WHERE valid_utc >= ? AND valid_utc <= ?",
             conn, params=(wx_min.isoformat(), wx_max.isoformat()),
@@ -1382,8 +1431,35 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
         if not wx.empty:
             wx["valid"] = pd.to_datetime(wx["valid_utc"], format="ISO8601", utc=True).dt.tz_convert(None).astype("datetime64[ns]")
             wx = wx.sort_values(["station", "valid"]).reset_index(drop=True)
-            df = _merge_weather_asof(df, wx, "ORIGIN", "EVENT_ORIGIN_UTC", "ORIG")
-            df = _merge_weather_asof(df, wx, "DEST", "EVENT_DEST_UTC", "DEST")
+            df = _merge_weather_asof(df, wx, "ORIGIN", "_WX_KEY_ORIG", "ORIG")
+            df = _merge_weather_asof(df, wx, "DEST", "_WX_KEY_DEST", "DEST")
+        df = df.drop(columns=["_WX_KEY_ORIG", "_WX_KEY_DEST"], errors="ignore")
+
+        # Post-merge NaN fill: physically meaningful defaults for every weather column.
+        # METAR omits GUST entirely when calm (not a sensor gap — no gust = 0 kt).
+        # Wind dir/speed filled with 0 when station doesn't report (calm assumed).
+        # VSBY/ALTI/P01M: standard-atmosphere defaults when station is unavailable.
+        # TMPC/DWPC/RELH: fill DEST from ORIG (ATL) as proxy for airports with no IEM
+        # ASOS coverage (international destinations, some small regional airports).
+        for _pfx in ("ORIG", "DEST"):
+            for _wx_col, _wx_fill in [
+                (f"{_pfx}_WX_GUST",  0.0),    # no gust = calm
+                (f"{_pfx}_WX_DRCT",  0.0),    # calm / variable wind direction
+                (f"{_pfx}_WX_SKNT",  0.0),    # calm wind speed
+                (f"{_pfx}_WX_P01M",  0.0),    # no precipitation
+                (f"{_pfx}_WX_VSBY",  10.0),   # 10 sm = CAVOK visibility
+                (f"{_pfx}_WX_ALTI",  29.92),  # standard sea-level pressure (inHg)
+            ]:
+                if _wx_col in df.columns:
+                    df[_wx_col] = df[_wx_col].fillna(_wx_fill)
+        for _wx_var in ("TMPC", "DWPC", "RELH"):
+            _dest_col = f"DEST_WX_{_wx_var}"
+            _orig_col = f"ORIG_WX_{_wx_var}"
+            if _dest_col in df.columns and _orig_col in df.columns:
+                df[_dest_col] = df[_dest_col].fillna(df[_orig_col])
+        for _gap_col in ("ORIG_WX_MATCH_GAP_MIN", "DEST_WX_MATCH_GAP_MIN"):
+            if _gap_col in df.columns:
+                df[_gap_col] = df[_gap_col].fillna(999.0)
 
     # v7 features: BEARING_DEG + ERA5 wind at cruise altitude
     df = _add_v7_wind_features(df)
@@ -1404,20 +1480,35 @@ _ERA5_GRIDS: dict | None = None
 def _add_v7_wind_features(df: pd.DataFrame) -> pd.DataFrame:
     """Agrega BEARING_DEG y features ERA5 viento 250hPa al inference frame."""
     global _ERA5_GRIDS
-    _np = np
+
+    # ── Step 1: BEARING_DEG (solo necesita airport_lookup, sin netCDF4/scipy) ──
+    # Separado del bloque ERA5 para que falle independientemente.
+    if "BEARING_DEG" not in df.columns:
+        try:
+            import sys
+            sys.path.insert(0, str(PROJECT_ROOT))
+            from feature_engineering_v7.airport_lookup import great_circle_bearing
+            pairs = df[["ORIGIN", "DEST"]].drop_duplicates().copy()
+            pairs["BEARING_DEG"] = pairs.apply(
+                lambda r: great_circle_bearing(r["ORIGIN"], r["DEST"]), axis=1
+            )
+            df = df.merge(pairs, on=["ORIGIN", "DEST"], how="left")
+        except Exception as e:
+            print(f"  BEARING_DEG failed: {e}")
+            df["BEARING_DEG"] = float("nan")
+    # Final fill: airports unknown even after airportsdata extension → frame median
+    _bearing_still = df["BEARING_DEG"].isna() if "BEARING_DEG" in df.columns else pd.Series([], dtype=bool)
+    if _bearing_still.any():
+        _bearing_med = df["BEARING_DEG"].median()
+        if pd.notna(_bearing_med):
+            df["BEARING_DEG"] = df["BEARING_DEG"].fillna(_bearing_med)
+
+    # ── Step 2: ERA5 wind (requiere netCDF4 + scipy — no instalados en prod) ──
     try:
         import sys
         sys.path.insert(0, str(PROJECT_ROOT))
-        from feature_engineering_v7.airport_lookup import great_circle_bearing, airport_coords
         from feature_engineering_v7.era5_wind_features import Era5WindGrid, _midpoint as era5_midpoint
         import numpy as _np
-
-        # BEARING_DEG por par único ORIGIN-DEST
-        pairs = df[["ORIGIN", "DEST"]].drop_duplicates().copy()
-        pairs["BEARING_DEG"] = pairs.apply(
-            lambda r: great_circle_bearing(r["ORIGIN"], r["DEST"]), axis=1
-        )
-        df = df.merge(pairs, on=["ORIGIN", "DEST"], how="left")
 
         # Cargar ERA5 grids una sola vez
         if _ERA5_GRIDS is None:
@@ -1437,7 +1528,7 @@ def _add_v7_wind_features(df: pd.DataFrame) -> pd.DataFrame:
 
         if not _ERA5_GRIDS:
             for c in ["ERA5_U_KT", "ERA5_V_KT", "ERA5_HEADWIND_KT", "ERA5_CROSSWIND_KT"]:
-                df[c] = _np.nan
+                df[c] = 0.0
             df["ERA5_TAILWIND_FLAG"] = 0
             return df
 
@@ -1473,14 +1564,17 @@ def _add_v7_wind_features(df: pd.DataFrame) -> pd.DataFrame:
         df["ERA5_TAILWIND_FLAG"] = (df["ERA5_HEADWIND_KT"] < -15).astype("int8")
 
     except Exception as e:
-        # Si falla por cualquier razón, rellenar con NaN para no romper inferencia
-        import warnings
-        warnings.warn(f"v7 wind features failed: {e}")
-        for c in ["BEARING_DEG", "ERA5_U_KT", "ERA5_V_KT", "ERA5_HEADWIND_KT", "ERA5_CROSSWIND_KT"]:
+        print(f"  ERA5 wind features unavailable: {e}")
+        for c in ["ERA5_U_KT", "ERA5_V_KT", "ERA5_HEADWIND_KT", "ERA5_CROSSWIND_KT"]:
             if c not in df.columns:
-                df[c] = float("nan") if "ERA5" in c or "BEARING" in c else 0
+                df[c] = 0.0  # no wind data → assume calm (0 kt)
         if "ERA5_TAILWIND_FLAG" not in df.columns:
             df["ERA5_TAILWIND_FLAG"] = 0
+
+    # Ensure no NaN remain in any ERA5 column (e.g. rows where BEARING_DEG was NaN)
+    for c in ["ERA5_U_KT", "ERA5_V_KT", "ERA5_HEADWIND_KT", "ERA5_CROSSWIND_KT"]:
+        if c in df.columns:
+            df[c] = df[c].fillna(0.0)
 
     return df
 
