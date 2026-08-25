@@ -15,6 +15,20 @@ _df = pd.read_csv(_CSV)[["iata", "iem_lat", "iem_lon"]].dropna()
 _LAT: dict[str, float] = dict(zip(_df["iata"], _df["iem_lat"]))
 _LON: dict[str, float] = dict(zip(_df["iata"], _df["iem_lon"]))
 
+# Secondary lookup: airportsdata covers 11,700+ IATA airports globally.
+# Fills gaps for international destinations and small regional airports
+# not present in airports_universe.csv (built from BTS US-only dataset).
+try:
+    import airportsdata as _airportsdata_pkg
+    _adb = _airportsdata_pkg.load("IATA")
+    for _code, _ap in _adb.items():
+        if _code not in _LAT and _ap.get("lat") is not None and _ap.get("lon") is not None:
+            _LAT[_code] = float(_ap["lat"])
+            _LON[_code] = float(_ap["lon"])
+    del _adb, _airportsdata_pkg, _code, _ap
+except (ImportError, Exception):
+    pass
+
 
 def airport_coords(iata: str) -> tuple[float, float] | None:
     """Retorna (lat, lon) o None si el aeropuerto no está en el universo."""

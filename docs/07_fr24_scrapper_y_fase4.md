@@ -145,13 +145,21 @@ gcloud run jobs update ontimeai-live-pull-2 \
 
 ---
 
-## 7. Estado al 2026-08-12
+## 7. Estado al 2026-08-14 (actualizado)
 
-- ✅ Scrapper FR24 corriendo en producción, 0 failures en 42+ horas, costo ~$0.10/día
-- ✅ Datos FR24 almacenados en `live_data.db` (tabla separada)
-- ✅ Chain walk de lineaje operativo (92.3% hit rate, 879 tails en cache)
-- ✅ `live_pull.py` tiene soporte de código para `LIVE_DATA_SOURCE=harvester`
-- ❌ Fase 4 **no activada** — pipeline de predicción sigue en modo AeroAPI
-- ❌ AUC live se ve impactado por el 71.6% de lineaje nulo (feature `TAIL_DELAY_DECAY` degrada)
+- ✅ Scrapper FR24 corriendo en producción, 0 failures en 60+ horas, costo ~$0.10/día
+- ✅ Datos FR24 almacenados en `live_data.db` (misma tabla `flights`, mismo schema que backend)
+- ✅ Chain walk de lineaje operativo (92.3% hit rate, 2400+ tails en cache)
+- ✅ **Fase 4 activada en producción el 2026-08-13** — `LIVE_DATA_SOURCE=harvester` en ambos jobs
+- ✅ Pipeline de predicción en modo harvester: 0 AeroAPI calls por ciclo, costo $0
+- ✅ `TAIL_DELAY_DECAY` NaN rate bajó de 71.6% → 1.6% (lineaje casi completo)
+- ✅ Frecuencia live-pull: cada 30 min (scheduler estándar), harvester cada 15 min
+- ✅ `FR24_MAX_PAGES=30` — valor definitivo (ver nota abajo)
 
-**Decisión pendiente** (para después de la exposición 2026-08-13): evaluar si activar Fase 4 y medir el impacto en AUC live con FR24 como fuente.
+### Nota sobre MAX_PAGES
+
+El 2026-08-14 se probó `FR24_MAX_PAGES=60`. Resultado: el harvester siguió llenando todas las páginas (1–60), pero el conteo de vuelos ATL no aumentó significativamente (193–203 vuelos vs 178–208 con 30 páginas). La ganancia fue de ~5-10 vuelos extra al precio de duplicar la duración del ciclo (104s vs 51s).
+
+**Conclusión**: el cuello de botella no es la paginación sino el volumen real que FR24 expone para ATL en una ventana de 6h. El techo de cobertura de FR24 es ~92% del tráfico comercial de ATL. El 8% restante corresponde a aviación general, charters sin código IATA, vuelos militares y aeronaves sin transponder visible — no recuperables desde ninguna fuente pública de scraping.
+
+`FR24_MAX_PAGES` fue revertido a 30 el mismo día.

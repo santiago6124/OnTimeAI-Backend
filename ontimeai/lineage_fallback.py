@@ -275,6 +275,22 @@ def apply_lineage_fallback(df: pd.DataFrame, lookups: dict[str, Any]) -> pd.Data
         imputed_absorb = 1.0 - imputed_late
         out["absorb_score_origin"] = out["absorb_score_origin"].fillna(imputed_absorb)
 
+    # ADS-B prev-leg features: always 100% NaN in prod (no live ADS-B tracking).
+    # Fill with neutral defaults so the model receives a value in its learned range
+    # rather than going to the NaN branch (trained on very few/no examples).
+    for _c in ("PREV_BLOCK_DELTA_MIN", "PREV_HOLDING_MIN", "PREV_ROUTE_DEVIATION_PCT"):
+        if _c in out.columns:
+            out[_c] = out[_c].fillna(0.0)
+
+    if "PREV_ADSB_AVAILABLE" in out.columns:
+        out["PREV_ADSB_AVAILABLE"] = out["PREV_ADSB_AVAILABLE"].fillna(0)
+
+    # PREV block times: use CRS_ELAPSED_TIME as a same-aircraft-type proxy
+    if "CRS_ELAPSED_TIME" in out.columns:
+        for _c in ("PREV_ACTUAL_BLOCK_MIN", "PREV_SCHED_BLOCK_MIN"):
+            if _c in out.columns:
+                out[_c] = out[_c].fillna(out["CRS_ELAPSED_TIME"])
+
     return out
 
 

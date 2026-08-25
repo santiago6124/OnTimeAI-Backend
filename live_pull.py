@@ -175,13 +175,20 @@ def main() -> int:
             SELECT fa_flight_id, origin, dest, tail_num, op_carrier,
                    scheduled_out_utc, scheduled_in_utc
             FROM flights
-            WHERE (origin = 'ATL' OR dest = 'ATL')
-              AND scheduled_out_utc IS NOT NULL
-              AND datetime(scheduled_out_utc) >= datetime(?)
-              AND datetime(scheduled_out_utc) < datetime(?)
-            ORDER BY scheduled_out_utc
+            WHERE (
+                (origin = 'ATL'
+                 AND scheduled_out_utc IS NOT NULL
+                 AND datetime(scheduled_out_utc) >= datetime(?)
+                 AND datetime(scheduled_out_utc) < datetime(?))
+                OR
+                (dest = 'ATL'
+                 AND scheduled_in_utc IS NOT NULL
+                 AND datetime(scheduled_in_utc) >= datetime(?)
+                 AND datetime(scheduled_in_utc) < datetime(?))
+            )
+            ORDER BY COALESCE(scheduled_out_utc, scheduled_in_utc)
             """,
-            (_iso(sched_start), _iso(sched_end)),
+            (_iso(sched_start), _iso(sched_end), _iso(sched_start), _iso(sched_end)),
         )
         cols = [d[0] for d in cur.description]
         sched_rows = [dict(zip(cols, r)) for r in cur.fetchall() if r[0]]
