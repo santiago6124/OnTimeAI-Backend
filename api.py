@@ -63,6 +63,14 @@ def _hash_password(password: str) -> str:
     return f"{salt}${h.hex()}"
 
 
+def _unusable_password() -> str:
+    """Sentinel for accounts without a local password (Google sign-in).
+
+    Has no '$' separator, so _check_password() always fails for these rows.
+    """
+    return f"!{secrets.token_hex(16)}"
+
+
 def _check_password(password: str, stored: str) -> bool:
     try:
         salt, h = stored.split("$", 1)
@@ -117,6 +125,16 @@ def _init_users_db() -> None:
             updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
         );
     """)
+    # Migration: identity provider columns (added for Google sign-in, issue #8)
+    existing = {r["name"] for r in con.execute("PRAGMA table_info(users)")}
+    for column, ddl in (
+        ("email",     "ALTER TABLE users ADD COLUMN email TEXT"),
+        ("provider",  "ALTER TABLE users ADD COLUMN provider TEXT NOT NULL DEFAULT 'local'"),
+        ("user_type", "ALTER TABLE users ADD COLUMN user_type TEXT"),
+    ):
+        if column not in existing:
+            con.execute(ddl)
+    con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL")
     # Seed initial users from env vars (idempotent)
     seeds = [
         (os.getenv("API_USERNAME", "admin"),  os.getenv("API_PASSWORD", "ontimeai2026"),  "superadmin"),
@@ -291,8 +309,12 @@ JWT_SECRET = os.getenv("JWT_SECRET_KEY", "ontimeai-dev-secret-change-in-prod-32c
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 8
 
+# Google sign-in: audience the ID token must be issued for. Empty disables /auth/google.
+GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+USER_TYPES = ("b2b", "b2c")
 
-_PUBLIC_PATHS = {"/auth/login", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"}
+
+_PUBLIC_PATHS = {"/auth/login", "/auth/google", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"}
 # Endpoints accesibles sin autenticación para la vista pública /live
 _LITE_PUBLIC_PATHS = {"/flights", "/metrics/hourly"}
 _LITE_PUBLIC_PREFIXES = ("/weather/",)
@@ -324,6 +346,14 @@ class AuthMiddleware(BaseHTTPMiddleware):
 class LoginRequest(BaseModel):
     username: str
     password: str
+
+
+class GoogleLoginRequest(BaseModel):
+    id_token: str
+
+
+class MeUpdate(BaseModel):
+    user_type: Optional[str] = None
 
 
 class UserCreate(BaseModel):
@@ -599,27 +629,139 @@ def _flight_row_to_dict(row: sqlite3.Row) -> dict:
 
 # ── Auth routes ────────────────────────────────────────────────────────────
 
+def _issue_token(username: str, role: str) -> str:
+    expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
+    return jwt.encode(
+        {"sub": username, "role": role, "exp": expire},
+        JWT_SECRET, algorithm=JWT_ALGORITHM,
+    )
+
+
 @app.post("/auth/login")
 def login(body: LoginRequest):
     con = _get_users_con()
     row = con.execute(
-        "SELECT password_hash, role, active FROM users WHERE username=?", (body.username,)
+        "SELECT password_hash, role, active, user_type FROM users WHERE username=?", (body.username,)
     ).fetchone()
     con.close()
     if not row or not row["active"] or not _check_password(body.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Credenciales incorrectas")
-    expire = datetime.now(timezone.utc) + timedelta(hours=JWT_EXPIRE_HOURS)
-    token = jwt.encode(
-        {"sub": body.username, "role": row["role"], "exp": expire},
-        JWT_SECRET, algorithm=JWT_ALGORITHM,
-    )
-    return {"access_token": token, "token_type": "bearer"}
+    return {
+        "access_token": _issue_token(body.username, row["role"]),
+        "token_type": "bearer",
+        "user_type": row["user_type"],
+    }
+
+
+def _verify_google_id_token(raw_token: str) -> dict:
+    """Validate a Google ID token against our client ID. Raises HTTPException."""
+    if not GOOGLE_CLIENT_ID:
+        raise HTTPException(503, "Login con Google no está configurado en este entorno")
+    try:
+        from google.auth.transport import requests as google_requests
+        from google.oauth2 import id_token as google_id_token
+    except ImportError:
+        raise HTTPException(503, "Dependencia google-auth no instalada")
+    try:
+        claims = google_id_token.verify_oauth2_token(
+            raw_token, google_requests.Request(), GOOGLE_CLIENT_ID
+        )
+    except ValueError as e:
+        raise HTTPException(401, f"ID token de Google inválido: {e}")
+    if not claims.get("email"):
+        raise HTTPException(401, "El ID token no incluye email")
+    if not claims.get("email_verified"):
+        raise HTTPException(401, "El email de la cuenta de Google no está verificado")
+    return claims
+
+
+@app.post("/auth/google")
+def login_google(body: GoogleLoginRequest):
+    """Exchange a Google ID token for our own JWT, creating the user on first sign-in."""
+    claims = _verify_google_id_token(body.id_token)
+    email = claims["email"].lower()
+
+    con = _get_users_con()
+    row = con.execute(
+        "SELECT username, role, active, user_type, provider FROM users WHERE username=? OR email=?",
+        (email, email),
+    ).fetchone()
+
+    if row is None:
+        con.execute(
+            "INSERT INTO users (username, password_hash, role, email, provider) "
+            "VALUES (?,?,'user',?, 'google')",
+            (email, _unusable_password(), email),
+        )
+        con.commit()
+        con.close()
+        _upload_users_db()
+        return {
+            "access_token": _issue_token(email, "user"),
+            "token_type": "bearer",
+            "user_type": None,
+            "is_new_user": True,
+        }
+
+    if not row["active"]:
+        con.close()
+        raise HTTPException(403, "La cuenta está desactivada")
+    # Existing local account signing in with Google for the first time: link them.
+    if row["provider"] == "local":
+        con.execute(
+            "UPDATE users SET email=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            "WHERE username=? AND email IS NULL",
+            (email, row["username"]),
+        )
+        con.commit()
+    con.close()
+    return {
+        "access_token": _issue_token(row["username"], row["role"]),
+        "token_type": "bearer",
+        "user_type": row["user_type"],
+        "is_new_user": False,
+    }
 
 
 @app.get("/auth/me")
 def auth_me(request: Request):
     payload = _payload_of(request)
-    return {"username": payload.get("sub"), "role": payload.get("role", "user")}
+    username = payload.get("sub")
+    con = _get_users_con()
+    row = con.execute(
+        "SELECT email, provider, user_type FROM users WHERE username=?", (username,)
+    ).fetchone()
+    con.close()
+    return {
+        "username": username,
+        "role": payload.get("role", "user"),
+        "email": row["email"] if row else None,
+        "provider": row["provider"] if row else "local",
+        "user_type": row["user_type"] if row else None,
+    }
+
+
+@app.patch("/users/me")
+def update_me(request: Request, body: MeUpdate):
+    """Set the caller's profile type (B2B/B2C) — used by onboarding and settings."""
+    username = _payload_of(request).get("sub")
+    if body.user_type is None:
+        return {"ok": True}
+    if body.user_type not in USER_TYPES:
+        raise HTTPException(400, f"user_type inválido. Válidos: {', '.join(USER_TYPES)}")
+    con = _get_users_con()
+    res = con.execute(
+        "UPDATE users SET user_type=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+        "WHERE username=?",
+        (body.user_type, username),
+    )
+    if res.rowcount == 0:
+        con.close()
+        raise HTTPException(404, "Usuario no encontrado")
+    con.commit()
+    con.close()
+    _upload_users_db()
+    return {"ok": True, "user_type": body.user_type}
 
 
 # ── User management (superadmin only) ──────────────────────────────────────
@@ -629,7 +771,8 @@ def list_users(request: Request):
     _require_superadmin(request)
     con = _get_users_con()
     rows = con.execute(
-        "SELECT id, username, role, active, created_at FROM users ORDER BY created_at"
+        "SELECT id, username, role, active, provider, user_type, created_at "
+        "FROM users ORDER BY created_at"
     ).fetchall()
     con.close()
     return [dict(r) for r in rows]
