@@ -40,7 +40,17 @@ def refresh_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(api, "_DB_REFRESH_LOCK", threading.Lock())
     monkeypatch.setattr(api, "_DB_REFRESH_THREAD_LOCK", threading.Lock())
     monkeypatch.setattr(api, "_db_refresh_thread", None)
-    monkeypatch.setattr(api, "_db_last_refresh", 0.0)
+    # No alcanza con 0.0: el disparador es
+    # `time.monotonic() - _db_last_refresh < _DB_REFRESH_INTERVAL`, y
+    # `time.monotonic()` cuenta desde el arranque de la máquina. En un runner
+    # de CI recién booteado vale unos pocos cientos de segundos, por debajo del
+    # intervalo, así que con 0.0 el refresh no se dispara y los tests que
+    # dependen del camino automático esperan un evento que nunca llega.
+    # Restar el intervalo al reloj actual deja el refresh vencido con
+    # independencia del uptime.
+    monkeypatch.setattr(
+        api, "_db_last_refresh", time.monotonic() - api._DB_REFRESH_INTERVAL - 1
+    )
     monkeypatch.setattr(api, "_db_last_health_check", time.monotonic())
     return target
 
