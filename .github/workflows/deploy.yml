@@ -67,6 +67,11 @@ jobs:
           done
 
       - name: Desplegar backend
+        # max-instances 1 a proposito: users.db es SQLite en /tmp que se
+        # baja de GCS al arrancar y se sube entera tras cada escritura. Con
+        # dos instancias, la que arranco primero sube su copia vieja y pisa
+        # los usuarios que creo la otra, sin error ni aviso. Subir este
+        # numero exige antes mover usuarios a un almacen multi-escritor.
         # Las credenciales van por --set-secrets, no como env vars planas: así
         # no quedan legibles para quien tenga run.services.get. Ver docs/SECRETS.md.
         run: |
@@ -75,7 +80,7 @@ jobs:
             --region "$REGION" --platform managed \
             --allow-unauthenticated \
             --memory 2Gi --cpu 2 \
-            --min-instances 0 --max-instances 2 \
+            --min-instances 0 --max-instances 1 \
             --timeout 60 \
             --set-env-vars "ACTIVE_MODEL=4year_v9,GCS_BUCKET=ontimeai-prod-live-db,API_USERNAME=admin,API_USERNAME_VIEWER=viewer" \
             --set-secrets "JWT_SECRET_KEY=jwt-secret-key:latest,API_PASSWORD=api-password:latest,API_PASSWORD_VIEWER=api-password-viewer:latest" \
