@@ -1,9 +1,17 @@
 name: GCP auth check
 
 # Verifica que la federación con GCP funcione sin ninguna clave guardada.
-# Se corre a mano; los workflows de deploy reutilizan este mismo bloque de auth.
+# Los workflows de deploy reutilizan este mismo bloque de auth.
+#
+# Corre solo cuando un PR toca la configuración de autenticación, para que un
+# cambio ahí se valide antes de mergear en vez de descubrirse en un deploy.
+# `workflow_dispatch` permite además correrlo a mano desde la pestaña Actions.
 on:
   workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/gcp-auth-check.yml"
+      - "docs/GITHUB_GCP_AUTH.md"
 
 permissions:
   # Necesario para que GitHub emita el token OIDC que GCP intercambia.
