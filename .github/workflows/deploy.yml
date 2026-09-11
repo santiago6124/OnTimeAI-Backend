@@ -1,0 +1,100 @@
+name: Deploy
+
+# Un merge a main despliega el backend y los jobs del live pipeline.
+#
+# Antes esto se corría a mano con deploy.sh, y se notaba: la imagen del job
+# estuvo 16 días con código viejo (el arreglo del batching de METAR se commiteó
+# el 24/08 y la imagen era del 19/08), y el backend llegó a servir código que no
+# estaba en main. Nada avisaba en ninguno de los dos casos.
+on:
+  push:
+    branches: [main]
+  # Permite redesplegar sin tener que empujar un commit vacío.
+  workflow_dispatch:
+
+# Dos despliegues pisándose dejan Cloud Run en un estado indeterminado, así que
+# el segundo espera en vez de cancelar al primero.
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ontimeai-prod
+  REGION: us-central1
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ontimeai-prod
+          workload_identity_provider: projects/871707213932/locations/global/workloadIdentityPools/github/providers/github
+          service_account: github-deployer@ontimeai-prod.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Construir imagen del backend
+        run: |
+          gcloud builds submit \
+            --tag "gcr.io/$PROJECT_ID/ontimeai-backend" \
+            --project="$PROJECT_ID" --quiet
+
+      - name: Desplegar backend
+        # Las credenciales van por --set-secrets, no como env vars planas: así
+        # no quedan legibles para quien tenga run.services.get. Ver docs/SECRETS.md.
+        run: |
+          gcloud run deploy ontimeai-backend \
+            --image "gcr.io/$PROJECT_ID/ontimeai-backend" \
+            --region "$REGION" --platform managed \
+            --allow-unauthenticated \
+            --memory 2Gi --cpu 2 \
+            --min-instances 0 --max-instances 2 \
+            --timeout 60 \
+            --set-env-vars "ACTIVE_MODEL=4year_v9,GCS_BUCKET=ontimeai-prod-live-db,API_USERNAME=admin,API_USERNAME_VIEWER=viewer" \
+            --set-secrets "JWT_SECRET_KEY=jwt-secret-key:latest,API_PASSWORD=api-password:latest,API_PASSWORD_VIEWER=api-password-viewer:latest" \
+            --project="$PROJECT_ID" --quiet
+
+      - name: Construir imagen del live job
+        run: |
+          gcloud builds submit \
+            --config cloudbuild-job.yaml \
+            --project="$PROJECT_ID" --quiet
+
+      - name: Desplegar los dos live jobs
+        # Comparten imagen y difieren sólo en la clave de AeroAPI, para repartir
+        # el rate limit entre ciclos intercalados.
+        run: |
+          for JOB in ontimeai-live-pull ontimeai-live-pull-2; do
+            case "$JOB" in
+              ontimeai-live-pull)   SECRET=aeroapi-key ;;
+              ontimeai-live-pull-2) SECRET=aeroapi-key-2 ;;
+            esac
+            gcloud run jobs deploy "$JOB" \
+              --image "gcr.io/$PROJECT_ID/ontimeai-live-pull" \
+              --region "$REGION" \
+              --cpu 2 --memory 4Gi \
+              --max-retries 1 --task-timeout 1800 \
+              --set-env-vars "GCS_BUCKET=ontimeai-prod-live-db,ACTIVE_MODEL=4year_v9,MAX_PAGES=7,CHAIN_WALK_MAX=10,LIVE_DATA_SOURCE=harvester" \
+              --set-secrets "AEROAPI_KEY=${SECRET}:latest" \
+              --project="$PROJECT_ID" --quiet
+          done
+
+      - name: Resumen
+        run: |
+          echo "### Desplegado" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit: \`${GITHUB_SHA::7}\`" >> "$GITHUB_STEP_SUMMARY"
+          URL=$(gcloud run services describe ontimeai-backend \
+                  --region "$REGION" --project "$PROJECT_ID" \
+                  --format='value(status.url)')
+          REV=$(gcloud run services describe ontimeai-backend \
+                  --region "$REGION" --project "$PROJECT_ID" \
+                  --format='value(status.latestReadyRevisionName)')
+          echo "Backend: $URL (revisión \`$REV\`)" >> "$GITHUB_STEP_SUMMARY"
