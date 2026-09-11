@@ -41,16 +41,30 @@ jobs:
       - uses: google-github-actions/setup-gcloud@v2
 
       - name: Construir imagen del backend
-        # --suppress-logs: transmitir los logs del build exige rol Viewer sobre
-        # el proyecto, que el deployer no tiene. Sin la bandera, gcloud sale con
-        # codigo 1 aunque el build termine en SUCCESS. El resultado se sigue
-        # esperando y reportando; ante un fallo, el ID del build queda en la
-        # salida para inspeccionarlo en la consola.
+        # Se lanza en modo asincrono y se consulta el estado en vez de dejar que
+        # gcloud espere: al esperar intenta leer el bucket de logs, lo que exige
+        # rol Viewer sobre el proyecto. Sin ese rol sale con codigo 1 aunque el
+        # build haya terminado en SUCCESS. --suppress-logs no alcanza.
         run: |
-          gcloud builds submit \
+          BUILD_ID=$(gcloud builds submit \
             --tag "gcr.io/$PROJECT_ID/ontimeai-backend" \
-            --suppress-logs \
-            --project="$PROJECT_ID" --quiet
+            --async --format='value(id)' \
+            --project="$PROJECT_ID" --quiet)
+          echo "Build $BUILD_ID"
+          while true; do
+            STATUS=$(gcloud builds describe "$BUILD_ID" \
+              --project="$PROJECT_ID" --format='value(status)')
+            case "$STATUS" in
+              SUCCESS)
+                echo "Build OK"; break ;;
+              FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED)
+                echo "Build $STATUS"
+                echo "https://console.cloud.google.com/cloud-build/builds/$BUILD_ID?project=$PROJECT_ID"
+                exit 1 ;;
+              *)
+                sleep 15 ;;
+            esac
+          done
 
       - name: Desplegar backend
         # Las credenciales van por --set-secrets, no como env vars planas: así
@@ -69,10 +83,25 @@ jobs:
 
       - name: Construir imagen del live job
         run: |
-          gcloud builds submit \
+          BUILD_ID=$(gcloud builds submit \
             --config cloudbuild-job.yaml \
-            --suppress-logs \
-            --project="$PROJECT_ID" --quiet
+            --async --format='value(id)' \
+            --project="$PROJECT_ID" --quiet)
+          echo "Build $BUILD_ID"
+          while true; do
+            STATUS=$(gcloud builds describe "$BUILD_ID" \
+              --project="$PROJECT_ID" --format='value(status)')
+            case "$STATUS" in
+              SUCCESS)
+                echo "Build OK"; break ;;
+              FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED)
+                echo "Build $STATUS"
+                echo "https://console.cloud.google.com/cloud-build/builds/$BUILD_ID?project=$PROJECT_ID"
+                exit 1 ;;
+              *)
+                sleep 15 ;;
+            esac
+          done
 
       - name: Desplegar los dos live jobs
         # Comparten imagen y difieren sólo en la clave de AeroAPI, para repartir
