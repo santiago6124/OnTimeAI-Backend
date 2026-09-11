@@ -1460,6 +1460,83 @@ def metrics_route_history(origin: str, dest: str):
         con.close()
 
 
+_SIZE_SAMPLE_ROWS = 5000
+
+
+def _table_bytes_exact(con, tables: list[str]) -> dict[str, int] | None:
+    """
+    Bytes reales por tabla, incluidos sus índices, vía el vtab `dbstat`.
+
+    Sólo está disponible si SQLite fue compilado con SQLITE_ENABLE_DBSTAT_VTAB,
+    lo que no está garantizado. Devuelve None si no existe, para que el llamador
+    caiga a la estimación por muestreo.
+    """
+    try:
+        con.execute("SELECT 1 FROM dbstat LIMIT 1")
+    except sqlite3.OperationalError:
+        return None
+
+    sizes: dict[str, int] = {}
+    for tbl in tables:
+        try:
+            # `name` en dbstat cubre tanto la tabla como sus índices; se
+            # agrupan bajo la tabla para que el total sea el costo real.
+            row = con.execute(
+                """
+                SELECT COALESCE(SUM(pgsize), 0) FROM dbstat
+                 WHERE name = ?
+                    OR name IN (SELECT name FROM sqlite_master
+                                 WHERE type = 'index' AND tbl_name = ?)
+                """,
+                (tbl, tbl),
+            ).fetchone()
+            sizes[tbl] = int(row[0]) if row else 0
+        except sqlite3.OperationalError:
+            sizes[tbl] = 0
+    return sizes
+
+
+def _table_bytes_estimated(con, tables: list[str]) -> dict[str, int]:
+    """
+    Estimación por muestreo, para cuando `dbstat` no está disponible.
+
+    Mide el largo en bytes de cada columna sobre una muestra y lo extrapola por
+    la cantidad de filas. No contempla el peso de los índices ni el overhead de
+    página, así que subestima: sirve para ordenar tablas por peso relativo, que
+    es lo que hace falta para decidir qué purgar.
+    """
+    sizes: dict[str, int] = {}
+    for tbl in tables:
+        try:
+            cols = [r[1] for r in con.execute(f"PRAGMA table_info({tbl})")]
+            if not cols:
+                sizes[tbl] = 0
+                continue
+
+            total_rows = con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            if total_rows == 0:
+                sizes[tbl] = 0
+                continue
+
+            # CAST a BLOB para contar bytes y no caracteres.
+            expr = " + ".join(
+                f'COALESCE(LENGTH(CAST("{c}" AS BLOB)), 0)' for c in cols
+            )
+            row = con.execute(
+                f"SELECT COALESCE(SUM({expr}), 0), COUNT(*) "
+                f"FROM (SELECT * FROM {tbl} LIMIT {_SIZE_SAMPLE_ROWS})"
+            ).fetchone()
+            sampled_bytes, sampled_rows = int(row[0]), int(row[1])
+            if sampled_rows == 0:
+                sizes[tbl] = 0
+                continue
+
+            sizes[tbl] = int(sampled_bytes / sampled_rows * total_rows)
+        except sqlite3.OperationalError:
+            sizes[tbl] = 0
+    return sizes
+
+
 @app.get("/admin/db-stats")
 def db_stats(request: Request):
     _require_superadmin(request)
@@ -1486,9 +1563,34 @@ def db_stats(request: Request):
         except Exception:
             pass
 
+        # Peso por tabla: sin esto no se puede decidir qué purgar, porque la
+        # cantidad de filas no dice nada del espacio que ocupan.
+        tables = list(counts.keys())
+        exact = _table_bytes_exact(con, tables)
+        table_bytes = exact if exact is not None else _table_bytes_estimated(con, tables)
+        table_sizes_mb = {t: round(b / 1e6, 2) for t, b in table_bytes.items()}
+
+        # Antigüedad por tabla, para saber cuánto libera cada ventana de corte.
+        AGE_COLUMNS = {
+            "predictions": "predicted_at_utc",
+            "prediction_shap": "predicted_at_utc",
+            "actuals": "settled_at_utc",
+            "weather_obs": "valid_utc",
+        }
+        table_dates: dict[str, dict[str, str | None]] = {}
+        for tbl, col in AGE_COLUMNS.items():
+            try:
+                row = con.execute(f"SELECT MIN({col}), MAX({col}) FROM {tbl}").fetchone()
+                table_dates[tbl] = {"first": row[0], "last": row[1]} if row else {}
+            except sqlite3.OperationalError:
+                continue
+
         return {
             "db_size_mb": round(size_mb, 2),
             "table_counts": counts,
+            "table_sizes_mb": table_sizes_mb,
+            "table_sizes_source": "dbstat" if exact is not None else "sampled",
+            "table_dates": table_dates,
             "prediction_dates": date_range,
         }
     finally:
