@@ -41,6 +41,27 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
+
+def _require_secret(name: str) -> str:
+    """
+    Lee una variable de entorno obligatoria o aborta el arranque.
+
+    Los secretos no llevan valor por defecto a propósito. Un default convierte
+    una variable faltante en un arranque exitoso con una credencial conocida —
+    el servicio queda en pie y nada avisa. Es preferible que el contenedor no
+    levante: Cloud Run deja la revisión anterior sirviendo y el error queda en
+    los logs del despliegue.
+    """
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(
+            f"Falta la variable de entorno obligatoria {name}. "
+            "Los secretos se inyectan desde Secret Manager con --set-secrets; "
+            "ver deploy.sh y docs/SECRETS.md."
+        )
+    return value
+
+
 GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 _TMP_DB = Path("/tmp/live_data.db")
 _BUNDLED_DB = Path(__file__).parent / "live_data.db"
@@ -117,10 +138,15 @@ def _init_users_db() -> None:
             updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
         );
     """)
-    # Seed initial users from env vars (idempotent)
+    # Alta inicial de usuarios desde el entorno.
+    #
+    # Es idempotente: sólo inserta si el usuario no existe. Cambiar estas
+    # variables NO rota la contraseña de una cuenta ya creada — users.db
+    # persiste en GCS entre despliegues. Para rotar hay que actualizar la fila,
+    # vía PATCH /admin/users/{username}. Ver docs/SECRETS.md.
     seeds = [
-        (os.getenv("API_USERNAME", "admin"),  os.getenv("API_PASSWORD", "ontimeai2026"),  "superadmin"),
-        (os.getenv("API_USERNAME_VIEWER", "viewer"), os.getenv("API_PASSWORD_VIEWER", "viewer2026"), "user"),
+        (_require_secret("API_USERNAME"), _require_secret("API_PASSWORD"), "superadmin"),
+        (_require_secret("API_USERNAME_VIEWER"), _require_secret("API_PASSWORD_VIEWER"), "user"),
     ]
     for username, password, role in seeds:
         if username and not con.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
@@ -287,7 +313,7 @@ ARTIFACT_PATH = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["4year_v9"])
 
 # ── Auth ───────────────────────────────────────────────────────────────────
 
-JWT_SECRET = os.getenv("JWT_SECRET_KEY", "ontimeai-dev-secret-change-in-prod-32chars")
+JWT_SECRET = _require_secret("JWT_SECRET_KEY")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 8
 
