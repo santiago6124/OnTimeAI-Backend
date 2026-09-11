@@ -21,14 +21,23 @@ jobs:
           # Misma versión que produccion (Dockerfile y Dockerfile.job).
           python-version: "3.11"
           cache: pip
-          cache-dependency-path: requirements.txt
+          cache-dependency-path: |
+            requirements-api.txt
+            requirements.txt
 
       - name: Instalar libomp
         # LightGBM lo enlaza en runtime; sin esto el import falla.
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libomp-dev
 
       - name: Instalar dependencias
-        run: pip install -r requirements.txt
+        # Hacen falta los dos archivos y no son intercambiables:
+        #   requirements-api.txt  → runtime de producción; es el que instalan
+        #                           ambos Dockerfiles. Trae fastapi, dotenv y jose.
+        #   requirements.txt      → entrenamiento y desarrollo. Trae pytest y optuna.
+        # Cualquier test que importe `api` necesita el primero; pytest sale del
+        # segundo. Se instalan en un solo comando para que pip resuelva las dos
+        # listas de restricciones a la vez (p. ej. lightgbm ==4.5.0 vs >=4.0).
+        run: pip install -r requirements-api.txt -r requirements.txt
 
       - name: Tests
         # test_api.py queda afuera: su bootstrap falla al colectar con
