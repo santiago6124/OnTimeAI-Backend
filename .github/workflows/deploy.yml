@@ -112,7 +112,7 @@ jobs:
         # Comparten imagen y difieren sólo en la clave de AeroAPI, para repartir
         # el rate limit entre ciclos intercalados.
         run: |
-          for JOB in ontimeai-live-pull ontimeai-live-pull-2; do
+          for JOB in ontimeai-live-pull ontimeai-live-pull-2 ontimeai-watchdog; do
             case "$JOB" in
               ontimeai-live-pull)   SECRET=aeroapi-key ;;
               ontimeai-live-pull-2) SECRET=aeroapi-key-2 ;;
@@ -126,6 +126,68 @@ jobs:
               --set-secrets "AEROAPI_KEY=${SECRET}:latest" \
               --project="$PROJECT_ID" --quiet
           done
+
+      - name: Construir imagen del vigia
+        run: |
+          BUILD_ID=$(gcloud builds submit \
+            --config cloudbuild-watchdog.yaml \
+            --async --format='value(id)' \
+            --project="$PROJECT_ID" --quiet)
+          echo "Build $BUILD_ID"
+          while true; do
+            STATUS=$(gcloud builds describe "$BUILD_ID" \
+              --project="$PROJECT_ID" --format='value(status)')
+            case "$STATUS" in
+              SUCCESS)
+                echo "Build OK"; break ;;
+              FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED)
+                echo "Build $STATUS"
+                echo "https://console.cloud.google.com/cloud-build/builds/$BUILD_ID?project=$PROJECT_ID"
+                exit 1 ;;
+              *)
+                sleep 15 ;;
+            esac
+          done
+
+      - name: Desplegar el vigia
+        # La URL del backend se resuelve en tiempo de deploy en vez de
+        # hardcodearse: ya cambio una vez con la migracion de proyecto GCP.
+        run: |
+          BACKEND_URL=$(gcloud run services describe ontimeai-backend \
+            --region "$REGION" --project "$PROJECT_ID" \
+            --format='value(status.url)')
+          gcloud run jobs deploy ontimeai-watchdog \
+            --image "gcr.io/$PROJECT_ID/ontimeai-watchdog:latest" \
+            --region "$REGION" \
+            --cpu 1 --memory 512Mi \
+            --max-retries 1 --task-timeout 300 \
+            --set-env-vars "GCS_BUCKET=ontimeai-prod-live-db,BACKEND_URL=$BACKEND_URL,API_USERNAME=admin" \
+            --set-secrets "TELEGRAM_BOT_TOKEN=telegram-bot-token:latest,TELEGRAM_CHAT_ID=telegram-chat-id:latest,API_PASSWORD=api-password:latest" \
+            --project="$PROJECT_ID" --quiet
+
+      - name: Asegurar el scheduler del vigia
+        # Idempotente, para que el scheduler quede versionado y se pueda
+        # recrear si se migra de proyecto GCP otra vez.
+        #
+        # El cron esquiva los minutos ya ocupados (:00 :10 :15 :20 :30 :40 :45
+        # :50 entre keepalive, harvester y los dos predictores). El vigia solo
+        # lee, asi que no compite por la base, pero separarlo mantiene los logs
+        # legibles.
+        run: |
+          SA="871707213932-compute@developer.gserviceaccount.com"
+          URI="https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT_ID/jobs/ontimeai-watchdog:run"
+          if gcloud scheduler jobs describe ontimeai-watchdog-scheduler \
+               --location="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1; then
+            ACTION=update
+          else
+            ACTION=create
+          fi
+          gcloud scheduler jobs $ACTION http ontimeai-watchdog-scheduler \
+            --location="$REGION" \
+            --schedule="7,22,37,52 * * * *" \
+            --uri="$URI" --http-method=POST \
+            --oauth-service-account-email="$SA" \
+            --project="$PROJECT_ID" --quiet
 
       - name: Resumen
         run: |
