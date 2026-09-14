@@ -291,13 +291,17 @@ def _refresh_db_from_gcs(*, force: bool = False) -> bool:
 
     blocking = force or not _TMP_DB.exists()
     if not _DB_REFRESH_LOCK.acquire(blocking=blocking):
+        # Otro hilo esta descargando. Si esto se repite ciclo tras ciclo, hay
+        # un hilo trabado reteniendo el lock y el backend nunca se actualiza.
+        print("[db_refresh] abortado: el lock ya esta tomado por otro hilo")
         return False
 
     snapshot_path: Path | None = None
     try:
-        # Another request may have completed the refresh while this one waited.
+        # Otro pedido pudo haber completado el refresh mientras este esperaba.
         now = time.monotonic()
         if not force and now - _db_last_refresh < _DB_REFRESH_INTERVAL:
+            print("[db_refresh] abortado: otro hilo refresco mientras esperaba")
             return False
 
         snapshot_path = _temporary_db_path(_TMP_DB)
@@ -330,16 +334,32 @@ def _refresh_db_from_gcs(*, force: bool = False) -> bool:
 
 
 def _start_db_refresh() -> None:
-    """Start at most one non-blocking periodic refresh per API process."""
+    """
+    Arranca a lo sumo un refresh periodico no bloqueante por proceso.
+
+    Cada salida temprana se registra. Sin eso, un refresh que no ocurre es
+    indistinguible de uno que ocurre: el backend responde 200 con datos viejos
+    y no queda rastro de por que no se actualizo. Ya paso dos veces.
+    """
     global _db_refresh_thread
-    if not GCS_BUCKET or not _TMP_DB.exists():
+    if not GCS_BUCKET:
         return
-    if time.monotonic() - _db_last_refresh < _DB_REFRESH_INTERVAL:
+    if not _TMP_DB.exists():
+        print("[db_refresh] no arranca: falta el archivo local")
+        return
+
+    age = time.monotonic() - _db_last_refresh
+    if age < _DB_REFRESH_INTERVAL:
         return
 
     with _DB_REFRESH_THREAD_LOCK:
         if _db_refresh_thread is not None and _db_refresh_thread.is_alive():
+            print(
+                f"[db_refresh] no arranca: ya hay un hilo corriendo desde hace "
+                f"{age:.0f} s"
+            )
             return
+        print(f"[db_refresh] arrancando (ultimo refresh hace {age:.0f} s)")
         _db_refresh_thread = threading.Thread(
             target=_refresh_db_from_gcs,
             name="ontimeai-db-refresh",
@@ -1675,6 +1695,20 @@ def db_stats(request: Request):
             "refresh": {
                 "last_ok_utc": _db_last_refresh_ok_utc,
                 "last_error": _db_last_refresh_error,
+                # Estado interno del refresh. Sin esto habia que inferirlo de
+                # los logs, y un refresh que no se intenta no deja ninguno.
+                "seconds_since_last": round(
+                    time.monotonic() - _db_last_refresh, 1
+                ),
+                "interval_seconds": _DB_REFRESH_INTERVAL,
+                "is_due": (
+                    time.monotonic() - _db_last_refresh >= _DB_REFRESH_INTERVAL
+                ),
+                "thread_alive": bool(
+                    _db_refresh_thread is not None
+                    and _db_refresh_thread.is_alive()
+                ),
+                "lock_held": _DB_REFRESH_LOCK.locked(),
             },
         }
     finally:
