@@ -93,7 +93,7 @@ jobs:
             --memory 4Gi --cpu 2 \
             --min-instances 0 --max-instances 1 \
             --timeout 120 \
-            --set-env-vars "ACTIVE_MODEL=4year_v9,GCS_BUCKET=ontimeai-prod-live-db,API_USERNAME=admin,API_USERNAME_VIEWER=viewer" \
+            --set-env-vars "^##^ACTIVE_MODEL=4year_v9##GCS_BUCKET=ontimeai-prod-live-db##API_USERNAME=admin##API_USERNAME_VIEWER=viewer##GOOGLE_CLIENT_ID=871707213932-03a34jfb56ur6suc88rbuh5qelm6mbt3.apps.googleusercontent.com##ALLOWED_ORIGINS=http://localhost:3000,http://127.0.0.1:3000,https://ontimeai-frontend-ldcqq4xt6a-uc.a.run.app,https://ontimeai-frontend-871707213932.us-central1.run.app,capacitor://localhost" \
             --set-secrets "JWT_SECRET_KEY=jwt-secret-key:latest,API_PASSWORD=api-password:latest,API_PASSWORD_VIEWER=api-password-viewer:latest" \
             --project="$PROJECT_ID" --quiet
 
