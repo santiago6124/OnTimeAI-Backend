@@ -202,6 +202,8 @@ def _download_db_snapshot(destination: Path) -> int:
     """Download one immutable GCS generation into ``destination``."""
     from google.cloud import storage as gcs
 
+    from google.cloud.storage.retry import DEFAULT_RETRY
+
     blob = gcs.Client().bucket(GCS_BUCKET).blob("live_data.db")
     blob.reload()
     generation = int(blob.generation)
@@ -209,6 +211,11 @@ def _download_db_snapshot(destination: Path) -> int:
         str(destination),
         if_generation_match=generation,
         timeout=_DB_DOWNLOAD_TIMEOUT,
+        # `timeout` acota cada request; el corte real venia del deadline de la
+        # politica de reintentos, que tambien vale 120 s por defecto y es lo que
+        # aparecia en el log como "Timeout of 120.0s exceeded". Subir solo
+        # `timeout` no cambiaba nada.
+        retry=DEFAULT_RETRY.with_deadline(_DB_DOWNLOAD_TIMEOUT),
     )
     return generation
 
