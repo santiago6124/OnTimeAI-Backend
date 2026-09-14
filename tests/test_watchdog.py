@@ -129,3 +129,29 @@ class TestMinutesSince:
         # Los predictores corren cada 15 min: el umbral tiene que dejar pasar
         # un ciclo lento sin gritar, pero detectar una caída real.
         assert watchdog.STALE_AFTER_MIN >= 30
+
+
+class TestEnvStrip:
+    """
+    Secret Manager inyecta los bytes crudos del secreto. Un valor guardado con
+    `print()` o desde un archivo arrastra un salto de linea, y ese caracter
+    llega al destino. La primera corrida del vigia en produccion fallo con 401
+    por exactamente esto.
+    """
+
+    def test_saca_el_salto_de_linea_final(self, monkeypatch) -> None:
+        monkeypatch.setenv("UNA_VAR", "secreto\n")
+        assert watchdog._env("UNA_VAR") == "secreto"
+
+    def test_saca_espacios_de_ambos_extremos(self, monkeypatch) -> None:
+        monkeypatch.setenv("UNA_VAR", "  secreto \n")
+        assert watchdog._env("UNA_VAR") == "secreto"
+
+    def test_tambien_limpia_los_valores_por_defecto(self, monkeypatch) -> None:
+        monkeypatch.delenv("OTRA_VAR", raising=False)
+        assert watchdog._env("OTRA_VAR", " fallback\n") == "fallback"
+
+    def test_una_variable_obligatoria_que_falta_corta_el_arranque(self, monkeypatch) -> None:
+        monkeypatch.delenv("FALTANTE", raising=False)
+        with pytest.raises(KeyError):
+            watchdog._env("FALTANTE")
