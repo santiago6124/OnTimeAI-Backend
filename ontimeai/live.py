@@ -393,13 +393,18 @@ def fetch_airport_flights(airport_icao: str, kind: str, start_iso: str, end_iso:
 
 # ----------------------------- weather from IEM ---------------------------
 
-# Cache en proceso del ultimo fetch de METAR.
+# Cache en proceso de los fetch de METAR, por red.
 #
 # Ante un conflicto CAS, live_job rehace el pipeline completo dentro del mismo
-# proceso, y eso incluia volver a pedir el clima de ~130 aeropuertos. El METAR
+# proceso, y eso incluye volver a pedir el clima de ~130 aeropuertos. El METAR
 # se publica cada ~1 hora: repetir el pedido minutos despues devuelve lo mismo y
-# solo agrega latencia al ciclo, que es justamente lo que dispara mas conflictos.
-_IEM_CACHE: tuple[frozenset[str], float, pd.DataFrame] | None = None
+# solo agrega latencia al ciclo, que es lo que dispara mas conflictos.
+#
+# La clave es (red, estaciones de esa red) y no el conjunto completo. Entre un
+# intento y el siguiente la base ganadora trae vuelos nuevos, asi que el total
+# de aeropuertos cambia —medido: 131 y luego 133— y una clave global nunca
+# acierta. Por red, en cambio, cambian una o dos de 48.
+_IEM_CACHE: dict[tuple[str, frozenset[str]], tuple[float, pd.DataFrame]] = {}
 _IEM_CACHE_TTL_S = float(os.environ.get("IEM_CACHE_TTL_S", "600"))
 
 
@@ -412,16 +417,6 @@ def fetch_iem_obs(stations: set[str], start_utc: pd.Timestamp, end_utc: pd.Times
     Reutiliza el resultado si se pidio el mismo conjunto de estaciones hace menos
     de `_IEM_CACHE_TTL_S` segundos.
     """
-    global _IEM_CACHE
-
-    key = frozenset(stations)
-    if _IEM_CACHE is not None:
-        cached_key, cached_at, cached_df = _IEM_CACHE
-        age = time.monotonic() - cached_at
-        if cached_key == key and age < _IEM_CACHE_TTL_S:
-            print(f"  IEM: reutilizando el fetch de hace {age:.0f} s ({len(cached_df)} obs)")
-            return cached_df.copy()
-
     base = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
     frames = []
 
@@ -434,7 +429,15 @@ def fetch_iem_obs(stations: set[str], start_utc: pd.Timestamp, end_utc: pd.Times
 
     print(f"  IEM: {len(stations)} airports → {len(by_network)} network requests")
 
+    reused = 0
     for net, net_stations in sorted(by_network.items()):
+        cache_key = (net, frozenset(net_stations))
+        hit = _IEM_CACHE.get(cache_key)
+        if hit is not None and time.monotonic() - hit[0] < _IEM_CACHE_TTL_S:
+            frames.append(hit[1])
+            reused += 1
+            continue
+
         common = [
             ("year1", str(start_utc.year)), ("month1", str(start_utc.month)), ("day1", str(start_utc.day)),
             ("year2", str(end_utc.year)), ("month2", str(end_utc.month)), ("day2", str(end_utc.day)),
@@ -467,25 +470,26 @@ def fetch_iem_obs(stations: set[str], start_utc: pd.Timestamp, end_utc: pd.Times
                 df["wx_precip_flag"] = (df["p01m"].fillna(0) > 0).astype(int)
                 df["wx_low_vis_flag"] = (df["vsby"] < 3).astype(int)
                 df["wx_strong_wind_flag"] = ((df["sknt"] >= 20) | (df["gust"] >= 30)).astype(int)
-                frames.append(df[["station", "valid", "tmpc", "dwpc", "relh", "drct", "sknt", "alti",
-                                  "p01m", "vsby", "gust", "wxcodes",
-                                  "wx_precip_flag", "wx_low_vis_flag", "wx_strong_wind_flag"]])
+                net_frame = df[["station", "valid", "tmpc", "dwpc", "relh", "drct", "sknt", "alti",
+                                "p01m", "vsby", "gust", "wxcodes",
+                                "wx_precip_flag", "wx_low_vis_flag", "wx_strong_wind_flag"]]
+                _IEM_CACHE[cache_key] = (time.monotonic(), net_frame)
+                frames.append(net_frame)
                 break
             except Exception as e:
                 print(f"  IEM {net}: FAIL ({e})")
                 break
         time.sleep(0.5)
+    if reused:
+        print(f"  IEM: {reused}/{len(by_network)} redes reutilizadas del cache")
     if not frames:
-        result = pd.DataFrame()
-    else:
-        result = (
-            pd.concat(frames, ignore_index=True)
-            .drop_duplicates(["station", "valid"])
-            .sort_values(["station", "valid"])
-            .reset_index(drop=True)
-        )
-    _IEM_CACHE = (key, time.monotonic(), result)
-    return result.copy()
+        return pd.DataFrame()
+    return (
+        pd.concat(frames, ignore_index=True)
+        .drop_duplicates(["station", "valid"])
+        .sort_values(["station", "valid"])
+        .reset_index(drop=True)
+    )
 
 
 def upsert_weather(conn: sqlite3.Connection, wx: pd.DataFrame) -> int:

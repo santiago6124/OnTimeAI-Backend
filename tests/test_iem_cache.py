@@ -19,9 +19,9 @@ from ontimeai import live
 
 @pytest.fixture(autouse=True)
 def _clear_cache():
-    live._IEM_CACHE = None
+    live._IEM_CACHE.clear()
     yield
-    live._IEM_CACHE = None
+    live._IEM_CACHE.clear()
 
 
 def _fake_response(monkeypatch, counter: list[int]):
@@ -76,17 +76,33 @@ def test_no_devuelve_el_mismo_objeto_que_cachea(monkeypatch) -> None:
     assert segundo.loc[0, "tmpc"] == 20.0, "el cache quedo contaminado"
 
 
-def test_vuelve_a_pedir_si_cambia_el_conjunto_de_estaciones(monkeypatch) -> None:
+def test_reutiliza_las_redes_que_no_cambiaron(monkeypatch) -> None:
+    """
+    El caso que rompio la primera version de este cache.
+
+    Entre un intento y el siguiente, la base ganadora trae vuelos nuevos y el
+    total de aeropuertos cambia: medido en produccion, 131 y luego 133. Una
+    clave sobre el conjunto completo nunca acertaba. Por red, solo se vuelve a
+    pedir aquella cuyas estaciones cambiaron.
+    """
     calls = [0]
     _fake_response(monkeypatch, calls)
     start = pd.Timestamp("2026-09-14T10:00:00")
     end = pd.Timestamp("2026-09-14T14:00:00")
 
-    live.fetch_iem_obs({"ATL"}, start, end)
-    tras_primero = calls[0]
-    live.fetch_iem_obs({"ATL", "MIA"}, start, end)
+    # Dos redes distintas, para que agregar una estacion a una no invalide la otra.
+    monkeypatch.setitem(live.NETWORK_BY_AIRPORT, "ATL", "GA_ASOS")
+    monkeypatch.setitem(live.NETWORK_BY_AIRPORT, "MIA", "FL_ASOS")
+    monkeypatch.setitem(live.NETWORK_BY_AIRPORT, "MCO", "FL_ASOS")
 
-    assert calls[0] > tras_primero, "un conjunto distinto exige un pedido nuevo"
+    live.fetch_iem_obs({"ATL", "MIA"}, start, end)
+    tras_primero = calls[0]
+
+    # Se suma un aeropuerto a FL_ASOS; GA_ASOS deberia salir del cache.
+    live.fetch_iem_obs({"ATL", "MIA", "MCO"}, start, end)
+
+    nuevos = calls[0] - tras_primero
+    assert nuevos == 1, f"deberia repedirse solo la red que cambio, se pidieron {nuevos}"
 
 
 def test_vuelve_a_pedir_cuando_vence_el_ttl(monkeypatch) -> None:
@@ -99,8 +115,10 @@ def test_vuelve_a_pedir_cuando_vence_el_ttl(monkeypatch) -> None:
     tras_primero = calls[0]
 
     # El cache guarda time.monotonic(); se simula el paso del TTL.
-    key, cached_at, df = live._IEM_CACHE
-    live._IEM_CACHE = (key, cached_at - live._IEM_CACHE_TTL_S - 1, df)
+    live._IEM_CACHE = {
+        k: (at - live._IEM_CACHE_TTL_S - 1, df)
+        for k, (at, df) in live._IEM_CACHE.items()
+    }
 
     live.fetch_iem_obs({"ATL"}, start, end)
     assert calls[0] > tras_primero, "pasado el TTL hay que volver a pedir"
