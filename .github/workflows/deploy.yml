@@ -67,6 +67,10 @@ jobs:
           done
 
       - name: Desplegar backend
+        # timeout 120 s: el refresh de la base ocurre dentro del pedido
+        # (ver get_db). Con CPU asignada tarda ~20 s sobre ~700 MB, pero
+        # conviene margen si la base crece.
+        #
         # 4Gi de memoria, no 2: en Cloud Run /tmp es RAM, y durante un
         # refresh conviven la base actual y el snapshot que se descarga.
         # Con la base en ~680 MB eso son 1,4 GB solo de archivos, mas el
@@ -88,7 +92,7 @@ jobs:
             --allow-unauthenticated \
             --memory 4Gi --cpu 2 \
             --min-instances 0 --max-instances 1 \
-            --timeout 60 \
+            --timeout 120 \
             --set-env-vars "ACTIVE_MODEL=4year_v9,GCS_BUCKET=ontimeai-prod-live-db,API_USERNAME=admin,API_USERNAME_VIEWER=viewer" \
             --set-secrets "JWT_SECRET_KEY=jwt-secret-key:latest,API_PASSWORD=api-password:latest,API_PASSWORD_VIEWER=api-password-viewer:latest" \
             --project="$PROJECT_ID" --quiet

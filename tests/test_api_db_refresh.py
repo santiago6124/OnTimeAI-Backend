@@ -38,8 +38,6 @@ def refresh_env(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(api, "_TMP_DB", target)
     monkeypatch.setattr(api, "DB_PATH", target)
     monkeypatch.setattr(api, "_DB_REFRESH_LOCK", threading.Lock())
-    monkeypatch.setattr(api, "_DB_REFRESH_THREAD_LOCK", threading.Lock())
-    monkeypatch.setattr(api, "_db_refresh_thread", None)
     # No alcanza con 0.0: el disparador es
     # `time.monotonic() - _db_last_refresh < _DB_REFRESH_INTERVAL`, y
     # `time.monotonic()` cuenta desde el arranque de la máquina. En un runner
@@ -98,44 +96,81 @@ def test_invalid_download_never_replaces_active_snapshot(
     assert not list(tmp_path.glob(".live_data.db.*.tmp"))
 
 
-def test_concurrent_request_keeps_reading_previous_complete_snapshot(
+def test_refresh_is_synchronous_so_it_gets_cpu(
     refresh_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """
+    El refresh ocurre dentro del pedido, no en un hilo de fondo.
+
+    Antes se delegaba a un hilo para no demorar la respuesta. Esa decision es
+    razonable en general, pero no sobrevive a Cloud Run: con throttling —el
+    default— el contenedor recibe CPU solo mientras procesa un pedido. El hilo
+    quedaba sin CPU apenas se enviaba la respuesta y la descarga de ~700 MB caia
+    a ~2 MB/s hasta morir en el deadline. El backend servia datos de horas
+    atras respondiendo 200, sin ninguna senal.
+
+    El precio es que un pedido cada ~16 minutos espera la descarga. En la
+    practica lo paga el vigia, que es quien mas consulta.
+    """
     source = tmp_path / "new.db"
     _create_snapshot(source, "new")
-    download_started = threading.Event()
-    finish_download = threading.Event()
-    download_count = 0
+    downloads = 0
+
+    def download(destination: Path) -> int:
+        nonlocal downloads
+        downloads += 1
+        shutil.copyfile(source, destination)
+        return 44
+
+    monkeypatch.setattr(api, "_download_db_snapshot", download)
+
+    # El pedido no vuelve hasta tener el snapshot nuevo.
+    with api.get_db() as con:
+        assert _read_marker(con) == "new"
+    assert downloads == 1
+
+
+def test_concurrent_requests_do_not_pile_up_on_the_download(
+    refresh_env: Path, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Solo el primer pedido vencido paga la espera.
+
+    El lock es no bloqueante: mientras uno descarga, los demas siguen sirviendo
+    el snapshot anterior en vez de encolarse. Sin eso, una descarga lenta
+    convertiria cada pedido concurrente en una espera de minutos.
+    """
+    source = tmp_path / "new.db"
+    _create_snapshot(source, "new")
+    in_download = threading.Event()
+    release = threading.Event()
+    downloads = 0
 
     def slow_download(destination: Path) -> int:
-        nonlocal download_count
-        download_count += 1
-        destination.write_bytes(b"partial download")
-        download_started.set()
-        assert finish_download.wait(timeout=5)
+        nonlocal downloads
+        downloads += 1
+        in_download.set()
+        assert release.wait(timeout=5)
         shutil.copyfile(source, destination)
         return 44
 
     monkeypatch.setattr(api, "_download_db_snapshot", slow_download)
 
-    # The request starts the refresh in the background and immediately opens
-    # the previous snapshot instead of waiting for the large GCS download.
-    with api.get_db() as active:
-        assert _read_marker(active) == "old"
-    assert download_started.wait(timeout=5)
+    first = threading.Thread(target=lambda: api.get_db().close(), daemon=True)
+    first.start()
+    assert in_download.wait(timeout=5), "el primer pedido deberia estar descargando"
 
-    # Concurrent requests keep reading the untouched active DB.
-    with api.get_db() as active:
-        assert _read_marker(active) == "old"
+    # Mientras tanto, otro pedido responde ya con el snapshot viejo.
+    with api.get_db() as con:
+        assert _read_marker(con) == "old"
 
-    finish_download.set()
-    refresh_thread = api._db_refresh_thread
-    assert refresh_thread is not None
-    refresh_thread.join(timeout=5)
-    assert not refresh_thread.is_alive()
-    assert download_count == 1
-    with api.get_db() as installed:
-        assert _read_marker(installed) == "new"
+    release.set()
+    first.join(timeout=5)
+    assert not first.is_alive()
+    assert downloads == 1, "no deberia descargarse dos veces en paralelo"
+
+    with api.get_db() as con:
+        assert _read_marker(con) == "new"
 
 
 def test_download_retries_when_a_job_replaces_the_generation(

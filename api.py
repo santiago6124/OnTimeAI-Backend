@@ -82,8 +82,6 @@ _db_last_refresh: float = 0.0
 _db_last_health_check: float = 0.0
 _DB_HEALTH_INTERVAL = 60  # re-verify DB health every 60 s
 _DB_REFRESH_LOCK = threading.Lock()
-_DB_REFRESH_THREAD_LOCK = threading.Lock()
-_db_refresh_thread: threading.Thread | None = None
 # Salud del refresh. Un fallo dejaba al backend sirviendo el snapshot anterior
 # con respuesta 200 y sin rastro fuera de los logs; se expone en
 # /admin/db-stats para que la UI pueda mostrar que los datos estan viejos.
@@ -333,41 +331,6 @@ def _refresh_db_from_gcs(*, force: bool = False) -> bool:
         _DB_REFRESH_LOCK.release()
 
 
-def _start_db_refresh() -> None:
-    """
-    Arranca a lo sumo un refresh periodico no bloqueante por proceso.
-
-    Cada salida temprana se registra. Sin eso, un refresh que no ocurre es
-    indistinguible de uno que ocurre: el backend responde 200 con datos viejos
-    y no queda rastro de por que no se actualizo. Ya paso dos veces.
-    """
-    global _db_refresh_thread
-    if not GCS_BUCKET:
-        return
-    if not _TMP_DB.exists():
-        print("[db_refresh] no arranca: falta el archivo local")
-        return
-
-    age = time.monotonic() - _db_last_refresh
-    if age < _DB_REFRESH_INTERVAL:
-        return
-
-    with _DB_REFRESH_THREAD_LOCK:
-        if _db_refresh_thread is not None and _db_refresh_thread.is_alive():
-            print(
-                f"[db_refresh] no arranca: ya hay un hilo corriendo desde hace "
-                f"{age:.0f} s"
-            )
-            return
-        print(f"[db_refresh] arrancando (ultimo refresh hace {age:.0f} s)")
-        _db_refresh_thread = threading.Thread(
-            target=_refresh_db_from_gcs,
-            name="ontimeai-db-refresh",
-            daemon=True,
-        )
-        _db_refresh_thread.start()
-
-
 def _verify_db_health(path: Path) -> bool:
     """Read an actual data page to catch corruption beyond the schema."""
     try:
@@ -546,7 +509,18 @@ def get_db() -> sqlite3.Connection:
     if GCS_BUCKET and not _TMP_DB.exists():
         _refresh_db_from_gcs(force=True)
     else:
-        _start_db_refresh()
+        # Sincrono a proposito, no en un hilo de fondo.
+        #
+        # Cloud Run con throttling —el default— asigna CPU solo mientras se
+        # procesa un pedido. Un hilo de fondo arrancado por un request queda
+        # sin CPU apenas se envia la respuesta, y la descarga de ~700 MB cae a
+        # ~2 MB/s hasta morir en el deadline. Eso dejaba al backend sirviendo
+        # datos de horas atras, con respuesta 200 y sin senal alguna.
+        #
+        # Haciendolo dentro del request hay CPU asignada y la descarga tarda
+        # ~20 s. El lock es no bloqueante: solo el primer pedido vencido paga
+        # la espera, los concurrentes siguen sirviendo el snapshot anterior.
+        _refresh_db_from_gcs()
 
     if GCS_BUCKET and (time.monotonic() - _db_last_health_check > _DB_HEALTH_INTERVAL):
         if not _verify_db_health(_TMP_DB):
@@ -1704,10 +1678,8 @@ def db_stats(request: Request):
                 "is_due": (
                     time.monotonic() - _db_last_refresh >= _DB_REFRESH_INTERVAL
                 ),
-                "thread_alive": bool(
-                    _db_refresh_thread is not None
-                    and _db_refresh_thread.is_alive()
-                ),
+                # Refresco sincrono: si el lock esta tomado, hay un pedido
+                # descargando ahora mismo.
                 "lock_held": _DB_REFRESH_LOCK.locked(),
             },
         }
