@@ -67,12 +67,24 @@ _TMP_DB = Path("/tmp/live_data.db")
 _BUNDLED_DB = Path(__file__).parent / "live_data.db"
 DB_PATH = _TMP_DB if GCS_BUCKET else _BUNDLED_DB
 _DB_REFRESH_INTERVAL = 1000  # refresh from GCS every ~16 min
+# Segundos para bajar el snapshot completo desde GCS.
+#
+# El default de google-cloud-storage son 120 s, que con la base en ~670 MB se
+# quedaba corto: la descarga se cortaba a mitad con IncompleteRead y el backend
+# seguia sirviendo el snapshot anterior sin avisar. Llego a servir datos de dos
+# dias atras respondiendo 200.
+_DB_DOWNLOAD_TIMEOUT = max(60, int(os.getenv("DB_DOWNLOAD_TIMEOUT", "300")))
 _db_last_refresh: float = 0.0
 _db_last_health_check: float = 0.0
 _DB_HEALTH_INTERVAL = 60  # re-verify DB health every 60 s
 _DB_REFRESH_LOCK = threading.Lock()
 _DB_REFRESH_THREAD_LOCK = threading.Lock()
 _db_refresh_thread: threading.Thread | None = None
+# Salud del refresh. Un fallo dejaba al backend sirviendo el snapshot anterior
+# con respuesta 200 y sin rastro fuera de los logs; se expone en
+# /admin/db-stats para que la UI pueda mostrar que los datos estan viejos.
+_db_last_refresh_ok_utc: str | None = None
+_db_last_refresh_error: str | None = None
 
 # Users DB (separate from live_data.db so live job never overwrites it)
 USERS_DB_PATH = Path("/tmp/users.db") if GCS_BUCKET else Path(__file__).parent / "users.db"
@@ -196,6 +208,7 @@ def _download_db_snapshot(destination: Path) -> int:
     blob.download_to_filename(
         str(destination),
         if_generation_match=generation,
+        timeout=_DB_DOWNLOAD_TIMEOUT,
     )
     return generation
 
@@ -230,7 +243,7 @@ def _refresh_db_from_gcs(*, force: bool = False) -> bool:
     previous immutable snapshot. Forced refreshes (startup/recovery) wait for
     the in-flight installer because no known-good snapshot may be available.
     """
-    global _db_last_refresh
+    global _db_last_refresh, _db_last_refresh_ok_utc, _db_last_refresh_error
     if not GCS_BUCKET:
         return False
 
@@ -261,12 +274,15 @@ def _refresh_db_from_gcs(*, force: bool = False) -> bool:
         os.replace(snapshot_path, _TMP_DB)
         snapshot_path = None
         _db_last_refresh = time.monotonic()
+        _db_last_refresh_ok_utc = datetime.now(timezone.utc).isoformat()
+        _db_last_refresh_error = None
         print(
             f"[db] refreshed from GCS generation={generation} "
             f"({_TMP_DB.stat().st_size / 1e6:.0f} MB)"
         )
         return True
     except Exception as e:
+        _db_last_refresh_error = f"{datetime.now(timezone.utc).isoformat()}: {e}"
         print(f"[db_refresh] failed: {e}")
         return False
     finally:
@@ -1618,6 +1634,10 @@ def db_stats(request: Request):
             "table_sizes_source": "dbstat" if exact is not None else "sampled",
             "table_dates": table_dates,
             "prediction_dates": date_range,
+            "refresh": {
+                "last_ok_utc": _db_last_refresh_ok_utc,
+                "last_error": _db_last_refresh_error,
+            },
         }
     finally:
         con.close()
