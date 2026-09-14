@@ -27,16 +27,31 @@ from datetime import datetime, timezone
 
 import requests
 
-GCS_BUCKET = os.environ["GCS_BUCKET"]
-DB_OBJECT = os.getenv("DB_OBJECT", "live_data.db")
-STATE_OBJECT = os.getenv("WATCHDOG_STATE_OBJECT", "watchdog_state.json")
-BACKEND_URL = os.environ["BACKEND_URL"].rstrip("/")
+def _env(name: str, default: str | None = None) -> str:
+    """
+    Lee una variable y le saca los espacios de los extremos.
 
-TELEGRAM_TOKEN = os.environ["TELEGRAM_BOT_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+    Los secretos de Secret Manager se inyectan como bytes crudos, sin tocar. Un
+    valor cargado con `print()` o desde un archivo termina con un salto de
+    linea, y ese caracter viaja hasta el destino: la primera corrida de este
+    vigia fallo con 401 porque intentaba loguearse con "<password>\n". El
+    backend no lo sufria porque ya hacia strip; este proceso tenia que hacer lo
+    mismo.
+    """
+    value = os.environ[name] if default is None else os.getenv(name, default)
+    return value.strip()
 
-API_USERNAME = os.getenv("API_USERNAME", "admin")
-API_PASSWORD = os.environ["API_PASSWORD"]
+
+GCS_BUCKET = _env("GCS_BUCKET")
+DB_OBJECT = _env("DB_OBJECT", "live_data.db")
+STATE_OBJECT = _env("WATCHDOG_STATE_OBJECT", "watchdog_state.json")
+BACKEND_URL = _env("BACKEND_URL").rstrip("/")
+
+TELEGRAM_TOKEN = _env("TELEGRAM_BOT_TOKEN")
+TELEGRAM_CHAT_ID = _env("TELEGRAM_CHAT_ID")
+
+API_USERNAME = _env("API_USERNAME", "admin")
+API_PASSWORD = _env("API_PASSWORD")
 
 # Los predictores corren cada 15 min. Tres ciclos perdidos es una señal clara y
 # deja margen para un ciclo lento o un reintento.
