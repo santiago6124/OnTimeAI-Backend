@@ -93,24 +93,26 @@ def test_upload_conflict_never_falls_back_to_unconditional_write(
     assert blob.upload_precondition == 42
 
 
-def test_cleanup_skips_vacuum_at_threshold(
+def test_cleanup_skips_vacuum_when_little_space_to_reclaim(
     tmp_path: Path,
     monkeypatch,
     capsys,
 ) -> None:
+    # Borrar unas pocas filas libera fracciones de MB, muy por debajo de
+    # cualquier umbral razonable: no justifica reescribir la base entera.
     target = tmp_path / "cleanup-skip.db"
     _cleanup_sqlite(target, old_rows=2)
     monkeypatch.setattr(live_job, "TMP_DB", target)
-    monkeypatch.setattr(live_job, "PRUNE_VACUUM_MIN_DELETED", 2)
+    monkeypatch.setattr(live_job, "PRUNE_VACUUM_MIN_FREE_MB", 50)
 
     live_job._cleanup_old_data()
 
     output = capsys.readouterr().out
-    assert "VACUUM skipped: 2 deleted rows" in output
+    assert "VACUUM skipped" in output
     assert "Running VACUUM" not in output
 
 
-def test_cleanup_runs_vacuum_above_threshold(
+def test_cleanup_runs_vacuum_when_space_is_reclaimable(
     tmp_path: Path,
     monkeypatch,
     capsys,
@@ -118,13 +120,44 @@ def test_cleanup_runs_vacuum_above_threshold(
     target = tmp_path / "cleanup-vacuum.db"
     _cleanup_sqlite(target, old_rows=3)
     monkeypatch.setattr(live_job, "TMP_DB", target)
-    monkeypatch.setattr(live_job, "PRUNE_VACUUM_MIN_DELETED", 2)
+    # Umbral en 0 MB: cualquier espacio liberado alcanza para disparar.
+    monkeypatch.setattr(live_job, "PRUNE_VACUUM_MIN_FREE_MB", 0)
 
     live_job._cleanup_old_data()
 
     output = capsys.readouterr().out
-    assert "Running VACUUM: 3 deleted rows" in output
+    assert "Running VACUUM" in output
     assert "post-VACUUM" in output
+
+
+def test_reclaimable_mb_tracks_the_sqlite_freelist(tmp_path: Path) -> None:
+    """
+    SQLite no achica el archivo al borrar: marca paginas como libres y las
+    reusa. Este es el dato que decide si conviene un VACUUM, y el umbral
+    anterior (cantidad de filas borradas) no lo reflejaba.
+    """
+    import sqlite3
+
+    target = tmp_path / "freelist.db"
+    con = sqlite3.connect(target)
+    con.execute("CREATE TABLE t(a TEXT)")
+    con.executemany("INSERT INTO t VALUES (?)", [("x" * 500,) for _ in range(5000)])
+    con.commit()
+    assert live_job._reclaimable_mb(con) == 0.0
+
+    size_full = target.stat().st_size
+    con.execute("DELETE FROM t")
+    con.commit()
+
+    # El archivo sigue igual de grande, pero ahora hay espacio recuperable.
+    assert target.stat().st_size == size_full
+    assert live_job._reclaimable_mb(con) > 0.0
+
+    con.execute("VACUUM")
+    con.commit()
+    assert target.stat().st_size < size_full
+    assert live_job._reclaimable_mb(con) == 0.0
+    con.close()
 
 
 def test_main_reloads_winning_generation_and_retries(tmp_path: Path, monkeypatch) -> None:
