@@ -1,0 +1,18 @@
+# Imagen del vigía. Deliberadamente mínima: sólo requests y GCS.
+#
+# No reutiliza Dockerfile.job a propósito. Esa imagen arrastra LightGBM, los
+# artefactos del modelo y la base bundleada — cientos de MB para un proceso que
+# hace tres llamadas HTTP. Y si el vigía compartiera dependencias con lo que
+# vigila, un problema en esas dependencias lo dejaría mudo justo cuando hace
+# falta.
+FROM python:3.11-slim
+
+WORKDIR /app
+
+RUN pip install --no-cache-dir \
+    "requests>=2.28" \
+    "google-cloud-storage>=2.14"
+
+COPY watchdog.py .
+
+CMD ["python3", "watchdog.py"]
