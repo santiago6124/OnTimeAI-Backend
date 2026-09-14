@@ -1,0 +1,44 @@
+name: GCP auth check
+
+# Verifica que la federación con GCP funcione sin ninguna clave guardada.
+# Los workflows de deploy reutilizan este mismo bloque de auth.
+#
+# Corre solo cuando un PR toca la configuración de autenticación, para que un
+# cambio ahí se valide antes de mergear en vez de descubrirse en un deploy.
+# `workflow_dispatch` permite además correrlo a mano desde la pestaña Actions.
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - ".github/workflows/gcp-auth-check.yml"
+      - "docs/GITHUB_GCP_AUTH.md"
+
+permissions:
+  # Necesario para que GitHub emita el token OIDC que GCP intercambia.
+  # Sin esto el paso de auth falla con "missing id-token permission".
+  id-token: write
+  contents: read
+
+jobs:
+  auth:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Autenticar contra GCP
+        uses: google-github-actions/auth@v2
+        with:
+          project_id: ontimeai-prod
+          workload_identity_provider: projects/871707213932/locations/global/workloadIdentityPools/github/providers/github
+          service_account: github-deployer@ontimeai-prod.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Confirmar identidad
+        run: |
+          echo "Identidad efectiva:"
+          gcloud auth list --filter=status:ACTIVE --format='value(account)'
+
+      - name: Comprobar permisos de lectura sobre Cloud Run
+        run: gcloud run services list --region us-central1 --format='value(metadata.name)'
+
+      - name: Comprobar acceso a los jobs
+        run: gcloud run jobs list --region us-central1 --format='value(metadata.name)'

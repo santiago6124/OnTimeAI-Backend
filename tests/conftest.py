@@ -1,9 +1,25 @@
 """Shared pytest fixtures with synthetic master datasets."""
 from __future__ import annotations
 
+import os
+
 import numpy as np
 import pandas as pd
 import pytest
+
+# `api.py` exige estas variables al importarse: los secretos no tienen valor por
+# defecto para que una variable faltante no derive en un arranque silencioso con
+# una credencial conocida. pytest carga este conftest antes que los módulos de
+# test, así que definirlas acá alcanza para que el import funcione.
+#
+# En una máquina de desarrollo esto también lo resolvería `.env.local`, pero ese
+# archivo no está versionado y en un runner de CI no existe. Sin esto los tests
+# pasarían en local y fallarían en CI.
+os.environ.setdefault("JWT_SECRET_KEY", "test-only-secret-not-used-in-production")
+os.environ.setdefault("API_USERNAME", "test-admin")
+os.environ.setdefault("API_PASSWORD", "test-only-password")
+os.environ.setdefault("API_USERNAME_VIEWER", "test-viewer")
+os.environ.setdefault("API_PASSWORD_VIEWER", "test-only-password-viewer")
 
 
 MASTER_COLUMNS = [

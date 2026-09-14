@@ -19,9 +19,17 @@ GCS_OBJECT = "live_data.db"
 TMP_DB = Path("/tmp/live_data.db")
 BUNDLED_DB = Path(__file__).parent / "live_data.db"
 GCS_GENERATION_RETRIES = max(0, int(os.environ.get("GCS_GENERATION_RETRIES", "2")))
-PRUNE_VACUUM_MIN_DELETED = max(
+# Cuantos MB de espacio libre justifican correr un VACUUM.
+#
+# Antes el disparador era la cantidad de filas borradas en el ciclo, con umbral
+# 50.000. En regimen se borran ~990 por ciclo, asi que nunca se alcanzaba: el
+# VACUUM no corria y el espacio liberado se acumulaba. Llego a 116 MB, el 17%
+# del archivo, y con eso la descarga de la base dejo de entrar en el timeout del
+# backend. El espacio libre es lo que el VACUUM recupera, asi que es lo que hay
+# que medir.
+PRUNE_VACUUM_MIN_FREE_MB = max(
     0,
-    int(os.environ.get("PRUNE_VACUUM_MIN_DELETED", "50000")),
+    int(os.environ.get("PRUNE_VACUUM_MIN_FREE_MB", "50")),
 )
 TRAINING_DATA_BUCKET = os.environ.get("TRAINING_DATA_BUCKET", "").strip()
 TRAINING_DATA_PREFIX = os.environ.get("TRAINING_DATA_PREFIX", "live-training").strip("/")
@@ -104,6 +112,19 @@ def _gcs_download() -> int:
     return generation
 
 
+def _reclaimable_mb(con) -> float:
+    """
+    MB que un VACUUM devolveria al sistema de archivos.
+
+    SQLite no achica el archivo al borrar filas: marca las paginas como libres y
+    las reusa. `freelist_count` cuenta esas paginas, asi que multiplicado por el
+    tamano de pagina da exactamente lo que el VACUUM recupera.
+    """
+    free_pages = con.execute("PRAGMA freelist_count").fetchone()[0]
+    page_size = con.execute("PRAGMA page_size").fetchone()[0]
+    return free_pages * page_size / 1e6
+
+
 def _cleanup_old_data() -> None:
     """Trim stale data to keep DB small. prediction_shap is not needed for retraining."""
     import sqlite3 as _sqlite3
@@ -118,13 +139,10 @@ def _cleanup_old_data() -> None:
     total_deleted = shap_deleted + weather_deleted
     db_mb = TMP_DB.stat().st_size / 1e6
     print(f"[job] cleanup: -{shap_deleted} SHAP rows, -{weather_deleted} weather rows (DB: {db_mb:.0f} MB)")
-    if total_deleted > PRUNE_VACUUM_MIN_DELETED:
+    free_mb = _reclaimable_mb(con)
+    if free_mb >= PRUNE_VACUUM_MIN_FREE_MB:
         try:
-            print(
-                "[job] Running VACUUM: "
-                f"{total_deleted} deleted rows exceed the "
-                f"{PRUNE_VACUUM_MIN_DELETED} threshold..."
-            )
+            print(f"[job] Running VACUUM: {free_mb:.0f} MB reclaimable...")
             con.execute("VACUUM")
             con.commit()
             db_mb_after = TMP_DB.stat().st_size / 1e6
@@ -133,9 +151,8 @@ def _cleanup_old_data() -> None:
             print(f"[job] VACUUM skipped: {e}")
     else:
         print(
-            "[job] VACUUM skipped: "
-            f"{total_deleted} deleted rows do not exceed the "
-            f"{PRUNE_VACUUM_MIN_DELETED} threshold."
+            f"[job] VACUUM skipped: {free_mb:.0f} MB reclaimable, "
+            f"under the {PRUNE_VACUUM_MIN_FREE_MB} MB threshold."
         )
     con.close()
 
@@ -293,7 +310,6 @@ def _run_pipeline_attempt(extra_args: list[str]) -> int:
                 TMP_DB,
                 days=30,
                 dry_run=False,
-                vacuum_min_deleted=PRUNE_VACUUM_MIN_DELETED,
             )
         except Exception as e:
             print(f"[job] Error running database pruning: {e}")
