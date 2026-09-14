@@ -393,12 +393,35 @@ def fetch_airport_flights(airport_icao: str, kind: str, start_iso: str, end_iso:
 
 # ----------------------------- weather from IEM ---------------------------
 
+# Cache en proceso del ultimo fetch de METAR.
+#
+# Ante un conflicto CAS, live_job rehace el pipeline completo dentro del mismo
+# proceso, y eso incluia volver a pedir el clima de ~130 aeropuertos. El METAR
+# se publica cada ~1 hora: repetir el pedido minutos despues devuelve lo mismo y
+# solo agrega latencia al ciclo, que es justamente lo que dispara mas conflictos.
+_IEM_CACHE: tuple[frozenset[str], float, pd.DataFrame] | None = None
+_IEM_CACHE_TTL_S = float(os.environ.get("IEM_CACHE_TTL_S", "600"))
+
+
 def fetch_iem_obs(stations: set[str], start_utc: pd.Timestamp, end_utc: pd.Timestamp) -> pd.DataFrame:
     """Fetches ASOS observations from IEM, batching all stations per network into one request.
 
     Batching by network reduces ~120 individual requests to ~10-15 network requests,
     eliminating rate-limit issues entirely.
+
+    Reutiliza el resultado si se pidio el mismo conjunto de estaciones hace menos
+    de `_IEM_CACHE_TTL_S` segundos.
     """
+    global _IEM_CACHE
+
+    key = frozenset(stations)
+    if _IEM_CACHE is not None:
+        cached_key, cached_at, cached_df = _IEM_CACHE
+        age = time.monotonic() - cached_at
+        if cached_key == key and age < _IEM_CACHE_TTL_S:
+            print(f"  IEM: reutilizando el fetch de hace {age:.0f} s ({len(cached_df)} obs)")
+            return cached_df.copy()
+
     base = "https://mesonet.agron.iastate.edu/cgi-bin/request/asos.py"
     frames = []
 
@@ -453,8 +476,16 @@ def fetch_iem_obs(stations: set[str], start_utc: pd.Timestamp, end_utc: pd.Times
                 break
         time.sleep(0.5)
     if not frames:
-        return pd.DataFrame()
-    return pd.concat(frames, ignore_index=True).drop_duplicates(["station", "valid"]).sort_values(["station", "valid"]).reset_index(drop=True)
+        result = pd.DataFrame()
+    else:
+        result = (
+            pd.concat(frames, ignore_index=True)
+            .drop_duplicates(["station", "valid"])
+            .sort_values(["station", "valid"])
+            .reset_index(drop=True)
+        )
+    _IEM_CACHE = (key, time.monotonic(), result)
+    return result.copy()
 
 
 def upsert_weather(conn: sqlite3.Connection, wx: pd.DataFrame) -> int:

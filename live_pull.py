@@ -305,6 +305,7 @@ def main() -> int:
     n_wx = 0
     if not args.no_weather:
         print("\n[4] IEM METAR refresh...")
+        _t_weather = time.monotonic()
         # Only fetch weather for airports that appear in today's flights (~40-50),
         # not the full 326-airport universe (would exceed 300s task timeout).
         active_airports: set[str] = set()
@@ -348,8 +349,10 @@ def main() -> int:
                 [(t,) for t in new_tails],
             )
             conn.commit()
+            print(f"[4] clima listo en {time.monotonic() - _t_weather:.0f} s")
             print(f"\n[4a] bootstrap: queued {len(new_tails)} unseen tails for next harvester tick")
         else:
+            print(f"[4] clima listo en {time.monotonic() - _t_weather:.0f} s")
             print(f"\n[4a] bootstrap: all {len(target_tails)} target tails already cached")
 
     # ---- 4b. FAA NAS Status snapshot (Tier 2 #K) ----
@@ -364,6 +367,7 @@ def main() -> int:
 
     # ---- 5. predict scheduled flights ----
     print("\n[5] Building features and predicting...")
+    _t_predict = time.monotonic()
     # Decouple the prediction target from this cycle's fetch. Predicting only the
     # flights pulled this tick means each flight is scored ~once, minutes before
     # departure (the scheduled_departures feed only surfaces near-term flights).
@@ -893,6 +897,7 @@ def main() -> int:
     # subsequent GCS upload in live_job.py reads /tmp/live_data.db.
     conn.close()
 
+    print(f"[5] features + inferencia en {time.monotonic() - _t_predict:.0f} s")
     print(f"\nDone. run_id={run_id}")
     return 0
 
