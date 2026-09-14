@@ -1,6 +1,7 @@
 """Google sign-in (issue #8): token exchange, first-login onboarding and profile type."""
 from __future__ import annotations
 
+import os
 import sqlite3
 import uuid
 
@@ -130,6 +131,14 @@ def test_user_type_requires_authentication(client):
 # ── Existing password accounts keep working ────────────────────────────────
 
 def test_local_login_still_works(client):
-    r = client.post("/auth/login", json={"username": "admin", "password": "ontimeai2026"})
+    # Las credenciales sembradas salen del entorno (conftest las fija en CI),
+    # así que no se pueden hardcodear: en local vienen de .env.local.
+    r = client.post(
+        "/auth/login",
+        json={
+            "username": os.environ["API_USERNAME"],
+            "password": os.environ["API_PASSWORD"],
+        },
+    )
     assert r.status_code == 200
     assert client.get("/auth/me", headers=_bearer(r)).json()["provider"] == "local"
