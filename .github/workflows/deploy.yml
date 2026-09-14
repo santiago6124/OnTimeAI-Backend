@@ -1,0 +1,214 @@
+name: Deploy
+
+# Un merge a main despliega el backend y los jobs del live pipeline.
+#
+# Antes esto se corría a mano con deploy.sh, y se notaba: la imagen del job
+# estuvo 16 días con código viejo (el arreglo del batching de METAR se commiteó
+# el 24/08 y la imagen era del 19/08), y el backend llegó a servir código que no
+# estaba en main. Nada avisaba en ninguno de los dos casos.
+on:
+  push:
+    branches: [main]
+  # Permite redesplegar sin tener que empujar un commit vacío.
+  workflow_dispatch:
+
+# Dos despliegues pisándose dejan Cloud Run en un estado indeterminado, así que
+# el segundo espera en vez de cancelar al primero.
+concurrency:
+  group: deploy-backend
+  cancel-in-progress: false
+
+env:
+  PROJECT_ID: ontimeai-prod
+  REGION: us-central1
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ontimeai-prod
+          workload_identity_provider: projects/871707213932/locations/global/workloadIdentityPools/github/providers/github
+          service_account: github-deployer@ontimeai-prod.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Construir imagen del backend
+        # Se lanza en modo asincrono y se consulta el estado en vez de dejar que
+        # gcloud espere: al esperar intenta leer el bucket de logs, lo que exige
+        # rol Viewer sobre el proyecto. Sin ese rol sale con codigo 1 aunque el
+        # build haya terminado en SUCCESS. --suppress-logs no alcanza.
+        run: |
+          BUILD_ID=$(gcloud builds submit \
+            --tag "gcr.io/$PROJECT_ID/ontimeai-backend" \
+            --async --format='value(id)' \
+            --project="$PROJECT_ID" --quiet)
+          echo "Build $BUILD_ID"
+          while true; do
+            STATUS=$(gcloud builds describe "$BUILD_ID" \
+              --project="$PROJECT_ID" --format='value(status)')
+            case "$STATUS" in
+              SUCCESS)
+                echo "Build OK"; break ;;
+              FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED)
+                echo "Build $STATUS"
+                echo "https://console.cloud.google.com/cloud-build/builds/$BUILD_ID?project=$PROJECT_ID"
+                exit 1 ;;
+              *)
+                sleep 15 ;;
+            esac
+          done
+
+      - name: Desplegar backend
+        # timeout 120 s: el refresh de la base ocurre dentro del pedido
+        # (ver get_db). Con CPU asignada tarda ~20 s sobre ~700 MB, pero
+        # conviene margen si la base crece.
+        #
+        # 4Gi de memoria, no 2: en Cloud Run /tmp es RAM, y durante un
+        # refresh conviven la base actual y el snapshot que se descarga.
+        # Con la base en ~680 MB eso son 1,4 GB solo de archivos, mas el
+        # modelo y las dependencias. Con 2Gi la descarga se cortaba a la
+        # mitad con IncompleteRead y el backend quedaba sirviendo datos
+        # viejos sin avisar.
+        #
+        # max-instances 1 a proposito: users.db es SQLite en /tmp que se
+        # baja de GCS al arrancar y se sube entera tras cada escritura. Con
+        # dos instancias, la que arranco primero sube su copia vieja y pisa
+        # los usuarios que creo la otra, sin error ni aviso. Subir este
+        # numero exige antes mover usuarios a un almacen multi-escritor.
+        # Las credenciales van por --set-secrets, no como env vars planas: así
+        # no quedan legibles para quien tenga run.services.get. Ver docs/SECRETS.md.
+        run: |
+          gcloud run deploy ontimeai-backend \
+            --image "gcr.io/$PROJECT_ID/ontimeai-backend" \
+            --region "$REGION" --platform managed \
+            --allow-unauthenticated \
+            --memory 4Gi --cpu 2 \
+            --min-instances 0 --max-instances 1 \
+            --timeout 120 \
+            --set-env-vars "ACTIVE_MODEL=4year_v9,GCS_BUCKET=ontimeai-prod-live-db,API_USERNAME=admin,API_USERNAME_VIEWER=viewer" \
+            --set-secrets "JWT_SECRET_KEY=jwt-secret-key:latest,API_PASSWORD=api-password:latest,API_PASSWORD_VIEWER=api-password-viewer:latest" \
+            --project="$PROJECT_ID" --quiet
+
+      - name: Construir imagen del live job
+        run: |
+          BUILD_ID=$(gcloud builds submit \
+            --config cloudbuild-job.yaml \
+            --async --format='value(id)' \
+            --project="$PROJECT_ID" --quiet)
+          echo "Build $BUILD_ID"
+          while true; do
+            STATUS=$(gcloud builds describe "$BUILD_ID" \
+              --project="$PROJECT_ID" --format='value(status)')
+            case "$STATUS" in
+              SUCCESS)
+                echo "Build OK"; break ;;
+              FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED)
+                echo "Build $STATUS"
+                echo "https://console.cloud.google.com/cloud-build/builds/$BUILD_ID?project=$PROJECT_ID"
+                exit 1 ;;
+              *)
+                sleep 15 ;;
+            esac
+          done
+
+      - name: Desplegar los dos live jobs
+        # Comparten imagen y difieren sólo en la clave de AeroAPI, para repartir
+        # el rate limit entre ciclos intercalados.
+        run: |
+          for JOB in ontimeai-live-pull ontimeai-live-pull-2 ontimeai-watchdog; do
+            case "$JOB" in
+              ontimeai-live-pull)   SECRET=aeroapi-key ;;
+              ontimeai-live-pull-2) SECRET=aeroapi-key-2 ;;
+            esac
+            gcloud run jobs deploy "$JOB" \
+              --image "gcr.io/$PROJECT_ID/ontimeai-live-pull" \
+              --region "$REGION" \
+              --cpu 2 --memory 4Gi \
+              --max-retries 1 --task-timeout 1800 \
+              --set-env-vars "GCS_BUCKET=ontimeai-prod-live-db,ACTIVE_MODEL=4year_v9,MAX_PAGES=7,CHAIN_WALK_MAX=10,LIVE_DATA_SOURCE=harvester" \
+              --set-secrets "AEROAPI_KEY=${SECRET}:latest" \
+              --project="$PROJECT_ID" --quiet
+          done
+
+      - name: Construir imagen del vigia
+        run: |
+          BUILD_ID=$(gcloud builds submit \
+            --config cloudbuild-watchdog.yaml \
+            --async --format='value(id)' \
+            --project="$PROJECT_ID" --quiet)
+          echo "Build $BUILD_ID"
+          while true; do
+            STATUS=$(gcloud builds describe "$BUILD_ID" \
+              --project="$PROJECT_ID" --format='value(status)')
+            case "$STATUS" in
+              SUCCESS)
+                echo "Build OK"; break ;;
+              FAILURE|INTERNAL_ERROR|TIMEOUT|CANCELLED|EXPIRED)
+                echo "Build $STATUS"
+                echo "https://console.cloud.google.com/cloud-build/builds/$BUILD_ID?project=$PROJECT_ID"
+                exit 1 ;;
+              *)
+                sleep 15 ;;
+            esac
+          done
+
+      - name: Desplegar el vigia
+        # La URL del backend se resuelve en tiempo de deploy en vez de
+        # hardcodearse: ya cambio una vez con la migracion de proyecto GCP.
+        run: |
+          BACKEND_URL=$(gcloud run services describe ontimeai-backend \
+            --region "$REGION" --project "$PROJECT_ID" \
+            --format='value(status.url)')
+          gcloud run jobs deploy ontimeai-watchdog \
+            --image "gcr.io/$PROJECT_ID/ontimeai-watchdog:latest" \
+            --region "$REGION" \
+            --cpu 1 --memory 512Mi \
+            --max-retries 1 --task-timeout 300 \
+            --set-env-vars "GCS_BUCKET=ontimeai-prod-live-db,BACKEND_URL=$BACKEND_URL,API_USERNAME=admin" \
+            --set-secrets "TELEGRAM_BOT_TOKEN=telegram-bot-token:latest,TELEGRAM_CHAT_ID=telegram-chat-id:latest,API_PASSWORD=api-password:latest" \
+            --project="$PROJECT_ID" --quiet
+
+      - name: Asegurar el scheduler del vigia
+        # Idempotente, para que el scheduler quede versionado y se pueda
+        # recrear si se migra de proyecto GCP otra vez.
+        #
+        # El cron esquiva los minutos ya ocupados (:00 :10 :15 :20 :30 :40 :45
+        # :50 entre keepalive, harvester y los dos predictores). El vigia solo
+        # lee, asi que no compite por la base, pero separarlo mantiene los logs
+        # legibles.
+        run: |
+          SA="871707213932-compute@developer.gserviceaccount.com"
+          URI="https://$REGION-run.googleapis.com/apis/run.googleapis.com/v1/namespaces/$PROJECT_ID/jobs/ontimeai-watchdog:run"
+          if gcloud scheduler jobs describe ontimeai-watchdog-scheduler \
+               --location="$REGION" --project="$PROJECT_ID" >/dev/null 2>&1; then
+            ACTION=update
+          else
+            ACTION=create
+          fi
+          gcloud scheduler jobs $ACTION http ontimeai-watchdog-scheduler \
+            --location="$REGION" \
+            --schedule="7,22,37,52 * * * *" \
+            --uri="$URI" --http-method=POST \
+            --oauth-service-account-email="$SA" \
+            --project="$PROJECT_ID" --quiet
+
+      - name: Resumen
+        run: |
+          echo "### Desplegado" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "Commit: \`${GITHUB_SHA::7}\`" >> "$GITHUB_STEP_SUMMARY"
+          URL=$(gcloud run services describe ontimeai-backend \
+                  --region "$REGION" --project "$PROJECT_ID" \
+                  --format='value(status.url)')
+          REV=$(gcloud run services describe ontimeai-backend \
+                  --region "$REGION" --project "$PROJECT_ID" \
+                  --format='value(status.latestReadyRevisionName)')
+          echo "Backend: $URL (revisión \`$REV\`)" >> "$GITHUB_STEP_SUMMARY"

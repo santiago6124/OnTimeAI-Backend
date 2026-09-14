@@ -41,17 +41,52 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 # ── Config ─────────────────────────────────────────────────────────────────
 
+
+def _require_secret(name: str) -> str:
+    """
+    Lee una variable de entorno obligatoria o aborta el arranque.
+
+    Los secretos no llevan valor por defecto a propósito. Un default convierte
+    una variable faltante en un arranque exitoso con una credencial conocida —
+    el servicio queda en pie y nada avisa. Es preferible que el contenedor no
+    levante: Cloud Run deja la revisión anterior sirviendo y el error queda en
+    los logs del despliegue.
+    """
+    value = os.getenv(name, "").strip()
+    if not value:
+        raise RuntimeError(
+            f"Falta la variable de entorno obligatoria {name}. "
+            "Los secretos se inyectan desde Secret Manager con --set-secrets; "
+            "ver deploy.sh y docs/SECRETS.md."
+        )
+    return value
+
+
 GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 _TMP_DB = Path("/tmp/live_data.db")
 _BUNDLED_DB = Path(__file__).parent / "live_data.db"
 DB_PATH = _TMP_DB if GCS_BUCKET else _BUNDLED_DB
 _DB_REFRESH_INTERVAL = 1000  # refresh from GCS every ~16 min
+# Segundos para bajar el snapshot completo desde GCS.
+#
+# El default de google-cloud-storage son 120 s, que con la base en ~670 MB se
+# quedaba corto: la descarga se cortaba a mitad con IncompleteRead y el backend
+# seguia sirviendo el snapshot anterior sin avisar. Llego a servir datos de dos
+# dias atras respondiendo 200.
+_DB_DOWNLOAD_TIMEOUT = max(60, int(os.getenv("DB_DOWNLOAD_TIMEOUT", "300")))
+# Reintentos cuando un job reemplaza el objeto mientras se lo descarga.
+_DB_DOWNLOAD_GENERATION_RETRIES = max(
+    0, int(os.getenv("DB_DOWNLOAD_GENERATION_RETRIES", "2"))
+)
 _db_last_refresh: float = 0.0
 _db_last_health_check: float = 0.0
 _DB_HEALTH_INTERVAL = 60  # re-verify DB health every 60 s
 _DB_REFRESH_LOCK = threading.Lock()
-_DB_REFRESH_THREAD_LOCK = threading.Lock()
-_db_refresh_thread: threading.Thread | None = None
+# Salud del refresh. Un fallo dejaba al backend sirviendo el snapshot anterior
+# con respuesta 200 y sin rastro fuera de los logs; se expone en
+# /admin/db-stats para que la UI pueda mostrar que los datos estan viejos.
+_db_last_refresh_ok_utc: str | None = None
+_db_last_refresh_error: str | None = None
 
 # Users DB (separate from live_data.db so live job never overwrites it)
 USERS_DB_PATH = Path("/tmp/users.db") if GCS_BUCKET else Path(__file__).parent / "users.db"
@@ -135,10 +170,15 @@ def _init_users_db() -> None:
         if column not in existing:
             con.execute(ddl)
     con.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_email ON users(email) WHERE email IS NOT NULL")
-    # Seed initial users from env vars (idempotent)
+    # Alta inicial de usuarios desde el entorno.
+    #
+    # Es idempotente: sólo inserta si el usuario no existe. Cambiar estas
+    # variables NO rota la contraseña de una cuenta ya creada — users.db
+    # persiste en GCS entre despliegues. Para rotar hay que actualizar la fila,
+    # vía PATCH /admin/users/{username}. Ver docs/SECRETS.md.
     seeds = [
-        (os.getenv("API_USERNAME", "admin"),  os.getenv("API_PASSWORD", "ontimeai2026"),  "superadmin"),
-        (os.getenv("API_USERNAME_VIEWER", "viewer"), os.getenv("API_PASSWORD_VIEWER", "viewer2026"), "user"),
+        (_require_secret("API_USERNAME"), _require_secret("API_PASSWORD"), "superadmin"),
+        (_require_secret("API_USERNAME_VIEWER"), _require_secret("API_PASSWORD_VIEWER"), "user"),
     ]
     for username, password, role in seeds:
         if username and not con.execute("SELECT 1 FROM users WHERE username=?", (username,)).fetchone():
@@ -179,17 +219,52 @@ def _verify_db_snapshot(path: Path) -> bool:
 
 
 def _download_db_snapshot(destination: Path) -> int:
-    """Download one immutable GCS generation into ``destination``."""
+    """
+    Descarga una generacion completa de GCS.
+
+    Reintenta ante conflicto de generacion. Tres jobs reescriben este objeto
+    —live-pull a los :00/:30, live-pull-2 a los :15/:45 y el harvester cada 10
+    minutos— y GCS no conserva generaciones viejas sin versionado. Entre el
+    reload y el final de la descarga de ~685 MB puede entrar una escritura, y
+    entonces la generacion pedida deja de existir:
+
+      404 GET .../live_data.db?ifGenerationMatch=1789392097835849
+      No such object
+
+    Los jobs ya reintentan ante el mismo conflicto al escribir; el lector tenia
+    que hacer lo propio. La precondicion se conserva porque garantiza que el
+    archivo en disco corresponde a una unica generacion y no a dos mezcladas.
+    """
     from google.cloud import storage as gcs
+    from google.cloud.exceptions import NotFound
+    from google.cloud.storage.retry import DEFAULT_RETRY
 
     blob = gcs.Client().bucket(GCS_BUCKET).blob("live_data.db")
-    blob.reload()
-    generation = int(blob.generation)
-    blob.download_to_filename(
-        str(destination),
-        if_generation_match=generation,
-    )
-    return generation
+
+    for attempt in range(_DB_DOWNLOAD_GENERATION_RETRIES + 1):
+        blob.reload()
+        generation = int(blob.generation)
+        try:
+            blob.download_to_filename(
+                str(destination),
+                if_generation_match=generation,
+                timeout=_DB_DOWNLOAD_TIMEOUT,
+                # `timeout` acota cada request; el deadline de la politica de
+                # reintentos acota el total, y tambien vale 120 s por defecto.
+                # Subir solo el primero no evitaba el corte.
+                retry=DEFAULT_RETRY.with_deadline(_DB_DOWNLOAD_TIMEOUT),
+            )
+            return generation
+        except NotFound:
+            if attempt >= _DB_DOWNLOAD_GENERATION_RETRIES:
+                raise
+            print(
+                f"[db_refresh] generation {generation} fue reemplazada durante "
+                f"la descarga; reintentando "
+                f"({attempt + 2}/{_DB_DOWNLOAD_GENERATION_RETRIES + 1})"
+            )
+
+    raise RuntimeError("unreachable")
 
 
 def _temporary_db_path(target: Path) -> Path:
@@ -222,7 +297,7 @@ def _refresh_db_from_gcs(*, force: bool = False) -> bool:
     previous immutable snapshot. Forced refreshes (startup/recovery) wait for
     the in-flight installer because no known-good snapshot may be available.
     """
-    global _db_last_refresh
+    global _db_last_refresh, _db_last_refresh_ok_utc, _db_last_refresh_error
     if not GCS_BUCKET:
         return False
 
@@ -232,13 +307,17 @@ def _refresh_db_from_gcs(*, force: bool = False) -> bool:
 
     blocking = force or not _TMP_DB.exists()
     if not _DB_REFRESH_LOCK.acquire(blocking=blocking):
+        # Otro hilo esta descargando. Si esto se repite ciclo tras ciclo, hay
+        # un hilo trabado reteniendo el lock y el backend nunca se actualiza.
+        print("[db_refresh] abortado: el lock ya esta tomado por otro hilo")
         return False
 
     snapshot_path: Path | None = None
     try:
-        # Another request may have completed the refresh while this one waited.
+        # Otro pedido pudo haber completado el refresh mientras este esperaba.
         now = time.monotonic()
         if not force and now - _db_last_refresh < _DB_REFRESH_INTERVAL:
+            print("[db_refresh] abortado: otro hilo refresco mientras esperaba")
             return False
 
         snapshot_path = _temporary_db_path(_TMP_DB)
@@ -253,37 +332,21 @@ def _refresh_db_from_gcs(*, force: bool = False) -> bool:
         os.replace(snapshot_path, _TMP_DB)
         snapshot_path = None
         _db_last_refresh = time.monotonic()
+        _db_last_refresh_ok_utc = datetime.now(timezone.utc).isoformat()
+        _db_last_refresh_error = None
         print(
             f"[db] refreshed from GCS generation={generation} "
             f"({_TMP_DB.stat().st_size / 1e6:.0f} MB)"
         )
         return True
     except Exception as e:
+        _db_last_refresh_error = f"{datetime.now(timezone.utc).isoformat()}: {e}"
         print(f"[db_refresh] failed: {e}")
         return False
     finally:
         if snapshot_path is not None:
             snapshot_path.unlink(missing_ok=True)
         _DB_REFRESH_LOCK.release()
-
-
-def _start_db_refresh() -> None:
-    """Start at most one non-blocking periodic refresh per API process."""
-    global _db_refresh_thread
-    if not GCS_BUCKET or not _TMP_DB.exists():
-        return
-    if time.monotonic() - _db_last_refresh < _DB_REFRESH_INTERVAL:
-        return
-
-    with _DB_REFRESH_THREAD_LOCK:
-        if _db_refresh_thread is not None and _db_refresh_thread.is_alive():
-            return
-        _db_refresh_thread = threading.Thread(
-            target=_refresh_db_from_gcs,
-            name="ontimeai-db-refresh",
-            daemon=True,
-        )
-        _db_refresh_thread.start()
 
 
 def _verify_db_health(path: Path) -> bool:
@@ -305,7 +368,7 @@ ARTIFACT_PATH = MODEL_REGISTRY.get(ACTIVE_MODEL, MODEL_REGISTRY["4year_v9"])
 
 # ── Auth ───────────────────────────────────────────────────────────────────
 
-JWT_SECRET = os.getenv("JWT_SECRET_KEY", "ontimeai-dev-secret-change-in-prod-32chars")
+JWT_SECRET = _require_secret("JWT_SECRET_KEY")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 8
 
@@ -476,7 +539,18 @@ def get_db() -> sqlite3.Connection:
     if GCS_BUCKET and not _TMP_DB.exists():
         _refresh_db_from_gcs(force=True)
     else:
-        _start_db_refresh()
+        # Sincrono a proposito, no en un hilo de fondo.
+        #
+        # Cloud Run con throttling —el default— asigna CPU solo mientras se
+        # procesa un pedido. Un hilo de fondo arrancado por un request queda
+        # sin CPU apenas se envia la respuesta, y la descarga de ~700 MB cae a
+        # ~2 MB/s hasta morir en el deadline. Eso dejaba al backend sirviendo
+        # datos de horas atras, con respuesta 200 y sin senal alguna.
+        #
+        # Haciendolo dentro del request hay CPU asignada y la descarga tarda
+        # ~20 s. El lock es no bloqueante: solo el primer pedido vencido paga
+        # la espera, los concurrentes siguen sirviendo el snapshot anterior.
+        _refresh_db_from_gcs()
 
     if GCS_BUCKET and (time.monotonic() - _db_last_health_check > _DB_HEALTH_INTERVAL):
         if not _verify_db_health(_TMP_DB):
@@ -1603,6 +1677,83 @@ def metrics_route_history(origin: str, dest: str):
         con.close()
 
 
+_SIZE_SAMPLE_ROWS = 5000
+
+
+def _table_bytes_exact(con, tables: list[str]) -> dict[str, int] | None:
+    """
+    Bytes reales por tabla, incluidos sus índices, vía el vtab `dbstat`.
+
+    Sólo está disponible si SQLite fue compilado con SQLITE_ENABLE_DBSTAT_VTAB,
+    lo que no está garantizado. Devuelve None si no existe, para que el llamador
+    caiga a la estimación por muestreo.
+    """
+    try:
+        con.execute("SELECT 1 FROM dbstat LIMIT 1")
+    except sqlite3.OperationalError:
+        return None
+
+    sizes: dict[str, int] = {}
+    for tbl in tables:
+        try:
+            # `name` en dbstat cubre tanto la tabla como sus índices; se
+            # agrupan bajo la tabla para que el total sea el costo real.
+            row = con.execute(
+                """
+                SELECT COALESCE(SUM(pgsize), 0) FROM dbstat
+                 WHERE name = ?
+                    OR name IN (SELECT name FROM sqlite_master
+                                 WHERE type = 'index' AND tbl_name = ?)
+                """,
+                (tbl, tbl),
+            ).fetchone()
+            sizes[tbl] = int(row[0]) if row else 0
+        except sqlite3.OperationalError:
+            sizes[tbl] = 0
+    return sizes
+
+
+def _table_bytes_estimated(con, tables: list[str]) -> dict[str, int]:
+    """
+    Estimación por muestreo, para cuando `dbstat` no está disponible.
+
+    Mide el largo en bytes de cada columna sobre una muestra y lo extrapola por
+    la cantidad de filas. No contempla el peso de los índices ni el overhead de
+    página, así que subestima: sirve para ordenar tablas por peso relativo, que
+    es lo que hace falta para decidir qué purgar.
+    """
+    sizes: dict[str, int] = {}
+    for tbl in tables:
+        try:
+            cols = [r[1] for r in con.execute(f"PRAGMA table_info({tbl})")]
+            if not cols:
+                sizes[tbl] = 0
+                continue
+
+            total_rows = con.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            if total_rows == 0:
+                sizes[tbl] = 0
+                continue
+
+            # CAST a BLOB para contar bytes y no caracteres.
+            expr = " + ".join(
+                f'COALESCE(LENGTH(CAST("{c}" AS BLOB)), 0)' for c in cols
+            )
+            row = con.execute(
+                f"SELECT COALESCE(SUM({expr}), 0), COUNT(*) "
+                f"FROM (SELECT * FROM {tbl} LIMIT {_SIZE_SAMPLE_ROWS})"
+            ).fetchone()
+            sampled_bytes, sampled_rows = int(row[0]), int(row[1])
+            if sampled_rows == 0:
+                sizes[tbl] = 0
+                continue
+
+            sizes[tbl] = int(sampled_bytes / sampled_rows * total_rows)
+        except sqlite3.OperationalError:
+            sizes[tbl] = 0
+    return sizes
+
+
 @app.get("/admin/db-stats")
 def db_stats(request: Request):
     _require_superadmin(request)
@@ -1629,10 +1780,51 @@ def db_stats(request: Request):
         except Exception:
             pass
 
+        # Peso por tabla: sin esto no se puede decidir qué purgar, porque la
+        # cantidad de filas no dice nada del espacio que ocupan.
+        tables = list(counts.keys())
+        exact = _table_bytes_exact(con, tables)
+        table_bytes = exact if exact is not None else _table_bytes_estimated(con, tables)
+        table_sizes_mb = {t: round(b / 1e6, 2) for t, b in table_bytes.items()}
+
+        # Antigüedad por tabla, para saber cuánto libera cada ventana de corte.
+        AGE_COLUMNS = {
+            "predictions": "predicted_at_utc",
+            "prediction_shap": "predicted_at_utc",
+            "actuals": "settled_at_utc",
+            "weather_obs": "valid_utc",
+        }
+        table_dates: dict[str, dict[str, str | None]] = {}
+        for tbl, col in AGE_COLUMNS.items():
+            try:
+                row = con.execute(f"SELECT MIN({col}), MAX({col}) FROM {tbl}").fetchone()
+                table_dates[tbl] = {"first": row[0], "last": row[1]} if row else {}
+            except sqlite3.OperationalError:
+                continue
+
         return {
             "db_size_mb": round(size_mb, 2),
             "table_counts": counts,
+            "table_sizes_mb": table_sizes_mb,
+            "table_sizes_source": "dbstat" if exact is not None else "sampled",
+            "table_dates": table_dates,
             "prediction_dates": date_range,
+            "refresh": {
+                "last_ok_utc": _db_last_refresh_ok_utc,
+                "last_error": _db_last_refresh_error,
+                # Estado interno del refresh. Sin esto habia que inferirlo de
+                # los logs, y un refresh que no se intenta no deja ninguno.
+                "seconds_since_last": round(
+                    time.monotonic() - _db_last_refresh, 1
+                ),
+                "interval_seconds": _DB_REFRESH_INTERVAL,
+                "is_due": (
+                    time.monotonic() - _db_last_refresh >= _DB_REFRESH_INTERVAL
+                ),
+                # Refresco sincrono: si el lock esta tomado, hay un pedido
+                # descargando ahora mismo.
+                "lock_held": _DB_REFRESH_LOCK.locked(),
+            },
         }
     finally:
         con.close()
