@@ -136,3 +136,83 @@ def test_concurrent_request_keeps_reading_previous_complete_snapshot(
     assert download_count == 1
     with api.get_db() as installed:
         assert _read_marker(installed) == "new"
+
+
+def test_download_retries_when_a_job_replaces_the_generation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Tres jobs reescriben el objeto en GCS y no hay versionado, asi que la
+    generacion leida puede desaparecer antes de terminar la descarga de
+    ~685 MB. El lector tiene que reintentar, como ya hacen los escritores.
+    """
+    import google.cloud.storage as gcs_module
+    from google.cloud.exceptions import NotFound
+
+    source = tmp_path / "new.db"
+    _create_snapshot(source, "new")
+    generations = iter([111, 222])
+    attempts: list[int] = []
+
+    class _Blob:
+        generation = 0
+
+        def reload(self):
+            type(self).generation = next(generations)
+
+        def download_to_filename(self, destination, **kwargs):
+            requested = kwargs["if_generation_match"]
+            attempts.append(requested)
+            if requested == 111:
+                # Un job la reemplazo mientras se descargaba.
+                raise NotFound("No such object")
+            shutil.copyfile(source, Path(destination))
+
+    blob = _Blob()
+
+    class _Client:
+        def bucket(self, _name):
+            return type("B", (), {"blob": lambda _s, _n: blob})()
+
+    monkeypatch.setattr(api, "GCS_BUCKET", "test-bucket")
+    monkeypatch.setattr(gcs_module, "Client", _Client)
+
+    destination = tmp_path / "downloaded.db"
+    assert api._download_db_snapshot(destination) == 222
+    assert attempts == [111, 222], "deberia reintentar con la generacion nueva"
+    with sqlite3.connect(destination) as con:
+        assert _read_marker(con) == "new"
+
+
+def test_download_gives_up_after_repeated_generation_conflicts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Si el objeto se reemplaza en cada intento, el error tiene que salir."""
+    import itertools
+
+    import google.cloud.storage as gcs_module
+    from google.cloud.exceptions import NotFound
+
+    counter = itertools.count(1)
+
+    class _Blob:
+        generation = 0
+
+        def reload(self):
+            type(self).generation = next(counter)
+
+        def download_to_filename(self, destination, **kwargs):
+            raise NotFound("No such object")
+
+    blob = _Blob()
+
+    class _Client:
+        def bucket(self, _name):
+            return type("B", (), {"blob": lambda _s, _n: blob})()
+
+    monkeypatch.setattr(api, "GCS_BUCKET", "test-bucket")
+    monkeypatch.setattr(gcs_module, "Client", _Client)
+    monkeypatch.setattr(api, "_DB_DOWNLOAD_GENERATION_RETRIES", 2)
+
+    with pytest.raises(NotFound):
+        api._download_db_snapshot(tmp_path / "x.db")
