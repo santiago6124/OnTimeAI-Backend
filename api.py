@@ -74,6 +74,10 @@ _DB_REFRESH_INTERVAL = 1000  # refresh from GCS every ~16 min
 # seguia sirviendo el snapshot anterior sin avisar. Llego a servir datos de dos
 # dias atras respondiendo 200.
 _DB_DOWNLOAD_TIMEOUT = max(60, int(os.getenv("DB_DOWNLOAD_TIMEOUT", "300")))
+# Reintentos cuando un job reemplaza el objeto mientras se lo descarga.
+_DB_DOWNLOAD_GENERATION_RETRIES = max(
+    0, int(os.getenv("DB_DOWNLOAD_GENERATION_RETRIES", "2"))
+)
 _db_last_refresh: float = 0.0
 _db_last_health_check: float = 0.0
 _DB_HEALTH_INTERVAL = 60  # re-verify DB health every 60 s
@@ -199,25 +203,52 @@ def _verify_db_snapshot(path: Path) -> bool:
 
 
 def _download_db_snapshot(destination: Path) -> int:
-    """Download one immutable GCS generation into ``destination``."""
-    from google.cloud import storage as gcs
+    """
+    Descarga una generacion completa de GCS.
 
+    Reintenta ante conflicto de generacion. Tres jobs reescriben este objeto
+    —live-pull a los :00/:30, live-pull-2 a los :15/:45 y el harvester cada 10
+    minutos— y GCS no conserva generaciones viejas sin versionado. Entre el
+    reload y el final de la descarga de ~685 MB puede entrar una escritura, y
+    entonces la generacion pedida deja de existir:
+
+      404 GET .../live_data.db?ifGenerationMatch=1789392097835849
+      No such object
+
+    Los jobs ya reintentan ante el mismo conflicto al escribir; el lector tenia
+    que hacer lo propio. La precondicion se conserva porque garantiza que el
+    archivo en disco corresponde a una unica generacion y no a dos mezcladas.
+    """
+    from google.cloud import storage as gcs
+    from google.cloud.exceptions import NotFound
     from google.cloud.storage.retry import DEFAULT_RETRY
 
     blob = gcs.Client().bucket(GCS_BUCKET).blob("live_data.db")
-    blob.reload()
-    generation = int(blob.generation)
-    blob.download_to_filename(
-        str(destination),
-        if_generation_match=generation,
-        timeout=_DB_DOWNLOAD_TIMEOUT,
-        # `timeout` acota cada request; el corte real venia del deadline de la
-        # politica de reintentos, que tambien vale 120 s por defecto y es lo que
-        # aparecia en el log como "Timeout of 120.0s exceeded". Subir solo
-        # `timeout` no cambiaba nada.
-        retry=DEFAULT_RETRY.with_deadline(_DB_DOWNLOAD_TIMEOUT),
-    )
-    return generation
+
+    for attempt in range(_DB_DOWNLOAD_GENERATION_RETRIES + 1):
+        blob.reload()
+        generation = int(blob.generation)
+        try:
+            blob.download_to_filename(
+                str(destination),
+                if_generation_match=generation,
+                timeout=_DB_DOWNLOAD_TIMEOUT,
+                # `timeout` acota cada request; el deadline de la politica de
+                # reintentos acota el total, y tambien vale 120 s por defecto.
+                # Subir solo el primero no evitaba el corte.
+                retry=DEFAULT_RETRY.with_deadline(_DB_DOWNLOAD_TIMEOUT),
+            )
+            return generation
+        except NotFound:
+            if attempt >= _DB_DOWNLOAD_GENERATION_RETRIES:
+                raise
+            print(
+                f"[db_refresh] generation {generation} fue reemplazada durante "
+                f"la descarga; reintentando "
+                f"({attempt + 2}/{_DB_DOWNLOAD_GENERATION_RETRIES + 1})"
+            )
+
+    raise RuntimeError("unreachable")
 
 
 def _temporary_db_path(target: Path) -> Path:
