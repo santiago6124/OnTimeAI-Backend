@@ -124,7 +124,23 @@ def prune_db(
         
         con.execute("DELETE FROM prediction_shap WHERE predicted_at_utc < ?", (cutoff_iso,))
         con.execute("DELETE FROM predictions WHERE predicted_at_utc < ?", (cutoff_iso,))
-        con.execute("DELETE FROM flights WHERE scheduled_out_utc < ?", (cutoff_iso,))
+        # `scheduled_out_utc < ?` sola deja vivas para siempre las filas donde
+        # ese campo es NULL o vacio: en SQL `NULL < 'x'` es NULL, no verdadero,
+        # y la fila nunca entra en el DELETE. Peor todavia, los `actuals` se
+        # borran por orfandad —`NOT IN (SELECT fa_flight_id FROM flights)`—, asi
+        # que cada vuelo inmortal mantiene vivo el suyo. Medido el 15/09:
+        # `actuals` arrastraba filas del 26/05 con retencion de 30 dias.
+        #
+        # Para esas filas se usa `first_seen_utc`, que es NOT NULL por esquema.
+        con.execute(
+            """DELETE FROM flights
+                WHERE CASE
+                        WHEN scheduled_out_utc IS NULL OR scheduled_out_utc = ''
+                        THEN first_seen_utc
+                        ELSE scheduled_out_utc
+                      END < ?""",
+            (cutoff_iso,),
+        )
         
         # Delete orphaned actuals
         cur = con.execute("DELETE FROM actuals WHERE fa_flight_id NOT IN (SELECT fa_flight_id FROM flights)")
