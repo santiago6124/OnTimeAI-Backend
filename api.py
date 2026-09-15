@@ -387,7 +387,7 @@ FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
 USER_TYPES = ("b2b", "b2c")
 
 
-_PUBLIC_PATHS = {"/auth/login", "/auth/google", "/auth/register", "/auth/firebase", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"}
+_PUBLIC_PATHS = {"/auth/login", "/auth/google", "/auth/firebase", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"}
 # Endpoints accesibles sin autenticación para la vista pública /live
 _LITE_PUBLIC_PATHS = {"/flights", "/metrics/hourly"}
 _LITE_PUBLIC_PREFIXES = ("/weather/",)
@@ -431,19 +431,6 @@ class FirebaseLoginRequest(BaseModel):
 
 class MeUpdate(BaseModel):
     user_type: Optional[str] = None
-
-
-class RegisterRequest(BaseModel):
-    """Alta propia, con correo y contrasena.
-
-    Sin verificacion de correo: mandar un mail exige infraestructura que el
-    proyecto no tiene. La consecuencia esta acotada por la guarda de
-    /auth/google, que se niega a reutilizar una cuenta local con el mismo
-    correo en vez de entregarsela a quien llegue con el token de Google.
-    """
-
-    email: str
-    password: str
 
 
 class UserCreate(BaseModel):
@@ -998,70 +985,6 @@ def _verify_google_id_token(raw_token: str) -> dict:
     if not claims.get("email_verified"):
         raise HTTPException(401, "El email de la cuenta de Google no está verificado")
     return claims
-
-
-# Largo minimo de la contrasena en el alta propia.
-#
-# Diez y no ocho: el hash es PBKDF2 y la base de usuarios viaja a GCS, asi que
-# el costo de una contrasena corta lo paga el usuario, no el atacante. No se
-# exigen mayusculas ni simbolos —empujan a "Password1!" y no agregan entropia
-# real frente a diez caracteres elegidos libremente.
-MIN_PASSWORD_LENGTH = 10
-
-
-def _looks_like_email(value: str) -> bool:
-    """Validacion deliberadamente laxa: un arroba, un punto despues, sin espacios.
-
-    Validar correos con precision es un pozo sin fondo, y el unico costo de un
-    falso positivo es una cuenta que su duenio no puede recuperar. Rechazar un
-    correo valido, en cambio, deja gente afuera sin explicacion.
-    """
-    if not value or " " in value or value.count("@") != 1:
-        return False
-    local, _, dominio = value.partition("@")
-    return bool(local) and "." in dominio and not dominio.startswith(".") and not dominio.endswith(".")
-
-
-@app.post("/auth/register", status_code=201)
-def register(body: RegisterRequest):
-    """Alta propia con correo y contrasena.
-
-    El sistema ya era abierto: cualquiera con cuenta de Google se registraba
-    solo. Esto quita la asimetria de que el otro metodo dependiera de que un
-    superadmin creara la cuenta a mano.
-
-    El rol es siempre `user`, nunca lo elige quien se registra.
-    """
-    email = body.email.strip().lower()
-    if not _looks_like_email(email):
-        raise HTTPException(400, "Correo inválido")
-    if len(body.password) < MIN_PASSWORD_LENGTH:
-        raise HTTPException(
-            400, f"La contraseña necesita al menos {MIN_PASSWORD_LENGTH} caracteres"
-        )
-
-    con = _get_users_con()
-    try:
-        con.execute(
-            "INSERT INTO users (username, password_hash, role, provider) "
-            "VALUES (?,?,'user','local')",
-            (email, _hash_password(body.password)),
-        )
-        con.commit()
-    except sqlite3.IntegrityError:
-        raise HTTPException(409, "Ya existe una cuenta con ese correo")
-    finally:
-        con.close()
-    _upload_users_db()
-
-    # Misma forma que /auth/google para que el frontend trate los dos altas
-    # igual y mande al onboarding.
-    return {
-        "access_token": _issue_token(email, "user"),
-        "token_type": "bearer",
-        "user_type": None,
-        "is_new_user": True,
-    }
 
 
 @app.post("/auth/google")

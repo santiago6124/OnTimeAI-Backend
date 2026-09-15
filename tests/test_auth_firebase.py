@@ -59,6 +59,26 @@ def _entrar(client):
     return client.post("/auth/firebase", json={"id_token": "token"})
 
 
+def _cuenta_local(correo, clave):
+    """Crea una cuenta local cuyo usuario ES un correo.
+
+    Se inserta directo porque el alta propia ya no existe: Firebase se ocupa de
+    las credenciales por correo. Hoy solo un administrador puede dejar una
+    cuenta con esta forma, pero mientras sea posible el endpoint tiene que
+    resolverla bien.
+    """
+    import api
+
+    con = api._get_users_con()
+    con.execute(
+        "INSERT INTO users (username, password_hash, role, provider) "
+        "VALUES (?,?,'user','local')",
+        (correo, api._hash_password(clave)),
+    )
+    con.commit()
+    con.close()
+
+
 class TestValidacionDelToken:
     """
     La logica de `_verify_firebase_id_token`, con la verificacion criptografica
@@ -139,11 +159,8 @@ class TestTransferenciaDeCuenta:
         self, client, monkeypatch
     ) -> None:
         correo = "disputada@ejemplo.com"
-        # Alguien la registro antes con una contrasena que conoce.
-        assert client.post(
-            "/auth/register",
-            json={"email": correo, "password": "la-del-ocupante"},
-        ).status_code == 201
+        # Alguien la ocupo antes con una contrasena que conoce.
+        _cuenta_local(correo, "la-del-ocupante")
 
         _con_token(monkeypatch, correo)
         r = _entrar(client)
@@ -154,7 +171,7 @@ class TestTransferenciaDeCuenta:
     ) -> None:
         correo = "invalidada@ejemplo.com"
         clave = "la-del-ocupante"
-        client.post("/auth/register", json={"email": correo, "password": clave})
+        _cuenta_local(correo, clave)
         # Antes de la transferencia, esa contrasena entra.
         assert client.post(
             "/auth/login", json={"username": correo, "password": clave}
@@ -174,7 +191,7 @@ class TestTransferenciaDeCuenta:
     ) -> None:
         """La transferencia cambia quien entra, no que permisos tiene."""
         correo = "conserva@ejemplo.com"
-        client.post("/auth/register", json={"email": correo, "password": "contrasena-larga"})
+        _cuenta_local(correo, "contrasena-larga")
 
         _con_token(monkeypatch, correo)
         cuerpo = _entrar(client).json()
