@@ -23,7 +23,7 @@ os.environ.setdefault("API_PASSWORD", "test-password")
 import watchdog  # noqa: E402
 
 
-def _run_with(checks, previous_state, monkeypatch, sources=None):
+def _run_with(checks, previous_state, monkeypatch, sources=None, capacity=None):
     """Corre main() con chequeos fijos y devuelve (mensajes, estado guardado)."""
     sent: list[str] = []
     saved: dict = {}
@@ -32,6 +32,7 @@ def _run_with(checks, previous_state, monkeypatch, sources=None):
     monkeypatch.setattr(watchdog, "check_backend_up", lambda: checks[1])
     monkeypatch.setattr(watchdog, "check_backend_data_fresh", lambda: checks[2])
     monkeypatch.setattr(watchdog, "check_sources_fresh", lambda: list(sources or []))
+    monkeypatch.setattr(watchdog, "check_capacity", lambda: list(capacity or []))
     monkeypatch.setattr(watchdog, "load_state", lambda: previous_state)
     monkeypatch.setattr(watchdog, "save_state", lambda s: saved.update(s))
     monkeypatch.setattr(watchdog, "notify", lambda text: sent.append(text))
@@ -220,3 +221,46 @@ class TestFrescuraPorFuente:
                   "source:aircraft_position": False}
         _, saved = _run_with(ALL_OK, previo, monkeypatch, sources=[])
         assert saved["source:aircraft_position"] is False
+
+
+class TestCapacidad:
+    """
+    Tamano de la base y duracion del ciclo: senales adelantadas, no caidas.
+
+    El job baja la base entera de GCS y la vuelve a subir en cada ciclo, asi
+    que su duracion crece con el archivo. Los predictores corren cada 15 min;
+    cuando el ciclo se acerca a esa ventana, dos jobs terminan escribiendo la
+    misma base. Ver issue #4.
+    """
+
+    def test_avisa_cuando_la_base_pasa_el_umbral(self, monkeypatch) -> None:
+        cap = [_fail("db_size", "La base pesa 850 MB (se avisa sobre 800)")]
+        sent, saved = _run_with(ALL_OK, {}, monkeypatch, capacity=cap)
+        assert len(sent) == 1 and "850 MB" in sent[0]
+        assert saved["db_size"] is False
+
+    def test_avisa_cuando_el_ciclo_se_acerca_al_scheduler(self, monkeypatch) -> None:
+        cap = [_fail("cycle_duration", "El ciclo tarda 11.0 min de mediana")]
+        sent, _ = _run_with(ALL_OK, {}, monkeypatch, capacity=cap)
+        assert len(sent) == 1 and "cycle_duration" in sent[0]
+
+    def test_tamano_y_duracion_son_alertas_distintas(self, monkeypatch) -> None:
+        # La base puede crecer sin que el ciclo sufra todavia, y al reves.
+        cap = [_fail("db_size"), _ok("cycle_duration")]
+        _, saved = _run_with(ALL_OK, {}, monkeypatch, capacity=cap)
+        assert saved["db_size"] is False
+        assert saved["cycle_duration"] is True
+
+    def test_no_pregunta_si_el_backend_esta_caido(self, monkeypatch) -> None:
+        llamadas = []
+        monkeypatch.setattr(watchdog, "check_capacity", lambda: llamadas.append(1) or [])
+        monkeypatch.setattr(watchdog, "check_sources_fresh", lambda: [])
+        monkeypatch.setattr(watchdog, "check_gcs_freshness", lambda: _ok("gcs"))
+        monkeypatch.setattr(watchdog, "check_backend_up", lambda: _fail("backend_up"))
+        monkeypatch.setattr(watchdog, "check_backend_data_fresh", lambda: _ok("backend_data"))
+        monkeypatch.setattr(watchdog, "load_state", lambda: {})
+        monkeypatch.setattr(watchdog, "save_state", lambda s: None)
+        monkeypatch.setattr(watchdog, "notify", lambda t: None)
+
+        assert watchdog.main() == 0
+        assert llamadas == []
