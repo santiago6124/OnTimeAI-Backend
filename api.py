@@ -541,10 +541,34 @@ def today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def risk_level(proba: float) -> str:
-    if proba >= 0.35:
+# Sin umbral en la fila —predicciones anteriores a que se guardara la columna—
+# se usa este, que es el del artefacto v9.
+_FALLBACK_THRESHOLD = 0.32
+
+
+def risk_level(proba: float, threshold: float | None = None) -> str:
+    """Traduce una probabilidad al nivel que muestra el dashboard.
+
+    Las bandas son relativas al umbral con el que el modelo etiqueto esa misma
+    prediccion, no constantes. Antes eran 0.35 y 0.15, elegidas cuando la
+    probabilidad media del lote rondaba 0.55 porque la cadena de ajustes la
+    inflaba. Con la probabilidad calibrada la media queda en ~0.07 y el umbral
+    en ~0.09, asi que esas constantes dejaban un vuelo marcado como demorado
+    (`predicted_delay=1`) mostrandose como riesgo bajo.
+
+    Atado al umbral, las tres bandas se sostienen solas:
+
+      alto   p >= 2x umbral   medido: la precision aproximadamente dobla
+      medio  p >= umbral      marcado como demorado, pero al filo
+      bajo   p <  umbral      no marcado
+
+    De modo que alto + medio es exactamente lo que el modelo marca, y no puede
+    volver a desalinearse del label.
+    """
+    cut = threshold if threshold and threshold > 0 else _FALLBACK_THRESHOLD
+    if proba >= 2 * cut:
         return "high"
-    if proba >= 0.15:
+    if proba >= cut:
         return "medium"
     return "low"
 
@@ -558,6 +582,15 @@ def _load_meta() -> dict[str, Any]:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+def _row_threshold(row) -> float | None:
+    """El umbral guardado en la fila, o None si la prediccion es anterior."""
+    try:
+        value = row["threshold_used"]
+    except (IndexError, KeyError):
+        return None
+    return float(value) if value is not None else None
+
 
 def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
     """Latest prediction per flight for active/upcoming flights in a sliding window.
@@ -592,6 +625,7 @@ def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
                f.aircraft_type,
                p.proba_delay,
                p.predicted_delay,
+               p.threshold_used,
                p.predicted_at_utc,
                CASE WHEN a.arr_delay_min IS NOT NULL THEN 1 ELSE 0 END AS has_actual,
                a.arr_delay_min,
@@ -661,7 +695,7 @@ def _flight_row_to_dict(row: sqlite3.Row) -> dict:
         "actual_on_utc":     act_on,
         "actual_in_utc":     act_in,
         "aircraft_type":   row["aircraft_type"] or "",
-        "risk":            risk_level(proba),
+        "risk":            risk_level(proba, _row_threshold(row)),
         "delay_probability": round(proba, 4),
         "predicted_delay": int(row["predicted_delay"]),
         "predicted_at_utc": row["predicted_at_utc"] or "",
@@ -960,6 +994,7 @@ def _get_historical_flight(con: sqlite3.Connection, fa_flight_id: str):
                f.aircraft_type,
                p.proba_delay,
                p.predicted_delay,
+               p.threshold_used,
                p.predicted_at_utc,
                CASE WHEN a.arr_delay_min IS NOT NULL THEN 1 ELSE 0 END AS has_actual,
                a.arr_delay_min,
@@ -1104,12 +1139,15 @@ def metrics_summary():
             }
         probas = [float(r["proba_delay"]) for r in rows]
         preds  = [int(r["predicted_delay"]) for r in rows]
+        # Mismo criterio que /flights: calculados por separado terminarian
+        # discrepando entre las fichas y el conteo del encabezado.
+        niveles = [risk_level(float(r["proba_delay"]), _row_threshold(r)) for r in rows]
         ticks  = [r["predicted_at_utc"] for r in rows if r["predicted_at_utc"]]
         return {
             "total_flights":           len(rows),
-            "high_risk":               sum(1 for p in probas if p >= 0.35),
-            "medium_risk":             sum(1 for p in probas if 0.15 <= p < 0.35),
-            "low_risk":                sum(1 for p in probas if p < 0.15),
+            "high_risk":               niveles.count("high"),
+            "medium_risk":             niveles.count("medium"),
+            "low_risk":                niveles.count("low"),
             "avg_delay_probability":   round(float(np.mean(probas)), 4),
             "predicted_positive_rate": round(float(np.mean(preds)), 4),
             "model_version":           ACTIVE_MODEL,
