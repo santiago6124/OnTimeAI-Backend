@@ -86,11 +86,28 @@ Y el estado se arrastra entre corridas: una fuente que no se pudo evaluar
 conserva lo que sabíamos de ella. Si su clave desapareciera, al volver el
 backend se la daría por sana y volvería a avisar de algo que nunca se arregló.
 
-## Lo que queda por hacer, fuera del código
+## Decisión: no se revive el feed
 
-- [ ] Escribir a contact@airplanes.live describiendo el proyecto
-- [ ] Averiguar si OpenSky admite tráfico desde Cloud Run, o buscar salida por
-      otra IP
+Se podría: escribir a contact@airplanes.live describiendo el proyecto, y
+averiguar si OpenSky admite tráfico desde Cloud Run o salir por otra IP.
 
-Mientras tanto la alerta de ADS-B va a dispararse una vez y quedarse callada,
-que es el comportamiento correcto para un problema conocido y persistente.
+No se hace, por tres razones.
+
+**Sus dos ajustes pertenecen a una cadena que estamos desarmando.**
+`adsb_eta_adjust` y `adsb_holding_adjust` son dos de las cuatro etapas de la
+cadena post-predicción. Medida sobre 3.979 vuelos con resultado real, esa
+cadena empeoraba el Brier ×5,6 y el ECE ×29 a cambio de +0,019 de AUC.
+Recuperar ADS-B seria devolverle dos etapas a algo que se está apagando.
+
+**Su tercer uso tiene suplentes.** `expand_candidate_tails()` suma matrículas
+vistas por ADS-B al conjunto a cosechar, pero es una de tres fuentes; las otras
+dos —matrículas pedidas por bootstrap y caché vencida— siguen funcionando.
+
+**El sistema lleva un mes sin ADS-B y está mejor que antes.** El ECE del modelo
+sobre la cohorte actual es 0,0164, el mejor medido.
+
+Si en algún momento se reconstruye la cadena de ajustes sobre bases medidas en
+vez de bandas fijadas a mano, vale la pena volver sobre esto. Hoy no.
+
+La alerta va a dispararse una vez y quedarse callada, que es el comportamiento
+correcto para un problema conocido que se decidió no atacar.
