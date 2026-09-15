@@ -50,20 +50,24 @@ Se recortó la imagen en dos pasos:
 nodos domina sobre el tamaño:
 
 ```
-imagen 353 MB (varias corridas)  → 120,4 s
-imagen 320 MB (varias corridas)  → 129,4 s
-imagen 247 MB (recién construida)→ 323,6 s
-imagen 247 MB (segunda)          → 291,6 s
-imagen 247 MB (tercera)          → 239,0 s
+imagen 353 MB  → 120,4 s
+imagen 320 MB  → 129,4 s
+imagen 247 MB  → 323,6 s   291,6 s   239,0 s   292,7 s
 ```
 
-Una imagen **más chica arranca más lento mientras está fría**, y va bajando a
-medida que los nodos la cachean. Con esa varianza, un 30% de recorte no produce
-señal distinguible del ruido.
+La imagen **más chica arranca entre dos y tres veces más lento**. La primera
+explicación —que se iba calentando la caché y convergería— la contradice la
+cuarta medición: 239 y después 292. No converge, oscila.
+
+Lo afirmable es lo que se ve: en este rango de tamaños la varianza del arranque
+con la misma imagen (239 a 324 s) es mayor que cualquier efecto atribuible a
+los MB, y no hay forma de aislarlo desde afuera. Lo que domina es algo del
+aprovisionamiento de Cloud Run que no controlamos ni observamos.
 
 Los dos recortes se dejan igual: valen por sí solos —menos que mantener, menos
 que auditar— pero **no hay evidencia de que aceleren el ciclo**, y no conviene
-afirmarlo.
+afirmarlo. Tampoco la hay de que lo empeoren: los 323 s de la imagen nueva son
+del mismo orden que la varianza que muestra consigo misma.
 
 ## El criterio que no se cumple
 
