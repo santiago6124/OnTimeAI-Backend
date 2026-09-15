@@ -613,6 +613,14 @@ def _optional_prediction_column(
 # respecto de su cadencia real, para que un ciclo lento no dispare ruido.
 #
 #   (columna de tiempo, minutos tolerados, que la alimenta)
+# Cadencia de los predictores. La duracion del ciclo se juzga contra esto.
+SCHEDULER_INTERVAL_MIN = 15
+
+# Cuando el archivo empieza a ser el problema. Medido: a 722 MB los ciclos
+# daban 6-10 min; a 437 MB, 4-7. El umbral deja margen para reaccionar antes de
+# que la transferencia domine el ciclo.
+DB_SIZE_WARN_MB = int(os.getenv("DB_SIZE_WARN_MB", "800"))
+
 SOURCE_FRESHNESS: dict[str, tuple[str, int, str]] = {
     "predictions":       ("predicted_at_utc",  60,  "live-pull (cada 15 min)"),
     "actuals":           ("settled_at_utc",   120,  "harvester FR24 + AeroAPI"),
@@ -620,6 +628,53 @@ SOURCE_FRESHNESS: dict[str, tuple[str, int, str]] = {
     "nas_status":        ("captured_at_utc",  180,  "NAS status FAA"),
     "aircraft_position": ("captured_at_utc",  120,  "ADS-B airplanes.live / OpenSky"),
 }
+
+
+def _recent_cycles(con: sqlite3.Connection, limit: int = 8) -> dict:
+    """Duracion de los ultimos ciclos del pipeline, desde la tabla `runs`.
+
+    El scheduler dispara cada 15 minutos. Un ciclo que se acerca a esa ventana
+    empieza a solaparse con el siguiente: dos jobs escribiendo la misma base y
+    pisandose las subidas a GCS. La duracion es la senal que avisa antes de que
+    eso pase, y el tamano de la base es su causa principal —el job la baja
+    entera y la vuelve a subir en cada ciclo, asi que el costo crece con el
+    archivo. Ver issue #4.
+    """
+    try:
+        filas = con.execute(
+            """SELECT started_utc, finished_utc FROM runs
+                WHERE finished_utc IS NOT NULL
+                ORDER BY started_utc DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+
+    duraciones: list[float] = []
+    for started, finished in filas:
+        try:
+            a = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+            b = datetime.fromisoformat(str(finished).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        duraciones.append(round((b - a).total_seconds() / 60, 1))
+    if not duraciones:
+        return {}
+
+    ordenadas = sorted(duraciones)
+    mediana = ordenadas[len(ordenadas) // 2]
+    tolerado = round(SCHEDULER_INTERVAL_MIN * 2 / 3, 1)
+    return {
+        "recent_minutes": duraciones,
+        "median_minutes": mediana,
+        "max_minutes": max(duraciones),
+        "scheduler_minutes": SCHEDULER_INTERVAL_MIN,
+        # Dos tercios de la ventana: deja margen para reaccionar antes del
+        # solapamiento, sin gritar por un ciclo lento aislado. Por eso se
+        # compara la mediana y no el maximo.
+        "tolerated_minutes": tolerado,
+        "slow": mediana > tolerado,
+    }
 
 
 def _source_freshness(con: sqlite3.Connection) -> dict[str, dict]:
@@ -1842,6 +1897,9 @@ def db_stats(request: Request):
             "table_sizes_source": "dbstat" if exact is not None else "sampled",
             "table_dates": table_dates,
             "sources": _source_freshness(con),
+            "cycles": _recent_cycles(con),
+            "db_size_warn_mb": DB_SIZE_WARN_MB,
+            "db_size_over_warn": size_mb > DB_SIZE_WARN_MB,
             "prediction_dates": date_range,
             "refresh": {
                 "last_ok_utc": _db_last_refresh_ok_utc,
