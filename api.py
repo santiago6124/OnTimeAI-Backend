@@ -583,6 +583,32 @@ def _load_meta() -> dict[str, Any]:
 
 # ── Helpers ────────────────────────────────────────────────────────────────
 
+def _optional_prediction_column(
+    con: sqlite3.Connection, name: str, table_alias: str = "p"
+) -> str:
+    """`<alias>.<name>` si la columna existe, `NULL AS <name>` si no.
+
+    Las columnas que se fueron sumando a `predictions` las crea una migracion
+    `ALTER TABLE` que corre al abrir la base para escritura, o sea en el job.
+    La API la abre en modo lectura y puede estar sirviendo una base que todavia
+    no paso por ahi: la bundleada en la imagen, que es el fallback de arranque,
+    o cualquier snapshot viejo.
+
+    Referenciar una de esas columnas a secas tumba el endpoint con
+    `OperationalError: no such column`. Paso el 15/09 con `threshold_used`:
+    /metrics/summary y /flights devolvieron 500 hasta el rollback.
+
+    El nombre se interpola en el SQL, asi que solo se llama con literales del
+    codigo, nunca con algo que venga de afuera.
+    """
+    present = {
+        row["name"] for row in con.execute("PRAGMA table_info(predictions)").fetchall()
+    }
+    if name not in present:
+        return f"NULL AS {name}"
+    return f"{table_alias}.{name}" if table_alias else name
+
+
 def _row_threshold(row) -> float | None:
     """El umbral guardado en la fila, o None si la prediccion es anterior."""
     try:
@@ -611,7 +637,10 @@ def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
     end_window = (now + timedelta(hours=18)).isoformat()
     undeparted_limit = (now - timedelta(hours=24)).isoformat()
 
-    rows = con.execute("""
+    threshold_col_inner = _optional_prediction_column(
+        con, "threshold_used", table_alias="p2"
+    )
+    rows = con.execute(f"""
         SELECT f.fa_flight_id,
                f.ident_iata,
                f.op_carrier,
@@ -639,6 +668,7 @@ def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
             SELECT p2.fa_flight_id,
                    p2.proba_delay,
                    p2.predicted_delay,
+                   {threshold_col_inner},
                    p2.predicted_at_utc,
                    ROW_NUMBER() OVER (
                        PARTITION BY p2.fa_flight_id
@@ -882,17 +912,8 @@ def list_flights(status: str = "all", departures_within_min: int = None):
 def get_flight_history(fa_flight_id: str):
     con = get_db()
     try:
-        prediction_columns = {
-            row["name"] for row in con.execute("PRAGMA table_info(predictions)").fetchall()
-        }
-
-        def optional_prediction_column(name: str) -> str:
-            # Static names supplied below; aliasing keeps legacy bundled DBs
-            # readable before the startup migration has run (notably in tests).
-            return f"p.{name}" if name in prediction_columns else f"NULL AS {name}"
-
         optional_fields = ", ".join(
-            optional_prediction_column(name)
+            _optional_prediction_column(con, name)
             for name in (
                 "proba_raw", "threshold_used", "threshold_strategy",
                 "prediction_phase", "gdp_orig_delay_min", "gdp_dest_delay_min",
@@ -980,7 +1001,11 @@ def _get_historical_flight(con: sqlite3.Connection, fa_flight_id: str):
     Used when a flight has already departed and is no longer in the active
     sliding window returned by _latest_predictions_active().
     """
-    return con.execute("""
+    # Sin alias: la subconsulta lee `predictions` directamente.
+    threshold_col_inner = _optional_prediction_column(
+        con, "threshold_used", table_alias=""
+    )
+    return con.execute(f"""
         SELECT f.fa_flight_id,
                f.ident_iata,
                f.op_carrier,
@@ -1003,6 +1028,7 @@ def _get_historical_flight(con: sqlite3.Connection, fa_flight_id: str):
         FROM flights f
         JOIN (
             SELECT fa_flight_id, proba_delay, predicted_delay, predicted_at_utc,
+                   {threshold_col_inner},
                    ROW_NUMBER() OVER (
                        PARTITION BY fa_flight_id ORDER BY predicted_at_utc DESC
                    ) AS rn
