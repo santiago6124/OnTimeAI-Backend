@@ -263,3 +263,69 @@ class TestDuracionDeCiclos:
         con_migrada.commit()
 
         assert api._recent_cycles(con_migrada)["recent_minutes"] == [5.0]
+
+
+class TestDuracionRealDelCiclo:
+    """
+    `runs.started_utc`/`finished_utc` los escribe live_pull y miden solo el
+    pipeline. El ciclo real incluye arranque del contenedor, descarga de GCS,
+    purga, VACUUM y subida.
+
+    Medido el 15/09 en produccion: 1,7-3,2 min segun `runs` contra 4,7-7,5 de
+    la ejecucion de Cloud Run. Una alerta construida sobre el numero chico no
+    se dispararia nunca, aunque el job estuviera por solaparse con el siguiente.
+    `job_seconds` lo escribe live_job y cubre el ciclo entero.
+    """
+
+    def _run(self, con, started, finished, job_seconds=None) -> None:
+        con.execute(
+            "INSERT INTO runs (started_utc, finished_utc, job_seconds) VALUES (?,?,?)",
+            (started, finished, job_seconds),
+        )
+
+    @pytest.fixture
+    def con_con_job_seconds(self, con_migrada):
+        con_migrada.execute("ALTER TABLE runs ADD COLUMN job_seconds REAL")
+        return con_migrada
+
+    def test_prefiere_la_duracion_completa(self, con_con_job_seconds) -> None:
+        con = con_con_job_seconds
+        # El pipeline dice 2 min; el ciclo completo, 6.
+        self._run(con, "2026-09-15T01:00:00+00:00", "2026-09-15T01:02:00+00:00", 360.0)
+        con.commit()
+
+        c = api._recent_cycles(con)
+        assert c["median_minutes"] == pytest.approx(6.0), "uso el numero del pipeline"
+        assert c["full_cycle_samples"] == 1
+
+    def test_cae_al_pipeline_cuando_no_hay_dato_completo(self, con_con_job_seconds) -> None:
+        con = con_con_job_seconds
+        self._run(con, "2026-09-15T01:00:00+00:00", "2026-09-15T01:02:00+00:00", None)
+        con.commit()
+
+        c = api._recent_cycles(con)
+        assert c["median_minutes"] == pytest.approx(2.0)
+        assert c["full_cycle_samples"] == 0
+
+    def test_reporta_cuantas_muestras_son_completas(self, con_con_job_seconds) -> None:
+        """Mientras no sean todas, la mediana esta sesgada hacia abajo."""
+        con = con_con_job_seconds
+        self._run(con, "2026-09-15T01:00:00+00:00", "2026-09-15T01:02:00+00:00", 360.0)
+        self._run(con, "2026-09-15T02:00:00+00:00", "2026-09-15T02:02:00+00:00", None)
+        con.commit()
+
+        c = api._recent_cycles(con)
+        assert c["full_cycle_samples"] == 1
+        assert c["total_samples"] == 2
+
+    def test_una_base_sin_la_columna_sigue_funcionando(self, con_migrada) -> None:
+        # Sin migrar todavia: se usa el pipeline y se avisa que no hay completas.
+        con_migrada.execute(
+            "INSERT INTO runs (started_utc, finished_utc) VALUES (?,?)",
+            ("2026-09-15T01:00:00+00:00", "2026-09-15T01:03:00+00:00"),
+        )
+        con_migrada.commit()
+
+        c = api._recent_cycles(con_migrada)
+        assert c["median_minutes"] == pytest.approx(3.0)
+        assert c["full_cycle_samples"] == 0

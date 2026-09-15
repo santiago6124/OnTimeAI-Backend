@@ -5,6 +5,7 @@ import os
 import resource
 import shutil
 import sys
+import time
 from pathlib import Path
 
 from ontimeai.training_store import read_bool_env
@@ -337,6 +338,46 @@ def _run_pipeline_attempt(extra_args: list[str]) -> int:
     return 0
 
 
+# Momento en que arranco el proceso. `runs` lo escribe live_pull y mide solo el
+# pipeline; el ciclo real incluye arranque del contenedor, descarga de GCS,
+# purga, VACUUM y subida. Medido el 15/09: 1,7-3,2 min contra 4,7-7,5 de la
+# ejecucion de Cloud Run.
+_JOB_STARTED = time.monotonic()
+
+
+def _record_job_duration() -> None:
+    """Guarda cuanto tardo el ciclo completo en la fila de `runs` de este ciclo.
+
+    Se llama antes de subir, porque despues la base ya viajo. Queda afuera la
+    subida en si —12 a 30 s para un archivo de 437 MB, medido—, asi que el
+    numero subestima el total por ese margen conocido.
+
+    Es la senal que avisa antes de que dos jobs se solapen: los predictores
+    corren cada 15 min y el ciclo crece con el tamano del archivo. Ver issue #4.
+    """
+    import sqlite3
+
+    elapsed = time.monotonic() - _JOB_STARTED
+    try:
+        con = sqlite3.connect(TMP_DB)
+        try:
+            cols = {r[1] for r in con.execute("PRAGMA table_info(runs)").fetchall()}
+            if "job_seconds" not in cols:
+                con.execute("ALTER TABLE runs ADD COLUMN job_seconds REAL")
+            con.execute(
+                """UPDATE runs SET job_seconds = ?
+                    WHERE run_id = (SELECT MAX(run_id) FROM runs)""",
+                (round(elapsed, 1),),
+            )
+            con.commit()
+        finally:
+            con.close()
+        print(f"[job] ciclo completo: {elapsed / 60:.1f} min")
+    except Exception as exc:
+        # No frena el ciclo: es telemetria, no parte del pipeline.
+        print(f"[job] no se pudo registrar la duracion: {type(exc).__name__}: {exc}")
+
+
 def main() -> int:
     try:
         _validate_training_store_config()
@@ -377,6 +418,7 @@ def main() -> int:
                 raise FileNotFoundError(f"pipeline did not produce {TMP_DB}")
 
             _cleanup_old_data()
+            _record_job_duration()
             _gcs_upload(base_generation)
             # Publish the newly durable outbox immediately, but acknowledge it
             # next cycle so no second full-DB upload is needed.
