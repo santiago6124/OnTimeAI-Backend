@@ -199,6 +199,14 @@ def check_capacity() -> list[Check]:
             f"La base pesa {size:.0f} MB (se avisa sobre {limite})",
         ))
 
+    cal = stats.get("chain_calibrator") or {}
+    if cal:
+        checks.append(Check(
+            "chain_calibrator",
+            not cal.get("stale", True),
+            f"Calibrador post-cadena: {cal.get('detail', 'sin detalle')}",
+        ))
+
     ciclos = stats.get("cycles") or {}
     if ciclos.get("median_minutes") is not None:
         checks.append(Check(

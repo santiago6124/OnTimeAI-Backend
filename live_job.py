@@ -349,6 +349,25 @@ def _run_pipeline_attempt(extra_args: list[str]) -> int:
                         con, model_version=os.environ.get("ACTIVE_MODEL", "")
                     )
                 print(f"[job] Agregados diarios: {n} filas (dia, segmento)")
+
+                # Reajuste del calibrador post-cadena.
+                #
+                # Antes de purgar, como los agregados: aprende de los vuelos
+                # que ya aterrizaron y la purga se lleva esa materia prima.
+                # Devolver None es un resultado valido —sin muestra suficiente
+                # no se calibra— y el ciclo sigue igual.
+                from ontimeai.chain_calibration import fit_chain_calibrator
+
+                with _fase("calibrador post-cadena"):
+                    ajuste = fit_chain_calibrator(con)
+                if ajuste is None:
+                    print("[job] Calibrador post-cadena: sin muestra suficiente, no se ajusto")
+                else:
+                    print(
+                        f"[job] Calibrador post-cadena: ajustado con "
+                        f"{ajuste['n_samples']:,} vuelos de {ajuste['window_days']} dias "
+                        f"(tasa base {ajuste['base_rate']:.1%})"
+                    )
             finally:
                 con.close()
         except Exception as e:

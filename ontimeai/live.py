@@ -239,6 +239,7 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
     _migrate_predictions_threshold(conn)
     _migrate_stable_ids(conn)
     _migrate_predictions_gdp_adjustment(conn)
+    _migrate_predictions_chain_probability(conn)
     _migrate_nas_status(conn)
     _migrate_estimated_times(conn)
     _migrate_prediction_phase(conn)
@@ -294,6 +295,20 @@ def _migrate_predictions_gdp_adjustment(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE predictions ADD COLUMN adsb_eta_delay_min REAL")
     if "adsb_holding_min" not in cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN adsb_holding_min REAL")
+
+
+def _migrate_predictions_chain_probability(conn: sqlite3.Connection) -> None:
+    """`proba_chain`: la salida de la cadena ANTES del calibrador post-cadena.
+
+    Hace falta separada de `proba_delay` —que es lo que se sirve— para que el
+    calibrador se reajuste sobre la salida cruda. Ajustarlo sobre lo servido
+    haria que cada reajuste aprendiera sobre valores ya calibrados, y la
+    correccion se aplicaria dos veces, tres, n veces.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(predictions)").fetchall()}
+    if "proba_chain" not in cols:
+        conn.execute("ALTER TABLE predictions ADD COLUMN proba_chain REAL")
+        conn.commit()
 
 
 def _migrate_predictions_threshold(conn: sqlite3.Connection) -> None:
