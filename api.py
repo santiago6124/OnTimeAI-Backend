@@ -608,6 +608,56 @@ def _optional_prediction_column(
         return f"NULL AS {name}"
     return f"{table_alias}.{name}" if table_alias else name
 
+# Cada fuente escribe una tabla distinta y a su propio ritmo. El numero es
+# cuantos minutos puede pasar sin escribir antes de considerarla caida: holgado
+# respecto de su cadencia real, para que un ciclo lento no dispare ruido.
+#
+#   (columna de tiempo, minutos tolerados, que la alimenta)
+SOURCE_FRESHNESS: dict[str, tuple[str, int, str]] = {
+    "predictions":       ("predicted_at_utc",  60,  "live-pull (cada 15 min)"),
+    "actuals":           ("settled_at_utc",   120,  "harvester FR24 + AeroAPI"),
+    "weather_obs":       ("valid_utc",        180,  "IEM METAR (publica cada ~1 h)"),
+    "nas_status":        ("captured_at_utc",  180,  "NAS status FAA"),
+    "aircraft_position": ("captured_at_utc",  120,  "ADS-B airplanes.live / OpenSky"),
+}
+
+
+def _source_freshness(con: sqlite3.Connection) -> dict[str, dict]:
+    """Cuanto hace que escribio cada fuente, y si eso ya es demasiado.
+
+    Una fuente que deja de escribir no rompe nada: el pipeline sigue, las
+    corridas figuran exitosas y la senal desaparece sin ruido. Paso con ADS-B,
+    que estuvo 25 dias inerte —`adsb_eta_adjust` y `adsb_holding_adjust`
+    recibiendo None en cada ciclo— hasta que alguien miro la tabla. Ver #9.
+    """
+    now = datetime.now(timezone.utc)
+    out: dict[str, dict] = {}
+    for table, (column, tolerated_min, fed_by) in SOURCE_FRESHNESS.items():
+        try:
+            row = con.execute(f"SELECT MAX({column}) FROM {table}").fetchone()
+        except sqlite3.OperationalError:
+            continue
+        last = row[0] if row else None
+        age_min: float | None = None
+        if last:
+            try:
+                parsed = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                age_min = round((now - parsed).total_seconds() / 60, 1)
+            except ValueError:
+                age_min = None
+        out[table] = {
+            "last_utc": last,
+            "age_minutes": age_min,
+            "tolerated_minutes": tolerated_min,
+            # Sin dato es tan malo como un dato viejo: la tabla vacia es
+            # justamente el estado en que quedo aircraft_position.
+            "stale": age_min is None or age_min > tolerated_min,
+            "fed_by": fed_by,
+        }
+    return out
+
 
 def _row_threshold(row) -> float | None:
     """El umbral guardado en la fila, o None si la prediccion es anterior."""
@@ -1729,6 +1779,7 @@ def db_stats(request: Request):
             "table_sizes_mb": table_sizes_mb,
             "table_sizes_source": "dbstat" if exact is not None else "sampled",
             "table_dates": table_dates,
+            "sources": _source_freshness(con),
             "prediction_dates": date_range,
             "refresh": {
                 "last_ok_utc": _db_last_refresh_ok_utc,

@@ -113,6 +113,60 @@ def check_backend_up() -> Check:
         return Check("backend_up", False, f"Backend inalcanzable: {exc}")
 
 
+def _login() -> str:
+    """Token del backend. Lanza si no se pudo, para que el chequeo lo reporte."""
+    response = requests.post(
+        f"{BACKEND_URL}/auth/login",
+        json={"username": API_USERNAME, "password": API_PASSWORD},
+        timeout=HTTP_TIMEOUT,
+    )
+    if response.status_code != 200:
+        raise RuntimeError(f"login fallo con {response.status_code}")
+    return response.json()["access_token"]
+
+
+def check_sources_fresh() -> list[Check]:
+    """Una senal por fuente de datos, no una sola por el pipeline entero.
+
+    Que el pipeline corra no significa que siga recibiendo todo lo que recibia.
+    ADS-B dejo de escribir el 12/08 y estuvo 25 dias inerte: las corridas
+    figuraban exitosas, no habia errores, y dos de las cuatro etapas de ajuste
+    recibian None en cada ciclo. La causa —403 de airplanes.live pidiendo
+    registro, y timeout de OpenSky— estaba en los logs del harvester, en nivel
+    WARNING, sin que nada la levantara. Ver #9.
+
+    Cada fuente es su propia alerta: una caida no puede quedar tapada por el
+    resto funcionando.
+    """
+    try:
+        stats = requests.get(
+            f"{BACKEND_URL}/admin/db-stats",
+            headers={"Authorization": f"Bearer {_login()}"},
+            timeout=HTTP_TIMEOUT,
+        ).json()
+    except Exception as exc:
+        return [Check("sources", False, f"No se pudo leer la frescura por fuente: {exc}")]
+
+    sources = stats.get("sources") or {}
+    if not sources:
+        # Backend viejo, anterior a que el endpoint lo expusiera.
+        return []
+
+    checks: list[Check] = []
+    for table, info in sorted(sources.items()):
+        age = info.get("age_minutes")
+        fed_by = info.get("fed_by", "")
+        if age is None:
+            detail = f"`{table}` esta vacia o sin fecha legible ({fed_by})"
+        else:
+            detail = (
+                f"`{table}` no recibe datos hace {age:.0f} min "
+                f"(se toleran {info.get('tolerated_minutes')}) — {fed_by}"
+            )
+        checks.append(Check(f"source:{table}", not info.get("stale", False), detail))
+    return checks
+
+
 def check_backend_data_fresh() -> Check:
     """
     ¿El backend sirve datos frescos?
@@ -121,14 +175,7 @@ def check_backend_data_fresh() -> Check:
     snapshot de dos días atrás. Este chequeo compara contra el último tick.
     """
     try:
-        auth = requests.post(
-            f"{BACKEND_URL}/auth/login",
-            json={"username": API_USERNAME, "password": API_PASSWORD},
-            timeout=HTTP_TIMEOUT,
-        )
-        if auth.status_code != 200:
-            return Check("backend_data", False, f"Login falló con {auth.status_code}")
-        token = auth.json()["access_token"]
+        token = _login()
 
         summary = requests.get(
             f"{BACKEND_URL}/metrics/summary",
@@ -206,8 +253,18 @@ def notify(text: str) -> None:
 
 def main() -> int:
     checks = [check_gcs_freshness(), check_backend_up(), check_backend_data_fresh()]
+    # Solo tiene sentido preguntar por las fuentes si el backend responde:
+    # si esta caido, cada fuente daria un falso positivo y el aviso serian
+    # cinco alertas en vez de una.
+    if all(c.ok for c in checks):
+        checks.extend(check_sources_fresh())
     state = load_state()
-    new_state = {}
+    # Se arranca del estado previo en vez de vacio. Una clave que no se pudo
+    # evaluar en esta corrida —las fuentes cuando el backend esta caido— tiene
+    # que conservar lo que sabiamos, no desaparecer: si desapareciera, al
+    # volver el backend `state.get(key, True)` la daria por sana y volveria a
+    # avisar de un problema que nunca dejo de estar.
+    new_state = dict(state)
     transitions: list[str] = []
 
     for check in checks:
