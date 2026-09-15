@@ -661,7 +661,7 @@ SOURCE_FRESHNESS: dict[str, tuple[str, int, str]] = {
 
 
 def _recent_cycles(con: sqlite3.Connection, limit: int = 8) -> dict:
-    """Duracion de los ultimos ciclos del pipeline, desde la tabla `runs`.
+    """Duracion de los ultimos ciclos completos del job.
 
     El scheduler dispara cada 15 minutos. Un ciclo que se acerca a esa ventana
     empieza a solaparse con el siguiente: dos jobs escribiendo la misma base y
@@ -669,19 +669,40 @@ def _recent_cycles(con: sqlite3.Connection, limit: int = 8) -> dict:
     eso pase, y el tamano de la base es su causa principal —el job la baja
     entera y la vuelve a subir en cada ciclo, asi que el costo crece con el
     archivo. Ver issue #4.
+
+    Se prefiere `runs.job_seconds`, que escribe live_job y cubre el ciclo
+    entero. `started_utc`/`finished_utc` los escribe live_pull y miden solo el
+    pipeline: medido el 15/09, 1,7-3,2 min contra 4,7-7,5 de la ejecucion real
+    de Cloud Run. La diferencia es arranque del contenedor, descarga, purga,
+    VACUUM y subida. Quedan como respaldo para las filas anteriores a que
+    `job_seconds` existiera, con la advertencia de que subestiman.
     """
+    tiene_job_seconds = False
+    try:
+        tiene_job_seconds = "job_seconds" in {
+            r["name"] for r in con.execute("PRAGMA table_info(runs)").fetchall()
+        }
+    except sqlite3.OperationalError:
+        return {}
+
+    columna = "job_seconds" if tiene_job_seconds else "NULL AS job_seconds"
     try:
         filas = con.execute(
-            """SELECT started_utc, finished_utc FROM runs
-                WHERE finished_utc IS NOT NULL
-                ORDER BY started_utc DESC LIMIT ?""",
+            f"""SELECT started_utc, finished_utc, {columna} FROM runs
+                 WHERE finished_utc IS NOT NULL
+                 ORDER BY started_utc DESC LIMIT ?""",
             (limit,),
         ).fetchall()
     except sqlite3.OperationalError:
         return {}
 
     duraciones: list[float] = []
-    for started, finished in filas:
+    completas = 0
+    for started, finished, job_seconds in filas:
+        if job_seconds is not None:
+            duraciones.append(round(float(job_seconds) / 60, 1))
+            completas += 1
+            continue
         try:
             a = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
             b = datetime.fromisoformat(str(finished).replace("Z", "+00:00"))
@@ -704,6 +725,10 @@ def _recent_cycles(con: sqlite3.Connection, limit: int = 8) -> dict:
         # compara la mediana y no el maximo.
         "tolerated_minutes": tolerado,
         "slow": mediana > tolerado,
+        # Cuantas de las filas miden el ciclo completo y no solo el pipeline.
+        # Mientras no sean todas, la mediana esta sesgada hacia abajo.
+        "full_cycle_samples": completas,
+        "total_samples": len(duraciones),
     }
 
 
