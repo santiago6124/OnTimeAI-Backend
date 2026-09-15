@@ -253,6 +253,34 @@ def main() -> int:
     ).fetchall():
         print(f"    {str(fase):<16}{cnt:>8,}{b_raw:>12.4f}{b_adj:>12.4f}{rate:>12.1%}")
 
+    print("\n[7] Punto de operacion sobre la probabilidad calibrada\n")
+    print("    La estrategia quantile@0.22 marca el 22% del lote porque el modelo")
+    print("    se entreno sobre BTS full-US, donde la tasa base ronda ese valor.")
+    print("    En ATL live la tasa real es otra, asi que el objetivo tambien deberia")
+    print("    serlo. Con una probabilidad calibrada, un umbral absoluto dice algo:\n")
+    rows = con.execute(
+        "SELECT proba_raw, y FROM temp.sample WHERE proba_raw IS NOT NULL"
+    ).fetchall()
+    total = len(rows)
+    positivos = sum(y for _, y in rows)
+    print(f"    {'umbral':>8}{'% marcado':>12}{'precision':>12}{'recall':>10}"
+          f"{'F1':>8}{'falsas/dia':>12}")
+    vuelos_por_dia = 700.0
+    for thr in (0.05, 0.08, 0.10, 0.12, 0.15, 0.20, 0.25, 0.30, 0.40, 0.50):
+        tp = sum(y for p_, y in rows if p_ >= thr)
+        marcados = sum(1 for p_, _ in rows if p_ >= thr)
+        if marcados == 0:
+            continue
+        prec = tp / marcados
+        rec = tp / positivos if positivos else float("nan")
+        f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
+        fp_dia = (marcados - tp) / total * vuelos_por_dia
+        print(f"    {thr:>8.2f}{marcados/total:>11.1%}{prec:>12.1%}{rec:>10.1%}"
+              f"{f1:>8.3f}{fp_dia:>12.0f}")
+    print(f"\n    De referencia: el lote tiene {total:,} vuelos y {positivos:,} demorados")
+    print(f"    ({positivos/total:.1%}). Las falsas por dia asumen ~{vuelos_por_dia:.0f}")
+    print("    vuelos diarios en la ventana operativa.")
+
     con.close()
     return 0
 
