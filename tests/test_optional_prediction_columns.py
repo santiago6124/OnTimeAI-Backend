@@ -28,6 +28,12 @@ def con_migrada() -> sqlite3.Connection:
     c = sqlite3.connect(":memory:")
     c.row_factory = sqlite3.Row
     c.executescript(SCHEMA)
+    # La crea el scrapper, no el SCHEMA del backend, pero en produccion vive en
+    # la misma base y la API la lee.
+    c.execute(
+        "CREATE TABLE IF NOT EXISTS aircraft_position ("
+        " icao24 TEXT NOT NULL, captured_at_utc TEXT NOT NULL, registration TEXT)"
+    )
     return c
 
 
@@ -127,3 +133,70 @@ class TestFilaConDatos:
         assert len(filas) == 1
         assert filas[0]["threshold_used"] == pytest.approx(0.09)
         assert api.risk_level(0.12, api._row_threshold(filas[0])) == "medium"
+
+
+class TestFrescuraPorFuente:
+    """
+    Una fuente que deja de escribir tiene que ser visible.
+
+    ADS-B dejo de escribir `aircraft_position` el 12/08 y estuvo 25 dias
+    inerte: las corridas figuraban exitosas, no habia errores, y dos de las
+    cuatro etapas de ajuste recibian None en cada ciclo. Ver #9.
+    """
+
+    def test_una_tabla_vacia_cuenta_como_caida(self, con_migrada) -> None:
+        # Es el estado exacto en que quedo aircraft_position: la purga de 30
+        # dias se llevo lo ultimo que habia y nada volvio a escribir.
+        fuentes = api._source_freshness(con_migrada)
+        assert fuentes["aircraft_position"]["stale"] is True
+        assert fuentes["aircraft_position"]["age_minutes"] is None
+
+    def test_una_escritura_reciente_no_esta_caida(self, con_migrada) -> None:
+        from datetime import datetime, timezone
+
+        ahora = datetime.now(timezone.utc).isoformat()
+        con_migrada.execute(
+            "INSERT INTO predictions (fa_flight_id, stable_id, predicted_at_utc,"
+            " proba_delay, predicted_delay) VALUES (?,?,?,?,?)",
+            ("FA1", "DL100", ahora, 0.1, 0),
+        )
+        fuentes = api._source_freshness(con_migrada)
+        assert fuentes["predictions"]["stale"] is False
+        assert fuentes["predictions"]["age_minutes"] < 1
+
+    def test_una_escritura_vieja_esta_caida(self, con_migrada) -> None:
+        from datetime import datetime, timedelta, timezone
+
+        viejo = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+        con_migrada.execute(
+            "INSERT INTO predictions (fa_flight_id, stable_id, predicted_at_utc,"
+            " proba_delay, predicted_delay) VALUES (?,?,?,?,?)",
+            ("FA1", "DL100", viejo, 0.1, 0),
+        )
+        fuentes = api._source_freshness(con_migrada)
+        assert fuentes["predictions"]["stale"] is True
+        assert fuentes["predictions"]["age_minutes"] == pytest.approx(300, abs=2)
+
+    def test_una_fecha_sin_zona_se_lee_como_utc(self, con_migrada) -> None:
+        # weather_obs guarda `valid_utc` sin offset. Leerla como hora local
+        # daria 3 horas de mas en Argentina y marcaria caida una fuente sana.
+        from datetime import datetime, timezone
+
+        ahora = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+        con_migrada.execute(
+            "INSERT INTO weather_obs (station, valid_utc) VALUES (?,?)", ("ATL", ahora)
+        )
+        fuentes = api._source_freshness(con_migrada)
+        assert fuentes["weather_obs"]["stale"] is False
+
+    def test_una_tabla_que_no_existe_se_omite(self, con_migrada) -> None:
+        """
+        Distinto de una tabla vacia. Que no exista significa que esa fuente
+        nunca se instalo en esta base —el backend puede leer una creada solo
+        por su propio SCHEMA—, no que dejo de escribir. Reportarla como caida
+        seria ruido permanente.
+        """
+        con_migrada.execute("DROP TABLE aircraft_position")
+        fuentes = api._source_freshness(con_migrada)
+        assert "aircraft_position" not in fuentes
+        assert "predictions" in fuentes
