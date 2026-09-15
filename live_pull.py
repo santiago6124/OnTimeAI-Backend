@@ -35,7 +35,12 @@ from ontimeai.live import (
     compute_adsb_holding_min, adsb_holding_adjust,
 )
 from ontimeai.lineage_fallback import load_lookups, build_live_turnaround_lookups
-from ontimeai.model import load_artifact, predict_label, predict_proba, select_threshold
+from ontimeai.model import (
+    load_artifact,
+    predict_proba,
+    select_threshold,
+    select_threshold_and_label,
+)
 from ontimeai.training_store import (
     enqueue_prediction_snapshots,
     enqueue_recent_outcomes,
@@ -48,6 +53,53 @@ from ontimeai.config import ARTIFACTS_DIR
 
 def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def load_gate_departure_delays(
+    conn, stable_ids: list[str]
+) -> tuple[dict[str, float], set[str]]:
+    """Demora de PUERTA de los vuelos que ya despegaron, y cuales ya aterrizaron.
+
+    Filtra `source_provider = 'aeroapi'` a proposito.
+    `intermediate_dep_delay_adjust` usa bandas validadas contra BTS para demora
+    de puerta, y solo aeroapi la mide: expone `actual_out` y su
+    `departure_delay` es gate-out.
+
+    FR24 guarda en esa misma columna `actual_off - scheduled_out`, o sea demora
+    de puerta MAS rodaje —no expone gate-out—. Medido sobre 410.650 filas fr24,
+    la mediana de `departure_delay_min - arr_delay_min` da +31,2 min contra
+    +7,0 en aeroapi: ese delta es el rodaje de ATL. Sin el filtro, un vuelo que
+    empujaba en horario y rodaba media hora entraba en la banda 30-60 y saltaba
+    a p=0.90. Ver issue #11.
+
+    El costo es cobertura: fr24 es el 96% de la muestra desde Fase 4, asi que
+    el ajuste queda casi inactivo. Es el resultado correcto mientras no exista
+    una demora de puerta comparable entre proveedores.
+    """
+    if not stable_ids:
+        return {}, set()
+    placeholders = ",".join("?" for _ in stable_ids)
+    dep_delay_map = {
+        row[0]: float(row[1])
+        for row in conn.execute(
+            f"""SELECT stable_id, departure_delay_min FROM actuals
+               WHERE stable_id IN ({placeholders})
+                 AND departure_delay_min IS NOT NULL
+                 AND source_provider = 'aeroapi'
+                 AND actual_in_utc IS NULL""",  # despego pero todavia no aterrizo
+            stable_ids,
+        ).fetchall()
+    }
+    landed_ids = {
+        row[0]
+        for row in conn.execute(
+            f"""SELECT stable_id FROM actuals
+               WHERE stable_id IN ({placeholders})
+                 AND actual_in_utc IS NOT NULL""",
+            stable_ids,
+        ).fetchall()
+    }
+    return dep_delay_map, landed_ids
 
 
 def main() -> int:
@@ -565,24 +617,26 @@ def main() -> int:
     # training snapshot stores booster/calibrated/final probabilities separately.
     proba = calibrated_proba
 
-    # Threshold strategy: quantile-target on the target subset (robust to live
-    # distribution shift); fall back to the artifact's static threshold when
-    # --target-pos-rate=0 or when the target batch is too small to estimate.
+    # Umbral de referencia sobre la probabilidad calibrada.
+    #
+    # NO es el que etiqueta. El operativo se calcula despues de la cadena de
+    # ajustes, sobre la misma distribucion contra la que se compara; este queda
+    # para poder medir cuanto la corre la cadena, que es informacion util en el
+    # log cuando algo se desalinea.
     target_proba = proba[target_mask.to_numpy()]
-    threshold_used, threshold_strategy = select_threshold(
+    threshold_calibrated, strategy_calibrated = select_threshold(
         target_proba,
         target_pos_rate=args.target_pos_rate,
         artifact_threshold=float(meta["threshold"]),
         abs_threshold=args.abs_threshold,
     )
-    labels = predict_label(proba, threshold_used, "binary")
     print(
-        f"   threshold strategy={threshold_strategy} value={threshold_used:.4f} "
-        f"| proba_target n={target_proba.size} mean={target_proba.mean():.3f} "
-        f"std={target_proba.std():.3f} pos_pred_rate="
-        f"{(target_proba >= threshold_used).mean():.3f}"
+        f"   threshold(calibrada) strategy={strategy_calibrated} "
+        f"value={threshold_calibrated:.4f} | proba_target n={target_proba.size} "
+        f"mean={target_proba.mean():.3f} std={target_proba.std():.3f}"
         if target_proba.size > 0
-        else f"   threshold strategy={threshold_strategy} value={threshold_used:.4f} (no targets)"
+        else f"   threshold(calibrada) strategy={strategy_calibrated} "
+             f"value={threshold_calibrated:.4f} (no targets)"
     )
 
     # Post-prediction GDP adjustment (Tier 2 #K). The v9 model was trained
@@ -602,27 +656,27 @@ def main() -> int:
     # Pre-fetch intermediate dep_delay for all target stable_ids in one query.
     target_indices = list(df.index[target_mask])
     target_stable_ids = [stable_id(df.loc[i, "fa_flight_id"]) for i in target_indices]
-    dep_delay_map: dict[str, float] = {}
-    landed_ids: set[str] = set()
-    if target_stable_ids:
-        placeholders = ",".join("?" for _ in target_stable_ids)
-        for row in conn.execute(
-            f"""SELECT stable_id, departure_delay_min FROM actuals
-               WHERE stable_id IN ({placeholders})
-                 AND departure_delay_min IS NOT NULL
-                 AND actual_in_utc IS NULL""",  # only flights that took off but haven't landed
-            target_stable_ids,
-        ).fetchall():
-            dep_delay_map[row[0]] = float(row[1])
-        for row in conn.execute(
-            f"""SELECT stable_id FROM actuals
-               WHERE stable_id IN ({placeholders})
-                 AND actual_in_utc IS NOT NULL""",
-            target_stable_ids,
-        ).fetchall():
-            landed_ids.add(row[0])
+    dep_delay_map, landed_ids = load_gate_departure_delays(conn, target_stable_ids)
 
     dep_adjust_enabled = os.getenv("DEP_DELAY_ADJUST", "1").lower() in ("1", "true", "yes")
+
+    # Apagado por defecto: hay que pedirlo explicitamente.
+    #
+    # `estimated_dep_delay_adjust` heredo las bandas de su hermano
+    # `intermediate_dep_delay_adjust`, que estan validadas contra BTS para
+    # demoras de salida YA OCURRIDAS. Aplicadas a una estimacion de horario
+    # —que todavia puede recuperarse— no describen nada.
+    #
+    # Medido sobre 3.979 vuelos con resultado real: el ajuste empujaba 2.678
+    # vuelos (67% del lote) y les mostraba una probabilidad media del 69,4%
+    # cuando la tasa real de ese grupo era 6,2%. El lote sin empujar daba 4,2%,
+    # asi que la senal existe pero vale un factor 1,5, no un factor 10. Que
+    # dos tercios de los vuelos tengan "demora estimada significativa" tambien
+    # sugiere que `estimated_out_utc` no significa lo que el ajuste asume.
+    #
+    # El reemplazo correcto es que el modelo aprenda la relacion, no fijarla a
+    # mano: ver issue #7.
+    est_adjust_enabled = os.getenv("EST_DELAY_ADJUST", "0").lower() in ("1", "true", "yes")
     if dep_delay_map and dep_adjust_enabled:
         print(f"   intermediate dep_delay available for {len(dep_delay_map)} targets")
 
@@ -683,7 +737,6 @@ def main() -> int:
                     est_delay = float((dt_est - dt_sched).total_seconds() / 60.0)
                 except Exception:
                     pass
-            est_adjust_enabled = os.getenv("EST_DELAY_ADJUST", "1").lower() in ("1", "true", "yes")
             proba_after_dep = (
                 estimated_dep_delay_adjust(proba_after_gdp, est_delay)
                 if est_adjust_enabled
@@ -723,7 +776,9 @@ def main() -> int:
         proba_adj = (
             adsb_holding_adjust(proba_after_eta, holding_min) if adsb_enabled else proba_after_eta
         )
-        label_adj = int(proba_adj >= threshold_used)
+        # La etiqueta no se puede decidir todavia: el umbral se calcula sobre
+        # el conjunto completo de probabilidades ya ajustadas, que recien
+        # termina de armarse cuando termina este loop.
 
         # Prediction phase: classify based on flight departure/landing status
         if sid in landed_ids:
@@ -742,25 +797,22 @@ def main() -> int:
             conn, df.loc[i, "op_carrier"], df.loc[i, "scheduled_off_utc"],
             window_hours=24.0, alpha=20.0, prior_window_hours=168.0,
         )
-        pred_rows.append((
+        pred_rows.append([
             df.loc[i, "fa_flight_id"], sid,
-            pred_now, float(proba_adj), label_adj,
-            float(threshold_used), threshold_strategy,
+            pred_now, float(proba_adj), None,   # etiqueta: se completa abajo
+            None, None,                         # umbral y estrategia: idem
             proba_raw, float(gdp_orig), float(gdp_dest),
             int(atl_window), (float(carrier_smooth) if carrier_smooth is not None else None),
             (float(dep_delay) if dep_delay is not None else None),
             (float(adsb_delay) if adsb_delay is not None else None),
             (float(holding_min) if holding_min is not None else None),
             phase,
-        ))
+        ])
         snapshot_contexts[i] = {
             "prediction_phase": phase,
             "booster_probability": float(booster_proba[i]),
             "calibrated_probability": float(calibrated_proba[i]),
             "final_probability": float(proba_adj),
-            "predicted_label": label_adj,
-            "threshold_used": float(threshold_used),
-            "threshold_strategy": threshold_strategy,
             "probability_after_gdp": float(proba_after_gdp),
             "probability_after_departure": float(proba_after_dep),
             "probability_after_adsb_eta": float(proba_after_eta),
@@ -796,6 +848,43 @@ def main() -> int:
                 else ""
             ),
         }
+
+    # ── Umbral operativo ────────────────────────────────────────────────────
+    #
+    # Se calcula aca, sobre las probabilidades YA ajustadas, porque es contra
+    # esas que se compara.
+    #
+    # Antes salia del percentil 78 de `calibrated_proba` y despues se comparaba
+    # contra `proba_adj`. Los cuatro ajustes son noisy-OR —`p' = 1-(1-p)(1-p_x)`,
+    # que solo puede subir la probabilidad—, asi que la tasa de positivos era
+    # por construccion mayor a la pretendida, sin importar el dato. Medido sobre
+    # 3.980 vuelos con resultado real: 78% del lote marcado como demorado contra
+    # el 22% que pide la estrategia, con la tasa real en 7,7%.
+    adjusted_proba = np.array([row[3] for row in pred_rows], dtype=float)
+    threshold_used, threshold_strategy, adjusted_labels = select_threshold_and_label(
+        adjusted_proba,
+        target_pos_rate=args.target_pos_rate,
+        artifact_threshold=float(meta["threshold"]),
+        abs_threshold=args.abs_threshold,
+    )
+    for row, i, label in zip(pred_rows, target_indices, adjusted_labels):
+        row[4] = int(label)
+        row[5] = float(threshold_used)
+        row[6] = threshold_strategy
+        ctx = snapshot_contexts.get(i)
+        if ctx is not None:
+            ctx["predicted_label"] = row[4]
+            ctx["threshold_used"] = float(threshold_used)
+            ctx["threshold_strategy"] = threshold_strategy
+    if adjusted_proba.size:
+        print(
+            f"   threshold(operativo) strategy={threshold_strategy} "
+            f"value={threshold_used:.4f} | pos_pred_rate="
+            f"{(adjusted_proba >= threshold_used).mean():.3f} | la cadena lo "
+            f"corrio {threshold_used - threshold_calibrated:+.4f} respecto de "
+            f"la calibrada"
+        )
+
     conn.executemany(
         """INSERT OR REPLACE INTO predictions
            (fa_flight_id, stable_id, predicted_at_utc, proba_delay, predicted_delay,

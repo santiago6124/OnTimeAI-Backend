@@ -143,6 +143,14 @@ CREATE TABLE IF NOT EXISTS actuals (
     actual_on_utc TEXT,
     actual_in_utc TEXT,
     arr_delay_min REAL,        -- arrival_in actual - scheduled_in (minutes)
+    -- OJO: la semantica depende de source_provider y las dos NO son comparables.
+    --   aeroapi : demora de puerta   (actual_out - scheduled_out)
+    --   fr24    : despegue - horario de puerta (actual_off - scheduled_out),
+    --             o sea demora de puerta MAS rodaje. FR24 no expone gate-out.
+    -- Medida sobre 410.650 filas fr24, la mediana de (departure_delay_min -
+    -- arr_delay_min) da +31,2 min contra +7,0 en aeroapi: es el rodaje de ATL.
+    -- Para demora de puerta comparable, filtrar source_provider = 'aeroapi'.
+    -- Ver issue #11.
     departure_delay_min REAL,
     cancelled INTEGER,
     diverted INTEGER,

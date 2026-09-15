@@ -571,10 +571,34 @@ def today_utc() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
-def risk_level(proba: float) -> str:
-    if proba >= 0.35:
+# Sin umbral en la fila —predicciones anteriores a que se guardara la columna—
+# se usa este, que es el del artefacto v9.
+_FALLBACK_THRESHOLD = 0.32
+
+
+def risk_level(proba: float, threshold: float | None = None) -> str:
+    """Traduce una probabilidad al nivel que muestra el dashboard.
+
+    Las bandas son relativas al umbral con el que el modelo etiqueto esa misma
+    prediccion, no constantes. Antes eran 0.35 y 0.15, elegidas cuando la
+    probabilidad media del lote rondaba 0.55 porque la cadena de ajustes la
+    inflaba. Con la probabilidad calibrada la media queda en ~0.07 y el umbral
+    en ~0.09, asi que esas constantes dejaban un vuelo marcado como demorado
+    (`predicted_delay=1`) mostrandose como riesgo bajo.
+
+    Atado al umbral, las tres bandas se sostienen solas:
+
+      alto   p >= 2x umbral   medido: la precision aproximadamente dobla
+      medio  p >= umbral      marcado como demorado, pero al filo
+      bajo   p <  umbral      no marcado
+
+    De modo que alto + medio es exactamente lo que el modelo marca, y no puede
+    volver a desalinearse del label.
+    """
+    cut = threshold if threshold and threshold > 0 else _FALLBACK_THRESHOLD
+    if proba >= 2 * cut:
         return "high"
-    if proba >= 0.15:
+    if proba >= cut:
         return "medium"
     return "low"
 
@@ -588,6 +612,146 @@ def _load_meta() -> dict[str, Any]:
 
 
 # ── Helpers ────────────────────────────────────────────────────────────────
+
+def _optional_prediction_column(
+    con: sqlite3.Connection, name: str, table_alias: str = "p"
+) -> str:
+    """`<alias>.<name>` si la columna existe, `NULL AS <name>` si no.
+
+    Las columnas que se fueron sumando a `predictions` las crea una migracion
+    `ALTER TABLE` que corre al abrir la base para escritura, o sea en el job.
+    La API la abre en modo lectura y puede estar sirviendo una base que todavia
+    no paso por ahi: la bundleada en la imagen, que es el fallback de arranque,
+    o cualquier snapshot viejo.
+
+    Referenciar una de esas columnas a secas tumba el endpoint con
+    `OperationalError: no such column`. Paso el 15/09 con `threshold_used`:
+    /metrics/summary y /flights devolvieron 500 hasta el rollback.
+
+    El nombre se interpola en el SQL, asi que solo se llama con literales del
+    codigo, nunca con algo que venga de afuera.
+    """
+    present = {
+        row["name"] for row in con.execute("PRAGMA table_info(predictions)").fetchall()
+    }
+    if name not in present:
+        return f"NULL AS {name}"
+    return f"{table_alias}.{name}" if table_alias else name
+
+# Cada fuente escribe una tabla distinta y a su propio ritmo. El numero es
+# cuantos minutos puede pasar sin escribir antes de considerarla caida: holgado
+# respecto de su cadencia real, para que un ciclo lento no dispare ruido.
+#
+#   (columna de tiempo, minutos tolerados, que la alimenta)
+# Cadencia de los predictores. La duracion del ciclo se juzga contra esto.
+SCHEDULER_INTERVAL_MIN = 15
+
+# Cuando el archivo empieza a ser el problema. Medido: a 722 MB los ciclos
+# daban 6-10 min; a 437 MB, 4-7. El umbral deja margen para reaccionar antes de
+# que la transferencia domine el ciclo.
+DB_SIZE_WARN_MB = int(os.getenv("DB_SIZE_WARN_MB", "800"))
+
+SOURCE_FRESHNESS: dict[str, tuple[str, int, str]] = {
+    "predictions":       ("predicted_at_utc",  60,  "live-pull (cada 15 min)"),
+    "actuals":           ("settled_at_utc",   120,  "harvester FR24 + AeroAPI"),
+    "weather_obs":       ("valid_utc",        180,  "IEM METAR (publica cada ~1 h)"),
+    "nas_status":        ("captured_at_utc",  180,  "NAS status FAA"),
+    "aircraft_position": ("captured_at_utc",  120,  "ADS-B airplanes.live / OpenSky"),
+}
+
+
+def _recent_cycles(con: sqlite3.Connection, limit: int = 8) -> dict:
+    """Duracion de los ultimos ciclos del pipeline, desde la tabla `runs`.
+
+    El scheduler dispara cada 15 minutos. Un ciclo que se acerca a esa ventana
+    empieza a solaparse con el siguiente: dos jobs escribiendo la misma base y
+    pisandose las subidas a GCS. La duracion es la senal que avisa antes de que
+    eso pase, y el tamano de la base es su causa principal —el job la baja
+    entera y la vuelve a subir en cada ciclo, asi que el costo crece con el
+    archivo. Ver issue #4.
+    """
+    try:
+        filas = con.execute(
+            """SELECT started_utc, finished_utc FROM runs
+                WHERE finished_utc IS NOT NULL
+                ORDER BY started_utc DESC LIMIT ?""",
+            (limit,),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return {}
+
+    duraciones: list[float] = []
+    for started, finished in filas:
+        try:
+            a = datetime.fromisoformat(str(started).replace("Z", "+00:00"))
+            b = datetime.fromisoformat(str(finished).replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            continue
+        duraciones.append(round((b - a).total_seconds() / 60, 1))
+    if not duraciones:
+        return {}
+
+    ordenadas = sorted(duraciones)
+    mediana = ordenadas[len(ordenadas) // 2]
+    tolerado = round(SCHEDULER_INTERVAL_MIN * 2 / 3, 1)
+    return {
+        "recent_minutes": duraciones,
+        "median_minutes": mediana,
+        "max_minutes": max(duraciones),
+        "scheduler_minutes": SCHEDULER_INTERVAL_MIN,
+        # Dos tercios de la ventana: deja margen para reaccionar antes del
+        # solapamiento, sin gritar por un ciclo lento aislado. Por eso se
+        # compara la mediana y no el maximo.
+        "tolerated_minutes": tolerado,
+        "slow": mediana > tolerado,
+    }
+
+
+def _source_freshness(con: sqlite3.Connection) -> dict[str, dict]:
+    """Cuanto hace que escribio cada fuente, y si eso ya es demasiado.
+
+    Una fuente que deja de escribir no rompe nada: el pipeline sigue, las
+    corridas figuran exitosas y la senal desaparece sin ruido. Paso con ADS-B,
+    que estuvo 25 dias inerte —`adsb_eta_adjust` y `adsb_holding_adjust`
+    recibiendo None en cada ciclo— hasta que alguien miro la tabla. Ver #9.
+    """
+    now = datetime.now(timezone.utc)
+    out: dict[str, dict] = {}
+    for table, (column, tolerated_min, fed_by) in SOURCE_FRESHNESS.items():
+        try:
+            row = con.execute(f"SELECT MAX({column}) FROM {table}").fetchone()
+        except sqlite3.OperationalError:
+            continue
+        last = row[0] if row else None
+        age_min: float | None = None
+        if last:
+            try:
+                parsed = datetime.fromisoformat(str(last).replace("Z", "+00:00"))
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                age_min = round((now - parsed).total_seconds() / 60, 1)
+            except ValueError:
+                age_min = None
+        out[table] = {
+            "last_utc": last,
+            "age_minutes": age_min,
+            "tolerated_minutes": tolerated_min,
+            # Sin dato es tan malo como un dato viejo: la tabla vacia es
+            # justamente el estado en que quedo aircraft_position.
+            "stale": age_min is None or age_min > tolerated_min,
+            "fed_by": fed_by,
+        }
+    return out
+
+
+def _row_threshold(row) -> float | None:
+    """El umbral guardado en la fila, o None si la prediccion es anterior."""
+    try:
+        value = row["threshold_used"]
+    except (IndexError, KeyError):
+        return None
+    return float(value) if value is not None else None
+
 
 def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
     """Latest prediction per flight for active/upcoming flights in a sliding window.
@@ -608,7 +772,10 @@ def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
     end_window = (now + timedelta(hours=18)).isoformat()
     undeparted_limit = (now - timedelta(hours=24)).isoformat()
 
-    rows = con.execute("""
+    threshold_col_inner = _optional_prediction_column(
+        con, "threshold_used", table_alias="p2"
+    )
+    rows = con.execute(f"""
         SELECT f.fa_flight_id,
                f.ident_iata,
                f.op_carrier,
@@ -622,6 +789,7 @@ def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
                f.aircraft_type,
                p.proba_delay,
                p.predicted_delay,
+               p.threshold_used,
                p.predicted_at_utc,
                CASE WHEN a.arr_delay_min IS NOT NULL THEN 1 ELSE 0 END AS has_actual,
                a.arr_delay_min,
@@ -635,6 +803,7 @@ def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
             SELECT p2.fa_flight_id,
                    p2.proba_delay,
                    p2.predicted_delay,
+                   {threshold_col_inner},
                    p2.predicted_at_utc,
                    ROW_NUMBER() OVER (
                        PARTITION BY p2.fa_flight_id
@@ -691,7 +860,7 @@ def _flight_row_to_dict(row: sqlite3.Row) -> dict:
         "actual_on_utc":     act_on,
         "actual_in_utc":     act_in,
         "aircraft_type":   row["aircraft_type"] or "",
-        "risk":            risk_level(proba),
+        "risk":            risk_level(proba, _row_threshold(row)),
         "delay_probability": round(proba, 4),
         "predicted_delay": int(row["predicted_delay"]),
         "predicted_at_utc": row["predicted_at_utc"] or "",
@@ -991,17 +1160,8 @@ def list_flights(status: str = "all", departures_within_min: int = None):
 def get_flight_history(fa_flight_id: str):
     con = get_db()
     try:
-        prediction_columns = {
-            row["name"] for row in con.execute("PRAGMA table_info(predictions)").fetchall()
-        }
-
-        def optional_prediction_column(name: str) -> str:
-            # Static names supplied below; aliasing keeps legacy bundled DBs
-            # readable before the startup migration has run (notably in tests).
-            return f"p.{name}" if name in prediction_columns else f"NULL AS {name}"
-
         optional_fields = ", ".join(
-            optional_prediction_column(name)
+            _optional_prediction_column(con, name)
             for name in (
                 "proba_raw", "threshold_used", "threshold_strategy",
                 "prediction_phase", "gdp_orig_delay_min", "gdp_dest_delay_min",
@@ -1089,7 +1249,11 @@ def _get_historical_flight(con: sqlite3.Connection, fa_flight_id: str):
     Used when a flight has already departed and is no longer in the active
     sliding window returned by _latest_predictions_active().
     """
-    return con.execute("""
+    # Sin alias: la subconsulta lee `predictions` directamente.
+    threshold_col_inner = _optional_prediction_column(
+        con, "threshold_used", table_alias=""
+    )
+    return con.execute(f"""
         SELECT f.fa_flight_id,
                f.ident_iata,
                f.op_carrier,
@@ -1103,6 +1267,7 @@ def _get_historical_flight(con: sqlite3.Connection, fa_flight_id: str):
                f.aircraft_type,
                p.proba_delay,
                p.predicted_delay,
+               p.threshold_used,
                p.predicted_at_utc,
                CASE WHEN a.arr_delay_min IS NOT NULL THEN 1 ELSE 0 END AS has_actual,
                a.arr_delay_min,
@@ -1111,6 +1276,7 @@ def _get_historical_flight(con: sqlite3.Connection, fa_flight_id: str):
         FROM flights f
         JOIN (
             SELECT fa_flight_id, proba_delay, predicted_delay, predicted_at_utc,
+                   {threshold_col_inner},
                    ROW_NUMBER() OVER (
                        PARTITION BY fa_flight_id ORDER BY predicted_at_utc DESC
                    ) AS rn
@@ -1173,8 +1339,11 @@ def _load_cached_shap(con: sqlite3.Connection, fa_flight_id: str) -> list[dict]:
                 "value":        feat_val,
             })
         return out
-    except sqlite3.OperationalError:
-        # Table doesn't exist yet (legacy DB) — fall back to live compute.
+    except sqlite3.OperationalError as exc:
+        # Base sin la tabla: es esperable en una legacy, y el llamador cae al
+        # calculo en vivo. Se deja rastro igual, porque si la tabla existe y
+        # falla por otra cosa, el sintoma es identico.
+        print(f"[shap] cache no disponible para {fa_flight_id}: {exc}")
         return []
 
 
@@ -1229,7 +1398,14 @@ def _compute_shap(fa_flight_id: str) -> list[dict]:
                 "direction":    "positive" if contrib >= 0 else "negative",
             })
         return result
-    except Exception:
+    except Exception as exc:
+        # Se loguea antes de devolver vacio. Este es el ultimo recurso: si la
+        # cache de `prediction_shap` no tiene nada y esto tampoco, el detalle
+        # del vuelo queda sin explicacion. Tragarse la excepcion dejaba el
+        # sintoma —`"shap": []`— sin ninguna pista de la causa, que es
+        # exactamente lo que hizo dificil de diagnosticar el issue #5.
+        print(f"[shap] calculo en vivo fallo para {fa_flight_id}: "
+              f"{type(exc).__name__}: {exc}")
         return []
 
 
@@ -1247,12 +1423,15 @@ def metrics_summary():
             }
         probas = [float(r["proba_delay"]) for r in rows]
         preds  = [int(r["predicted_delay"]) for r in rows]
+        # Mismo criterio que /flights: calculados por separado terminarian
+        # discrepando entre las fichas y el conteo del encabezado.
+        niveles = [risk_level(float(r["proba_delay"]), _row_threshold(r)) for r in rows]
         ticks  = [r["predicted_at_utc"] for r in rows if r["predicted_at_utc"]]
         return {
             "total_flights":           len(rows),
-            "high_risk":               sum(1 for p in probas if p >= 0.35),
-            "medium_risk":             sum(1 for p in probas if 0.15 <= p < 0.35),
-            "low_risk":                sum(1 for p in probas if p < 0.15),
+            "high_risk":               niveles.count("high"),
+            "medium_risk":             niveles.count("medium"),
+            "low_risk":                niveles.count("low"),
             "avg_delay_probability":   round(float(np.mean(probas)), 4),
             "predicted_positive_rate": round(float(np.mean(preds)), 4),
             "model_version":           ACTIVE_MODEL,
@@ -1301,6 +1480,58 @@ def metrics_hourly():
                 "avg_proba":   round(b["sum_proba"] / b["total"], 4) if b["total"] else 0.0,
             })
         return result
+    finally:
+        con.close()
+
+
+@app.get("/metrics/history")
+def metrics_history(segment: str = "all", days: int = 56):
+    """Serie diaria de calidad del modelo, mas alla de la retencion de 30 dias.
+
+    Sale de `metrics_daily`, que el job escribe antes de purgar. Las tablas
+    crudas se borran a los 30 dias; estos agregados no, asi que la serie crece
+    sin limite practico —son kilobytes por semana—. Ver issue #12.
+
+    `segment` acepta 'all', 'carrier:DL' o 'hour:14'. El default de 56 dias son
+    las 8 semanas que pide Frontend #3.
+    """
+    con = get_db()
+    try:
+        try:
+            filas = con.execute(
+                """SELECT day, n_flights, n_delayed, n_flagged, tp, fp, tn, fn,
+                          auc, brier, ece, mean_proba, mean_threshold, model_version
+                     FROM metrics_daily
+                    WHERE segment = ?
+                      AND day >= date('now', ?)
+                    ORDER BY day""",
+                (segment, f"-{max(1, min(int(days), 3650))} days"),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Base anterior al primer rollup: serie vacia, no un 500.
+            return {"segment": segment, "days": days, "points": []}
+
+        puntos = []
+        for r in filas:
+            tp, fp, fn = r["tp"], r["fp"], r["fn"]
+            puntos.append({
+                "day": r["day"],
+                "n_flights": r["n_flights"],
+                "n_delayed": r["n_delayed"],
+                "n_flagged": r["n_flagged"],
+                "actual_delay_rate": round(r["n_delayed"] / r["n_flights"], 4)
+                                     if r["n_flights"] else None,
+                "precision": round(tp / (tp + fp), 4) if (tp + fp) else None,
+                "recall": round(tp / (tp + fn), 4) if (tp + fn) else None,
+                "auc": round(r["auc"], 4) if r["auc"] is not None else None,
+                "brier": round(r["brier"], 4) if r["brier"] is not None else None,
+                "ece": round(r["ece"], 4) if r["ece"] is not None else None,
+                "mean_proba": round(r["mean_proba"], 4) if r["mean_proba"] is not None else None,
+                "mean_threshold": round(r["mean_threshold"], 4)
+                                  if r["mean_threshold"] is not None else None,
+                "model_version": r["model_version"],
+            })
+        return {"segment": segment, "days": days, "points": puntos}
     finally:
         con.close()
 
@@ -1808,6 +2039,10 @@ def db_stats(request: Request):
             "table_sizes_mb": table_sizes_mb,
             "table_sizes_source": "dbstat" if exact is not None else "sampled",
             "table_dates": table_dates,
+            "sources": _source_freshness(con),
+            "cycles": _recent_cycles(con),
+            "db_size_warn_mb": DB_SIZE_WARN_MB,
+            "db_size_over_warn": size_mb > DB_SIZE_WARN_MB,
             "prediction_dates": date_range,
             "refresh": {
                 "last_ok_utc": _db_last_refresh_ok_utc,
