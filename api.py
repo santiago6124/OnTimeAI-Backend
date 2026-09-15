@@ -850,7 +850,22 @@ def _latest_predictions_active(con: sqlite3.Connection) -> list[sqlite3.Row]:
           AND (
               (datetime(f.scheduled_out_utc) >= datetime(?) AND datetime(f.scheduled_out_utc) <= datetime(?))
               OR
-              (datetime(f.scheduled_out_utc) >= datetime(?) AND a.actual_out_utc IS NULL)
+              -- "programado hace poco y todavia sin salir".
+              --
+              -- Antes esto era `a.actual_out_utc IS NULL` a secas. Ese campo
+              -- lo poblaba AeroAPI; FR24, que es el 96% de la muestra desde
+              -- Fase 4, no expone gate-out y lo deja nulo siempre. La
+              -- condicion se cumplia para todos y la ventana retenia las 24 h
+              -- enteras: medido, 492 de 637 vuelos con salida programada hace
+              -- mas de 6 h, y el 98% de ellos ya habia aterrizado.
+              --
+              -- Se exige que no haya NINGUNA senal de salida, en vez de
+              -- confiar en una sola columna: un vuelo con despegue o con
+              -- aterrizaje obviamente salio, lo diga o no el gate-out.
+              (datetime(f.scheduled_out_utc) >= datetime(?)
+               AND a.actual_out_utc IS NULL
+               AND a.actual_off_utc IS NULL
+               AND a.actual_in_utc IS NULL)
           )
         ORDER BY f.scheduled_out_utc
     """, (start_window, end_window, undeparted_limit)).fetchall()
@@ -1841,7 +1856,22 @@ def operations(airport_code: str):
               AND (
                   (datetime(f.scheduled_out_utc) >= datetime(?) AND datetime(f.scheduled_out_utc) <= datetime(?))
                   OR
-                  (datetime(f.scheduled_out_utc) >= datetime(?) AND a.actual_out_utc IS NULL)
+                  -- "programado hace poco y todavia sin salir".
+              --
+              -- Antes esto era `a.actual_out_utc IS NULL` a secas. Ese campo
+              -- lo poblaba AeroAPI; FR24, que es el 96% de la muestra desde
+              -- Fase 4, no expone gate-out y lo deja nulo siempre. La
+              -- condicion se cumplia para todos y la ventana retenia las 24 h
+              -- enteras: medido, 492 de 637 vuelos con salida programada hace
+              -- mas de 6 h, y el 98% de ellos ya habia aterrizado.
+              --
+              -- Se exige que no haya NINGUNA senal de salida, en vez de
+              -- confiar en una sola columna: un vuelo con despegue o con
+              -- aterrizaje obviamente salio, lo diga o no el gate-out.
+              (datetime(f.scheduled_out_utc) >= datetime(?)
+               AND a.actual_out_utc IS NULL
+               AND a.actual_off_utc IS NULL
+               AND a.actual_in_utc IS NULL)
               )
         """, (code, code, start_window, end_window, undeparted_limit)).fetchall()
 
