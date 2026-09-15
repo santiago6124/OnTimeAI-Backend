@@ -130,6 +130,34 @@ def select_threshold(
     return float(artifact_threshold), "artifact"
 
 
+def select_threshold_and_label(
+    proba: np.ndarray,
+    *,
+    target_pos_rate: float,
+    artifact_threshold: float,
+    abs_threshold: float = 0.0,
+) -> tuple[float, str, np.ndarray]:
+    """Elige el umbral sobre ``proba`` y etiqueta ``proba`` con ese mismo umbral.
+
+    Existe para que las dos mitades no puedan separarse. En el pipeline live el
+    umbral salia del percentil de la probabilidad calibrada y despues se
+    comparaba contra la probabilidad ya ajustada, que es otra distribucion.
+    Como los ajustes post-prediccion son noisy-OR y solo pueden subir la
+    probabilidad, la tasa de positivos era por construccion mayor a la pedida:
+    78% del lote contra el 22% de la estrategia, con la tasa real en 7,7%.
+
+    Ninguna de las dos funciones que componia estaba mal. El error era de
+    cableado, y por eso el arreglo es una sola puerta de entrada.
+    """
+    threshold, strategy = select_threshold(
+        proba,
+        target_pos_rate=target_pos_rate,
+        artifact_threshold=artifact_threshold,
+        abs_threshold=abs_threshold,
+    )
+    return threshold, strategy, predict_label(np.asarray(proba), threshold, "binary")
+
+
 def predict_proba(booster: lgb.Booster, X: pd.DataFrame) -> np.ndarray:
     return booster.predict(X, num_iteration=booster.best_iteration or None)
 

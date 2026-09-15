@@ -303,6 +303,26 @@ def _run_pipeline_attempt(extra_args: list[str]) -> int:
         return exit_code
 
     if TMP_DB.exists():
+        # Antes de purgar, no despues: la purga se lleva las filas de las que
+        # salen estos numeros. Ver issue #12.
+        try:
+            import sqlite3
+
+            from ontimeai.rollup import rollup_daily_metrics
+
+            con = sqlite3.connect(TMP_DB)
+            try:
+                n = rollup_daily_metrics(
+                    con, model_version=os.environ.get("ACTIVE_MODEL", "")
+                )
+                print(f"[job] Agregados diarios: {n} filas (dia, segmento)")
+            finally:
+                con.close()
+        except Exception as e:
+            # No frena el ciclo. Perder un rollup cuesta un dia de historico;
+            # frenar el pipeline cuesta la prediccion de todos los vuelos.
+            print(f"[job] Error computing daily rollup: {e}")
+
         print("[job] Running database pruning...")
         try:
             from scripts.prune_db import prune_db
