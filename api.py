@@ -1141,8 +1141,11 @@ def _load_cached_shap(con: sqlite3.Connection, fa_flight_id: str) -> list[dict]:
                 "value":        feat_val,
             })
         return out
-    except sqlite3.OperationalError:
-        # Table doesn't exist yet (legacy DB) — fall back to live compute.
+    except sqlite3.OperationalError as exc:
+        # Base sin la tabla: es esperable en una legacy, y el llamador cae al
+        # calculo en vivo. Se deja rastro igual, porque si la tabla existe y
+        # falla por otra cosa, el sintoma es identico.
+        print(f"[shap] cache no disponible para {fa_flight_id}: {exc}")
         return []
 
 
@@ -1197,7 +1200,14 @@ def _compute_shap(fa_flight_id: str) -> list[dict]:
                 "direction":    "positive" if contrib >= 0 else "negative",
             })
         return result
-    except Exception:
+    except Exception as exc:
+        # Se loguea antes de devolver vacio. Este es el ultimo recurso: si la
+        # cache de `prediction_shap` no tiene nada y esto tampoco, el detalle
+        # del vuelo queda sin explicacion. Tragarse la excepcion dejaba el
+        # sintoma —`"shap": []`— sin ninguna pista de la causa, que es
+        # exactamente lo que hizo dificil de diagnosticar el issue #5.
+        print(f"[shap] calculo en vivo fallo para {fa_flight_id}: "
+              f"{type(exc).__name__}: {exc}")
         return []
 
 
