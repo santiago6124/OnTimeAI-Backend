@@ -1,14 +1,34 @@
-"""SHAP TreeExplainer wrappers for LightGBM boosters."""
+"""Valores SHAP de un booster LightGBM, con su implementacion nativa."""
 from __future__ import annotations
 
 import numpy as np
 import pandas as pd
-import shap
 
 
 def compute_shap_values(booster, X: pd.DataFrame):
-    explainer = shap.TreeExplainer(booster)
-    return explainer.shap_values(X)
+    """Valores SHAP del booster, con la implementacion nativa de LightGBM.
+
+    Es exactamente lo que hacia `shap.TreeExplainer(booster).shap_values(X)`:
+    para un modelo de arboles, shap delega en esta misma llamada. Se ve en su
+    propio codigo (`shap/explainers/_tree.py`):
+
+        phi = self.model.original_model.predict(
+            X, num_iteration=tree_limit, pred_contrib=True)
+
+    Verificado ademas numericamente sobre el artefacto 4year_v9: identicos bit
+    a bit, diferencia maxima 0.000e+00. Hay un test que lo comprueba cuando
+    shap esta instalado.
+
+    Se hace asi para sacar `shap` de las dependencias del job: arrastra numba y
+    llvmlite, que son 156 MB instalados. La imagen del job se baja entera en
+    cada ciclo —96 veces por dia— y el arranque en frio es el grueso del
+    tiempo. Ver issue #4.
+
+    `pred_contrib=True` devuelve una columna extra al final con el valor
+    esperado del modelo; shap no la incluye, asi que se recorta.
+    """
+    contribuciones = booster.predict(X, pred_contrib=True)
+    return np.asarray(contribuciones)[:, :-1]
 
 
 def global_feature_importance(shap_values, feature_names: list[str]) -> pd.Series:
