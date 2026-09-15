@@ -55,6 +55,53 @@ def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def load_gate_departure_delays(
+    conn, stable_ids: list[str]
+) -> tuple[dict[str, float], set[str]]:
+    """Demora de PUERTA de los vuelos que ya despegaron, y cuales ya aterrizaron.
+
+    Filtra `source_provider = 'aeroapi'` a proposito.
+    `intermediate_dep_delay_adjust` usa bandas validadas contra BTS para demora
+    de puerta, y solo aeroapi la mide: expone `actual_out` y su
+    `departure_delay` es gate-out.
+
+    FR24 guarda en esa misma columna `actual_off - scheduled_out`, o sea demora
+    de puerta MAS rodaje —no expone gate-out—. Medido sobre 410.650 filas fr24,
+    la mediana de `departure_delay_min - arr_delay_min` da +31,2 min contra
+    +7,0 en aeroapi: ese delta es el rodaje de ATL. Sin el filtro, un vuelo que
+    empujaba en horario y rodaba media hora entraba en la banda 30-60 y saltaba
+    a p=0.90. Ver issue #11.
+
+    El costo es cobertura: fr24 es el 96% de la muestra desde Fase 4, asi que
+    el ajuste queda casi inactivo. Es el resultado correcto mientras no exista
+    una demora de puerta comparable entre proveedores.
+    """
+    if not stable_ids:
+        return {}, set()
+    placeholders = ",".join("?" for _ in stable_ids)
+    dep_delay_map = {
+        row[0]: float(row[1])
+        for row in conn.execute(
+            f"""SELECT stable_id, departure_delay_min FROM actuals
+               WHERE stable_id IN ({placeholders})
+                 AND departure_delay_min IS NOT NULL
+                 AND source_provider = 'aeroapi'
+                 AND actual_in_utc IS NULL""",  # despego pero todavia no aterrizo
+            stable_ids,
+        ).fetchall()
+    }
+    landed_ids = {
+        row[0]
+        for row in conn.execute(
+            f"""SELECT stable_id FROM actuals
+               WHERE stable_id IN ({placeholders})
+                 AND actual_in_utc IS NOT NULL""",
+            stable_ids,
+        ).fetchall()
+    }
+    return dep_delay_map, landed_ids
+
+
 def main() -> int:
     p = argparse.ArgumentParser()
     p.add_argument("--artifact", default=ARTIFACTS_DIR / "4year_v9")
@@ -609,25 +656,7 @@ def main() -> int:
     # Pre-fetch intermediate dep_delay for all target stable_ids in one query.
     target_indices = list(df.index[target_mask])
     target_stable_ids = [stable_id(df.loc[i, "fa_flight_id"]) for i in target_indices]
-    dep_delay_map: dict[str, float] = {}
-    landed_ids: set[str] = set()
-    if target_stable_ids:
-        placeholders = ",".join("?" for _ in target_stable_ids)
-        for row in conn.execute(
-            f"""SELECT stable_id, departure_delay_min FROM actuals
-               WHERE stable_id IN ({placeholders})
-                 AND departure_delay_min IS NOT NULL
-                 AND actual_in_utc IS NULL""",  # only flights that took off but haven't landed
-            target_stable_ids,
-        ).fetchall():
-            dep_delay_map[row[0]] = float(row[1])
-        for row in conn.execute(
-            f"""SELECT stable_id FROM actuals
-               WHERE stable_id IN ({placeholders})
-                 AND actual_in_utc IS NOT NULL""",
-            target_stable_ids,
-        ).fetchall():
-            landed_ids.add(row[0])
+    dep_delay_map, landed_ids = load_gate_departure_delays(conn, target_stable_ids)
 
     dep_adjust_enabled = os.getenv("DEP_DELAY_ADJUST", "1").lower() in ("1", "true", "yes")
 
