@@ -1,15 +1,28 @@
 """Cloud Run Job entrypoint: descarga DB de GCS, corre live_pull, sube el DB actualizado."""
 from __future__ import annotations
 
+import time
+
+# Antes de cualquier import pesado.
+#
+# El ciclo medido por dentro daba 2,8 min contra ejecuciones de Cloud Run de
+# 5,1 a 8,7: entre 2 y 6 minutos transcurren antes de que este proceso empiece
+# a contar. Parte es descarga de la imagen y arranque del contenedor, y parte
+# es importar pandas, numpy, lightgbm, shap y sklearn. Con el cronometro aca,
+# la diferencia contra `status.startTime` de la ejecucion aisla lo primero.
+# Ver issue #4.
+_PROCESS_STARTED = time.monotonic()
+
 import os
 import resource
 import shutil
 import sys
-import time
 from contextlib import contextmanager
 from pathlib import Path
 
 from ontimeai.training_store import read_bool_env
+
+_IMPORTS_READY = time.monotonic()
 
 
 def _log_mem(label: str) -> None:
@@ -358,11 +371,14 @@ def _run_pipeline_attempt(extra_args: list[str]) -> int:
     return 0
 
 
-# Momento en que arranco el proceso. `runs` lo escribe live_pull y mide solo el
-# pipeline; el ciclo real incluye arranque del contenedor, descarga de GCS,
-# purga, VACUUM y subida. Medido el 15/09: 1,7-3,2 min contra 4,7-7,5 de la
-# ejecucion de Cloud Run.
-_JOB_STARTED = time.monotonic()
+# `runs` lo escribe live_pull y mide solo el pipeline; el ciclo real incluye
+# arranque del contenedor, importar las dependencias, descarga de GCS, purga,
+# VACUUM y subida. Medido el 15/09: 1,7-3,2 min contra 4,7-7,5 de la ejecucion
+# de Cloud Run.
+#
+# Se cuenta desde que arranco el proceso, no desde aca: los imports pesados
+# corren antes y son parte del ciclo igual.
+_JOB_STARTED = _PROCESS_STARTED
 
 
 def _record_job_duration() -> None:
@@ -399,6 +415,7 @@ def _record_job_duration() -> None:
 
 
 def main() -> int:
+    print(f"[fase] importar dependencias: {_IMPORTS_READY - _PROCESS_STARTED:.1f} s")
     try:
         _validate_training_store_config()
     except (RuntimeError, ValueError) as exc:
