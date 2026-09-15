@@ -142,10 +142,24 @@ def prune_db(
             (cutoff_iso,),
         )
         
-        # Delete orphaned actuals
-        cur = con.execute("DELETE FROM actuals WHERE fa_flight_id NOT IN (SELECT fa_flight_id FROM flights)")
-        actual_deleted = cur.rowcount
-        print(f"Deleted actuals: {actual_deleted:,} orphaned rows")
+        # Barrido de huerfanos: filas que apuntan a un vuelo que ya no existe.
+        #
+        # `actuals` ya se limpiaba asi. `predictions` y `prediction_shap` no, y
+        # ahi se acumulaba la mayor parte: los placeholders SYN- de captura de
+        # legs futuros se borraban de `flights` al vencer su TTL y dejaban todo
+        # lo suyo colgando. Medido el 15/09 sobre produccion: 33.469
+        # predicciones huerfanas (16,1% de la tabla, 100% con id SYN-, ninguna
+        # con label) y 623.505 filas de SHAP sin prediccion.
+        #
+        # El origen se corrige en el harvester (OnTimeAI-Scrapper#7); esto
+        # limpia lo acumulado y queda como red de seguridad: cualquier camino
+        # que borre un vuelo sin limpiar lo suyo se recoge aca.
+        for tabla in ("actuals", "predictions", "prediction_shap"):
+            cur = con.execute(
+                f"DELETE FROM {tabla} "
+                "WHERE fa_flight_id NOT IN (SELECT fa_flight_id FROM flights)"
+            )
+            print(f"Deleted {tabla}: {cur.rowcount:,} orphaned rows")
 
         con.execute("DELETE FROM weather_obs WHERE valid_utc < ?", (cutoff_iso,))
         con.execute("DELETE FROM runs WHERE started_utc < ?", (cutoff_iso,))
