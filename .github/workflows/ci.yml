@@ -23,6 +23,7 @@ jobs:
           cache: pip
           cache-dependency-path: |
             requirements-api.txt
+            requirements-job.txt
             requirements.txt
 
       - name: Instalar libomp
@@ -30,14 +31,26 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libomp-dev
 
       - name: Instalar dependencias
-        # Hacen falta los dos archivos y no son intercambiables:
-        #   requirements-api.txt  → runtime de producción; es el que instalan
-        #                           ambos Dockerfiles. Trae fastapi, dotenv y jose.
-        #   requirements.txt      → entrenamiento y desarrollo. Trae pytest y optuna.
-        # Cualquier test que importe `api` necesita el primero; pytest sale del
-        # segundo. Se instalan en un solo comando para que pip resuelva las dos
-        # listas de restricciones a la vez (p. ej. lightgbm ==4.5.0 vs >=4.0).
-        run: pip install -r requirements-api.txt -r requirements.txt
+        # Tres archivos, no intercambiables:
+        #   requirements-api.txt  → runtime del servicio HTTP (Dockerfile).
+        #                           Trae fastapi, uvicorn y jose.
+        #   requirements-job.txt  → runtime del Cloud Run Job (Dockerfile.job).
+        #                           Sin fastapi/uvicorn/jose, que no usa.
+        #   requirements.txt      → entrenamiento y desarrollo. Trae pytest.
+        # Acá se instalan todos porque los tests cubren ambos runtimes. Se
+        # instalan en un solo comando para que pip resuelva las listas de
+        # restricciones a la vez (p. ej. lightgbm ==4.5.0 vs >=4.0).
+        run: pip install -r requirements-api.txt -r requirements-job.txt -r requirements.txt
+
+      - name: El job arranca solo con sus dependencias
+        # Instalar los tres archivos juntos oculta el riesgo de haber dejado
+        # una dependencia del job fuera de requirements-job.txt: el import
+        # funcionaria igual acá y rompería recién en producción. Este paso lo
+        # verifica en un entorno aislado que instala únicamente esa lista.
+        run: |
+          python3 -m venv /tmp/venv-job
+          /tmp/venv-job/bin/pip install --quiet -r requirements-job.txt
+          /tmp/venv-job/bin/python -c "import live_job, live_pull, predict; print('el job importa con requirements-job.txt')"
 
       - name: Tests
         # test_api.py queda afuera: su bootstrap falla al colectar con

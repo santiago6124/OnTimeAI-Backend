@@ -6,11 +6,11 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
-COPY requirements-api.txt .
-RUN pip install --no-cache-dir -r requirements-api.txt
+COPY requirements-job.txt .
+RUN pip install --no-cache-dir -r requirements-job.txt
 
-# Código fuente completo del pipeline
-COPY api.py predict.py live_pull.py live_job.py ./
+# Código fuente del pipeline. api.py no entra: el job no lo importa.
+COPY predict.py live_pull.py live_job.py ./
 COPY ontimeai/ ./ontimeai/
 COPY feature_engineering_v7/ ./feature_engineering_v7/
 COPY scripts/prune_db.py ./scripts/prune_db.py
@@ -24,8 +24,10 @@ COPY artifacts/distance_lookup.csv ./artifacts/
 COPY artifacts/tail_to_aircraft_family.json ./artifacts/
 
 COPY airports_universe.csv .
-# DB bundleada como fallback para el primer arranque
-COPY live_data.db .
+
+# La DB bundleada NO entra: son 81 MB que solo se usarian con GCS_BUCKET
+# vacio, que en produccion nunca pasa. La imagen se baja entera en cada ciclo,
+# asi que cada MB se paga 96 veces por dia.
 
 ENV ACTIVE_MODEL=4year_v9
 
