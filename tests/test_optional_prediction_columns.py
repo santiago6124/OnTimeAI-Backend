@@ -329,3 +329,46 @@ class TestDuracionRealDelCiclo:
         c = api._recent_cycles(con_migrada)
         assert c["median_minutes"] == pytest.approx(3.0)
         assert c["full_cycle_samples"] == 0
+
+
+class TestArranqueSinGcs:
+    """
+    La imagen del job ya no trae `live_data.db`.
+
+    Eran 81 MB que solo se usaban con GCS_BUCKET vacio, y la imagen se baja
+    entera en cada ciclo: 96 veces por dia. Medido, el arranque en frio es el
+    92% del tiempo de un job que no hace nada —111 s de 120—. Ver issue #4.
+
+    En produccion GCS_BUCKET siempre esta; sin el es desarrollo local, y el
+    fallo tiene que decir que falta en vez de reventar.
+    """
+
+    def test_sin_bucket_y_sin_db_bundleada_falla_con_mensaje(
+        self, tmp_path, monkeypatch, capsys
+    ) -> None:
+        import live_job
+
+        monkeypatch.setattr(live_job, "GCS_BUCKET", "")
+        monkeypatch.setattr(live_job, "BUNDLED_DB", tmp_path / "no-existe.db")
+        monkeypatch.setattr(live_job, "_validate_training_store_config", lambda: None)
+
+        assert live_job.main() == 4
+        salida = capsys.readouterr().out
+        assert "GCS_BUCKET" in salida and "no-existe.db" in salida
+
+    def test_sin_bucket_pero_con_db_local_sigue_andando(
+        self, tmp_path, monkeypatch
+    ) -> None:
+        import live_job
+
+        bundled = tmp_path / "live_data.db"
+        bundled.write_bytes(b"SQLite format 3\x00")
+        monkeypatch.setattr(live_job, "GCS_BUCKET", "")
+        monkeypatch.setattr(live_job, "BUNDLED_DB", bundled)
+        monkeypatch.setattr(live_job, "TMP_DB", tmp_path / "tmp.db")
+        monkeypatch.setattr(live_job, "_validate_training_store_config", lambda: None)
+        monkeypatch.setattr(live_job, "_handle_training_publish", lambda **kw: True)
+        monkeypatch.setattr(live_job, "_run_pipeline_attempt", lambda args: 0)
+
+        assert live_job.main() == 0
+        assert (tmp_path / "tmp.db").exists()
