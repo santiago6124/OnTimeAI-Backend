@@ -680,6 +680,22 @@ def main() -> int:
     if dep_delay_map and dep_adjust_enabled:
         print(f"   intermediate dep_delay available for {len(dep_delay_map)} targets")
 
+    # Calibrador post-cadena. Puede no existir —base nueva— o estar vencido, y
+    # en ambos casos se sirve la salida cruda de la cadena, que es exagerada
+    # pero conocida. Un calibrador viejo corrige en la direccion equivocada y
+    # nadie lo sospecha; ver el issue #15 y ontimeai/chain_calibration.py.
+    from ontimeai.chain_calibration import load_chain_calibrator
+
+    chain_calibrator = load_chain_calibrator(conn)
+    if chain_calibrator is None:
+        print("   calibrador post-cadena: ausente o vencido, se sirve sin calibrar")
+    else:
+        print(
+            f"   calibrador post-cadena: ajustado hace "
+            f"{chain_calibrator.age_days:.1f} dias con "
+            f"{chain_calibrator.n_samples:,} vuelos"
+        )
+
     adsb_enabled = os.getenv("ADSB_ADJUST", "1").lower() in ("1", "true", "yes")
     adsb_capture_by_tail: dict[str, str] = {}
     target_tails = sorted(
@@ -773,8 +789,15 @@ def main() -> int:
             if adsb_enabled
             else None
         )
-        proba_adj = (
+        proba_chain = (
             adsb_holding_adjust(proba_after_eta, holding_min) if adsb_enabled else proba_after_eta
+        )
+        # La cadena produce un puntaje, no una probabilidad: sus constantes
+        # estan puestas a mano. El calibrador aprende la traduccion de los
+        # vuelos que ya aterrizaron. Se guardan los dos: `proba_chain` es sobre
+        # lo que se reajusta, `proba_adj` es lo que se sirve.
+        proba_adj = (
+            chain_calibrator(proba_chain) if chain_calibrator is not None else proba_chain
         )
         # La etiqueta no se puede decidir todavia: el umbral se calcula sobre
         # el conjunto completo de probabilidades ya ajustadas, que recien
@@ -802,6 +825,7 @@ def main() -> int:
             pred_now, float(proba_adj), None,   # etiqueta: se completa abajo
             None, None,                         # umbral y estrategia: idem
             proba_raw, float(gdp_orig), float(gdp_dest),
+            float(proba_chain),
             int(atl_window), (float(carrier_smooth) if carrier_smooth is not None else None),
             (float(dep_delay) if dep_delay is not None else None),
             (float(adsb_delay) if adsb_delay is not None else None),
@@ -812,6 +836,7 @@ def main() -> int:
             "prediction_phase": phase,
             "booster_probability": float(booster_proba[i]),
             "calibrated_probability": float(calibrated_proba[i]),
+            "chain_probability": float(proba_chain),
             "final_probability": float(proba_adj),
             "probability_after_gdp": float(proba_after_gdp),
             "probability_after_departure": float(proba_after_dep),
@@ -889,11 +914,11 @@ def main() -> int:
         """INSERT OR REPLACE INTO predictions
            (fa_flight_id, stable_id, predicted_at_utc, proba_delay, predicted_delay,
             threshold_used, threshold_strategy,
-            proba_raw, gdp_orig_delay_min, gdp_dest_delay_min,
+            proba_raw, gdp_orig_delay_min, gdp_dest_delay_min, proba_chain,
             atl_arrivals_in_window_30min, carrier_delay_rate_smooth,
             intermediate_dep_delay_min, adsb_eta_delay_min, adsb_holding_min,
             prediction_phase)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         pred_rows,
     )
 
@@ -926,14 +951,30 @@ def main() -> int:
             if training_store_required():
                 raise
     conn.commit()
-    # r[3]=proba_delay (final), r[7]=proba_raw, r[12]=intermediate_dep_delay_min,
-    # r[13]=adsb_eta_delay_min, r[14]=adsb_holding_min
-    n_any = sum(1 for r in pred_rows if r[7] is not None and abs(r[7] - r[3]) > 1e-6)
-    n_dep = sum(1 for r in pred_rows if r[12] is not None and r[12] > 5)
-    n_adsb_available = sum(1 for r in pred_rows if r[13] is not None)
-    n_adsb_boost = sum(1 for r in pred_rows if r[13] is not None and r[13] > 5)
-    n_holding = sum(1 for r in pred_rows if r[14] is not None and r[14] >= 5)
+    # Las filas se arman posicionalmente y estos indices tienen que seguir al
+    # INSERT de arriba. Se nombran para que agregar una columna no obligue a
+    # recontar a mano, que es como se rompio al sumar `proba_chain`.
+    I_PROBA_FINAL, I_PROBA_RAW, I_PROBA_CHAIN = 3, 7, 10
+    I_DEP_DELAY, I_ADSB_ETA, I_ADSB_HOLDING = 13, 14, 15
+
+    n_any = sum(
+        1 for r in pred_rows
+        if r[I_PROBA_RAW] is not None
+        and abs(r[I_PROBA_RAW] - r[I_PROBA_CHAIN]) > 1e-6
+    )
+    n_calibrado = sum(
+        1 for r in pred_rows if abs(r[I_PROBA_CHAIN] - r[I_PROBA_FINAL]) > 1e-6
+    )
+    n_dep = sum(1 for r in pred_rows if r[I_DEP_DELAY] is not None and r[I_DEP_DELAY] > 5)
+    n_adsb_available = sum(1 for r in pred_rows if r[I_ADSB_ETA] is not None)
+    n_adsb_boost = sum(
+        1 for r in pred_rows if r[I_ADSB_ETA] is not None and r[I_ADSB_ETA] > 5
+    )
+    n_holding = sum(
+        1 for r in pred_rows if r[I_ADSB_HOLDING] is not None and r[I_ADSB_HOLDING] >= 5
+    )
     print(f"   wrote {len(pred_rows)} predictions ({n_any} adjusted, "
+          f"{n_calibrado} calibrated, "
           f"{n_dep} via dep_delay, {n_adsb_available} with adsb_eta "
           f"of which {n_adsb_boost} boosted, {n_holding} in holding pattern)")
 
