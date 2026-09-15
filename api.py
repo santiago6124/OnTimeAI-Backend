@@ -377,7 +377,7 @@ GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
 USER_TYPES = ("b2b", "b2c")
 
 
-_PUBLIC_PATHS = {"/auth/login", "/auth/google", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"}
+_PUBLIC_PATHS = {"/auth/login", "/auth/google", "/auth/register", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"}
 # Endpoints accesibles sin autenticación para la vista pública /live
 _LITE_PUBLIC_PATHS = {"/flights", "/metrics/hourly"}
 _LITE_PUBLIC_PREFIXES = ("/weather/",)
@@ -417,6 +417,19 @@ class GoogleLoginRequest(BaseModel):
 
 class MeUpdate(BaseModel):
     user_type: Optional[str] = None
+
+
+class RegisterRequest(BaseModel):
+    """Alta propia, con correo y contrasena.
+
+    Sin verificacion de correo: mandar un mail exige infraestructura que el
+    proyecto no tiene. La consecuencia esta acotada por la guarda de
+    /auth/google, que se niega a reutilizar una cuenta local con el mismo
+    correo en vez de entregarsela a quien llegue con el token de Google.
+    """
+
+    email: str
+    password: str
 
 
 class UserCreate(BaseModel):
@@ -973,6 +986,70 @@ def _verify_google_id_token(raw_token: str) -> dict:
     return claims
 
 
+# Largo minimo de la contrasena en el alta propia.
+#
+# Diez y no ocho: el hash es PBKDF2 y la base de usuarios viaja a GCS, asi que
+# el costo de una contrasena corta lo paga el usuario, no el atacante. No se
+# exigen mayusculas ni simbolos —empujan a "Password1!" y no agregan entropia
+# real frente a diez caracteres elegidos libremente.
+MIN_PASSWORD_LENGTH = 10
+
+
+def _looks_like_email(value: str) -> bool:
+    """Validacion deliberadamente laxa: un arroba, un punto despues, sin espacios.
+
+    Validar correos con precision es un pozo sin fondo, y el unico costo de un
+    falso positivo es una cuenta que su duenio no puede recuperar. Rechazar un
+    correo valido, en cambio, deja gente afuera sin explicacion.
+    """
+    if not value or " " in value or value.count("@") != 1:
+        return False
+    local, _, dominio = value.partition("@")
+    return bool(local) and "." in dominio and not dominio.startswith(".") and not dominio.endswith(".")
+
+
+@app.post("/auth/register", status_code=201)
+def register(body: RegisterRequest):
+    """Alta propia con correo y contrasena.
+
+    El sistema ya era abierto: cualquiera con cuenta de Google se registraba
+    solo. Esto quita la asimetria de que el otro metodo dependiera de que un
+    superadmin creara la cuenta a mano.
+
+    El rol es siempre `user`, nunca lo elige quien se registra.
+    """
+    email = body.email.strip().lower()
+    if not _looks_like_email(email):
+        raise HTTPException(400, "Correo inválido")
+    if len(body.password) < MIN_PASSWORD_LENGTH:
+        raise HTTPException(
+            400, f"La contraseña necesita al menos {MIN_PASSWORD_LENGTH} caracteres"
+        )
+
+    con = _get_users_con()
+    try:
+        con.execute(
+            "INSERT INTO users (username, password_hash, role, provider) "
+            "VALUES (?,?,'user','local')",
+            (email, _hash_password(body.password)),
+        )
+        con.commit()
+    except sqlite3.IntegrityError:
+        raise HTTPException(409, "Ya existe una cuenta con ese correo")
+    finally:
+        con.close()
+    _upload_users_db()
+
+    # Misma forma que /auth/google para que el frontend trate los dos altas
+    # igual y mande al onboarding.
+    return {
+        "access_token": _issue_token(email, "user"),
+        "token_type": "bearer",
+        "user_type": None,
+        "is_new_user": True,
+    }
+
+
 @app.post("/auth/google")
 def login_google(body: GoogleLoginRequest):
     """Exchange a Google ID token for our own JWT, creating the user on first sign-in."""
@@ -1004,6 +1081,26 @@ def login_google(body: GoogleLoginRequest):
     if not row["active"]:
         con.close()
         raise HTTPException(403, "La cuenta está desactivada")
+
+    # Una cuenta local cuyo usuario ES este correo no se entrega.
+    #
+    # El alta propia guarda el correo como nombre de usuario y no puede
+    # verificarlo: no hay forma de mandar un mail. Sin esta guarda, cualquiera
+    # podria registrarse con el correo ajeno y esperar a que su duenio entre
+    # con Google, que caeria en la cuenta del otro —cuya contrasena el otro
+    # conoce—. Es toma de cuenta.
+    #
+    # El costo de negarse es que alguien puede ocupar un correo que no es suyo
+    # y dejar a su duenio sin poder usar Google. Es molesto y visible; lo otro
+    # es silencioso y grave. Se resuelve cuando haya verificacion por mail.
+    if row["provider"] == "local" and row["username"] == email:
+        con.close()
+        raise HTTPException(
+            409,
+            "Ya existe una cuenta con ese correo creada con contraseña. "
+            "Ingresá con tu contraseña.",
+        )
+
     # Existing local account signing in with Google for the first time: link them.
     if row["provider"] == "local":
         con.execute(
