@@ -374,10 +374,20 @@ JWT_EXPIRE_HOURS = 8
 
 # Google sign-in: audience the ID token must be issued for. Empty disables /auth/google.
 GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+
+# Firebase Authentication: el proyecto contra el que se valida el ID token.
+#
+# Firebase es quien manda los correos de verificacion y de recuperacion, que es
+# lo que ni Google Sign-In ni el alta propia pueden hacer: no tenemos servicio
+# de envio. Vacio deshabilita /auth/firebase.
+#
+# Coincide con el id del proyecto de Google Cloud —un proyecto de Firebase ES
+# un proyecto de GCP— asi que en produccion vale "ontimeai-prod".
+FIREBASE_PROJECT_ID = os.getenv("FIREBASE_PROJECT_ID", "")
 USER_TYPES = ("b2b", "b2c")
 
 
-_PUBLIC_PATHS = {"/auth/login", "/auth/google", "/auth/register", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"}
+_PUBLIC_PATHS = {"/auth/login", "/auth/google", "/auth/register", "/auth/firebase", "/docs", "/openapi.json", "/redoc", "/docs/oauth2-redirect"}
 # Endpoints accesibles sin autenticación para la vista pública /live
 _LITE_PUBLIC_PATHS = {"/flights", "/metrics/hourly"}
 _LITE_PUBLIC_PREFIXES = ("/weather/",)
@@ -412,6 +422,10 @@ class LoginRequest(BaseModel):
 
 
 class GoogleLoginRequest(BaseModel):
+    id_token: str
+
+
+class FirebaseLoginRequest(BaseModel):
     id_token: str
 
 
@@ -1102,6 +1116,122 @@ def login_google(body: GoogleLoginRequest):
         )
 
     # Existing local account signing in with Google for the first time: link them.
+    if row["provider"] == "local":
+        con.execute(
+            "UPDATE users SET email=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') "
+            "WHERE username=? AND email IS NULL",
+            (email, row["username"]),
+        )
+        con.commit()
+    con.close()
+    return {
+        "access_token": _issue_token(row["username"], row["role"]),
+        "token_type": "bearer",
+        "user_type": row["user_type"],
+        "is_new_user": False,
+    }
+
+
+def _verify_firebase_id_token(raw_token: str) -> dict:
+    """Valida un ID token de Firebase y exige que el correo este verificado.
+
+    Firebase firma estos tokens con las claves de Google, asi que `google-auth`
+    —ya instalado para Google Sign-In— los valida sin dependencias nuevas.
+
+    Exigir `email_verified` es el punto de todo esto: es la unica prueba que
+    tenemos de que el correo le pertenece a quien lo presenta. Sin ella el
+    endpoint no aporta nada sobre el alta propia.
+    """
+    if not FIREBASE_PROJECT_ID:
+        raise HTTPException(503, "Firebase no está configurado en este entorno")
+    try:
+        from google.auth.transport import requests as google_requests
+        from google.oauth2 import id_token as google_id_token
+    except ImportError:
+        raise HTTPException(503, "Dependencia google-auth no instalada")
+    try:
+        claims = google_id_token.verify_firebase_token(
+            raw_token, google_requests.Request(), audience=FIREBASE_PROJECT_ID
+        )
+    except ValueError as exc:
+        raise HTTPException(401, f"ID token de Firebase inválido: {exc}")
+    if not claims:
+        raise HTTPException(401, "ID token de Firebase inválido")
+    if not claims.get("email"):
+        raise HTTPException(401, "El ID token no incluye email")
+    if not claims.get("email_verified"):
+        raise HTTPException(
+            403,
+            "Falta verificar el correo. Revisá tu casilla y volvé a intentar.",
+        )
+    return claims
+
+
+@app.post("/auth/firebase")
+def login_firebase(body: FirebaseLoginRequest):
+    """Cambia un ID token de Firebase por un JWT propio.
+
+    Firebase se ocupa de las credenciales —alta, verificacion del correo,
+    recuperacion de contrasena— y esta tabla sigue siendo la duenia del rol y
+    del tipo de cuenta. Es el mismo reparto que con /auth/google, con la
+    diferencia de que aca el correo llega probado.
+    """
+    claims = _verify_firebase_id_token(body.id_token)
+    email = claims["email"].lower()
+
+    con = _get_users_con()
+    row = con.execute(
+        "SELECT username, role, active, user_type, provider FROM users "
+        "WHERE username=? OR email=?",
+        (email, email),
+    ).fetchone()
+
+    if row is None:
+        con.execute(
+            "INSERT INTO users (username, password_hash, role, email, provider) "
+            "VALUES (?,?,'user',?, 'firebase')",
+            (email, _unusable_password(), email),
+        )
+        con.commit()
+        con.close()
+        _upload_users_db()
+        return {
+            "access_token": _issue_token(email, "user"),
+            "token_type": "bearer",
+            "user_type": None,
+            "is_new_user": True,
+        }
+
+    if not row["active"]:
+        con.close()
+        raise HTTPException(403, "La cuenta está desactivada")
+
+    # Una cuenta local que reclamaba este correo pasa a manos de quien lo probo,
+    # y su contrasena deja de servir.
+    #
+    # El alta propia no puede verificar el correo, asi que cualquiera pudo
+    # haber registrado este y conocer su contrasena. Vincular sin mas le daria
+    # al duenio real una cuenta a la que el otro sigue entrando. Con el correo
+    # probado, la cuenta es de quien lo probo; el que la ocupaba pierde el
+    # acceso y puede recuperarlo por Firebase si el correo era suyo.
+    if row["provider"] == "local" and row["username"] == email:
+        con.execute(
+            "UPDATE users SET password_hash=?, provider='firebase', email=?, "
+            "updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') WHERE username=?",
+            (_unusable_password(), email, row["username"]),
+        )
+        con.commit()
+        con.close()
+        _upload_users_db()
+        return {
+            "access_token": _issue_token(row["username"], row["role"]),
+            "token_type": "bearer",
+            "user_type": row["user_type"],
+            "is_new_user": row["user_type"] is None,
+        }
+
+    # Cuenta creada por un administrador que entra por Firebase: se la vincula
+    # sin tocarle la contrasena, porque esa si la puso alguien de confianza.
     if row["provider"] == "local":
         con.execute(
             "UPDATE users SET email=?, updated_at=strftime('%Y-%m-%dT%H:%M:%SZ','now') "
