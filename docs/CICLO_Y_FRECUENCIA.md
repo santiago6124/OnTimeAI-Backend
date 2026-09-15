@@ -52,13 +52,13 @@ nodos domina sobre el tamaño:
 ```
 imagen 353 MB  → 120,4 s
 imagen 320 MB  → 129,4 s
-imagen 247 MB  → 323,6   291,6   239,0   292,7   125,1 s
+imagen 247 MB  → 323,6   291,6   239,0   292,7   125,1   153,6 s
 ```
 
 Una imagen recién construida arranca **dos o tres veces más lento** durante las
-primeras corridas, y recién después se estabiliza. Las cinco mediciones de la
-imagen de 247 MB no bajan de forma ordenada —239 y después 292— pero terminan
-en 125,1 s, que es el mismo valor que daban las imágenes de 320 y 353 MB.
+primeras corridas, y recién después se estabiliza. Las seis mediciones de la
+imagen de 247 MB no bajan de forma ordenada —239 y después 292— pero las dos
+últimas dan 125 y 154 s, el mismo rango que las imágenes de 320 y 353 MB.
 
 Ahí está la conclusión: **con caché caliente, las tres imágenes tardan lo
 mismo**. Recortar el 30% no cambió el arranque. Y durante las primeras corridas
