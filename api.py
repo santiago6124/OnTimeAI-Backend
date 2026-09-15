@@ -1276,6 +1276,58 @@ def metrics_hourly():
         con.close()
 
 
+@app.get("/metrics/history")
+def metrics_history(segment: str = "all", days: int = 56):
+    """Serie diaria de calidad del modelo, mas alla de la retencion de 30 dias.
+
+    Sale de `metrics_daily`, que el job escribe antes de purgar. Las tablas
+    crudas se borran a los 30 dias; estos agregados no, asi que la serie crece
+    sin limite practico —son kilobytes por semana—. Ver issue #12.
+
+    `segment` acepta 'all', 'carrier:DL' o 'hour:14'. El default de 56 dias son
+    las 8 semanas que pide Frontend #3.
+    """
+    con = get_db()
+    try:
+        try:
+            filas = con.execute(
+                """SELECT day, n_flights, n_delayed, n_flagged, tp, fp, tn, fn,
+                          auc, brier, ece, mean_proba, mean_threshold, model_version
+                     FROM metrics_daily
+                    WHERE segment = ?
+                      AND day >= date('now', ?)
+                    ORDER BY day""",
+                (segment, f"-{max(1, min(int(days), 3650))} days"),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            # Base anterior al primer rollup: serie vacia, no un 500.
+            return {"segment": segment, "days": days, "points": []}
+
+        puntos = []
+        for r in filas:
+            tp, fp, fn = r["tp"], r["fp"], r["fn"]
+            puntos.append({
+                "day": r["day"],
+                "n_flights": r["n_flights"],
+                "n_delayed": r["n_delayed"],
+                "n_flagged": r["n_flagged"],
+                "actual_delay_rate": round(r["n_delayed"] / r["n_flights"], 4)
+                                     if r["n_flights"] else None,
+                "precision": round(tp / (tp + fp), 4) if (tp + fp) else None,
+                "recall": round(tp / (tp + fn), 4) if (tp + fn) else None,
+                "auc": round(r["auc"], 4) if r["auc"] is not None else None,
+                "brier": round(r["brier"], 4) if r["brier"] is not None else None,
+                "ece": round(r["ece"], 4) if r["ece"] is not None else None,
+                "mean_proba": round(r["mean_proba"], 4) if r["mean_proba"] is not None else None,
+                "mean_threshold": round(r["mean_threshold"], 4)
+                                  if r["mean_threshold"] is not None else None,
+                "model_version": r["model_version"],
+            })
+        return {"segment": segment, "days": days, "points": puntos}
+    finally:
+        con.close()
+
+
 @app.get("/metrics/model")
 def metrics_model():
     try:
