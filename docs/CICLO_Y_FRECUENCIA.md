@@ -52,22 +52,24 @@ nodos domina sobre el tamaño:
 ```
 imagen 353 MB  → 120,4 s
 imagen 320 MB  → 129,4 s
-imagen 247 MB  → 323,6 s   291,6 s   239,0 s   292,7 s
+imagen 247 MB  → 323,6   291,6   239,0   292,7   125,1 s
 ```
 
-La imagen **más chica arranca entre dos y tres veces más lento**. La primera
-explicación —que se iba calentando la caché y convergería— la contradice la
-cuarta medición: 239 y después 292. No converge, oscila.
+Una imagen recién construida arranca **dos o tres veces más lento** durante las
+primeras corridas, y recién después se estabiliza. Las cinco mediciones de la
+imagen de 247 MB no bajan de forma ordenada —239 y después 292— pero terminan
+en 125,1 s, que es el mismo valor que daban las imágenes de 320 y 353 MB.
 
-Lo afirmable es lo que se ve: en este rango de tamaños la varianza del arranque
-con la misma imagen (239 a 324 s) es mayor que cualquier efecto atribuible a
-los MB, y no hay forma de aislarlo desde afuera. Lo que domina es algo del
-aprovisionamiento de Cloud Run que no controlamos ni observamos.
+Ahí está la conclusión: **con caché caliente, las tres imágenes tardan lo
+mismo**. Recortar el 30% no cambió el arranque. Y durante las primeras corridas
+después de cada despliegue el arranque se duplica o triplica, sea cual sea el
+tamaño, lo que explica buena parte de la varianza de los ciclos (5,1 a 8,9 min)
+sin necesidad de invocar otra causa.
 
 Los dos recortes se dejan igual: valen por sí solos —menos que mantener, menos
 que auditar— pero **no hay evidencia de que aceleren el ciclo**, y no conviene
-afirmarlo. Tampoco la hay de que lo empeoren: los 323 s de la imagen nueva son
-del mismo orden que la varianza que muestra consigo misma.
+afirmarlo. Tampoco la hay de que lo empeoren: la imagen de 247 MB, una vez
+caliente, arranca igual que la de 353.
 
 ## El criterio que no se cumple
 
@@ -109,9 +111,21 @@ toda ella, pero ese es el colchón que queda.
 
 Subir la frecuencia exige primero acortar el ciclo. En ese orden.
 
+## Un efecto secundario que conviene tener presente
+
+Cada despliegue construye una imagen nueva, y las primeras corridas contra ella
+arrancan dos o tres veces más lento. En un día con varios despliegues seguidos
+—como el 15/09— eso infla los ciclos y puede parecer una degradación del
+pipeline cuando es solamente caché fría. Antes de investigar un ciclo lento,
+conviene mirar si hubo un despliegue reciente.
+
 ## Si alguien retoma esto
 
 Lo que falta medir es el aprovisionamiento de Cloud Run separado de la descarga
 de imagen. Desde dentro del proceso no se ve, y desde fuera la caché de capas
 contamina la medición. Haría falta comparar contra un job de imagen mínima
 —`python:3.11-slim` sin nada— corriendo en paralelo durante un rato largo.
+
+Y conviene medir siempre con la imagen ya caliente: al menos cinco corridas
+seguidas, descartando las primeras. Las conclusiones de una sola corrida en
+este entorno no valen.
