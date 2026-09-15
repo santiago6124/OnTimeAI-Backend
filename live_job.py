@@ -424,6 +424,17 @@ def main() -> int:
     extra_args = _live_pull_args_from_env()
 
     if not GCS_BUCKET:
+        # La imagen ya no trae `live_data.db`: eran 81 MB que solo servian para
+        # este camino, y la imagen se baja entera en cada ciclo. En produccion
+        # GCS_BUCKET siempre esta; sin el, esto es desarrollo local y conviene
+        # decir que falta en vez de reventar con FileNotFoundError.
+        if not BUNDLED_DB.exists():
+            print(
+                f"[job] GCS_BUCKET no configurado y no hay {BUNDLED_DB}. "
+                "Configura GCS_BUCKET, o deja una copia de live_data.db ahi "
+                "para correr sin GCS."
+            )
+            return 4
         print("[job] GCS_BUCKET no configurado, usando DB local.")
         shutil.copy(BUNDLED_DB, TMP_DB)
         os.environ["LIVE_DB_BASE_GENERATION"] = "local"
