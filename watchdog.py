@@ -167,6 +167,51 @@ def check_sources_fresh() -> list[Check]:
     return checks
 
 
+def check_capacity() -> list[Check]:
+    """Tamano de la base y duracion del ciclo, antes de que sean un problema.
+
+    El job baja la base entera de GCS, la modifica y la vuelve a subir en cada
+    ciclo, asi que su duracion crece con el archivo. Los predictores corren cada
+    15 minutos: cuando el ciclo se acerca a esa ventana, dos jobs terminan
+    escribiendo la misma base y pisandose las subidas.
+
+    Es una senal adelantada, no una caida: avisa mientras todavia hay margen
+    para hacer algo —purgar, vacuumear mas seguido, partir el historico—.
+    Ver issue #4.
+    """
+    try:
+        stats = requests.get(
+            f"{BACKEND_URL}/admin/db-stats",
+            headers={"Authorization": f"Bearer {_login()}"},
+            timeout=HTTP_TIMEOUT,
+        ).json()
+    except Exception as exc:
+        return [Check("capacity", False, f"No se pudo leer /admin/db-stats: {exc}")]
+
+    checks: list[Check] = []
+
+    size = stats.get("db_size_mb")
+    limite = stats.get("db_size_warn_mb")
+    if size is not None and limite:
+        checks.append(Check(
+            "db_size",
+            not stats.get("db_size_over_warn", False),
+            f"La base pesa {size:.0f} MB (se avisa sobre {limite})",
+        ))
+
+    ciclos = stats.get("cycles") or {}
+    if ciclos.get("median_minutes") is not None:
+        checks.append(Check(
+            "cycle_duration",
+            not ciclos.get("slow", False),
+            f"El ciclo tarda {ciclos['median_minutes']:.1f} min de mediana, "
+            f"maximo {ciclos.get('max_minutes', 0):.1f} "
+            f"(se toleran {ciclos.get('tolerated_minutes')} contra un scheduler "
+            f"de {ciclos.get('scheduler_minutes')} min)",
+        ))
+    return checks
+
+
 def check_backend_data_fresh() -> Check:
     """
     ¿El backend sirve datos frescos?
@@ -258,6 +303,7 @@ def main() -> int:
     # cinco alertas en vez de una.
     if all(c.ok for c in checks):
         checks.extend(check_sources_fresh())
+        checks.extend(check_capacity())
     state = load_state()
     # Se arranca del estado previo en vez de vacio. Una clave que no se pudo
     # evaluar en esta corrida —las fuentes cuando el backend esta caido— tiene

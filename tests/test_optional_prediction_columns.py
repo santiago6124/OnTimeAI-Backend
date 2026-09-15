@@ -200,3 +200,66 @@ class TestFrescuraPorFuente:
         fuentes = api._source_freshness(con_migrada)
         assert "aircraft_position" not in fuentes
         assert "predictions" in fuentes
+
+
+class TestDuracionDeCiclos:
+    """
+    El job baja la base entera de GCS y la vuelve a subir en cada ciclo, asi que
+    su duracion crece con el archivo. Los predictores corren cada 15 min: cuando
+    el ciclo se acerca a esa ventana, dos jobs terminan escribiendo la misma
+    base y pisandose las subidas. Ver issue #4.
+    """
+
+    def _run(self, con, started, finished) -> None:
+        con.execute(
+            "INSERT INTO runs (started_utc, finished_utc) VALUES (?,?)",
+            (started, finished),
+        )
+
+    def test_calcula_mediana_y_maximo(self, con_migrada) -> None:
+        self._run(con_migrada, "2026-09-15T01:00:00+00:00", "2026-09-15T01:05:00+00:00")
+        self._run(con_migrada, "2026-09-15T02:00:00+00:00", "2026-09-15T02:07:00+00:00")
+        self._run(con_migrada, "2026-09-15T03:00:00+00:00", "2026-09-15T03:12:00+00:00")
+        con_migrada.commit()
+
+        c = api._recent_cycles(con_migrada)
+        assert c["median_minutes"] == pytest.approx(7.0)
+        assert c["max_minutes"] == pytest.approx(12.0)
+
+    def test_un_ciclo_lento_aislado_no_dispara(self, con_migrada) -> None:
+        """Por eso se compara la mediana y no el maximo."""
+        for h in ("01", "02", "03", "04"):
+            self._run(con_migrada, f"2026-09-15T{h}:00:00+00:00", f"2026-09-15T{h}:05:00+00:00")
+        self._run(con_migrada, "2026-09-15T05:00:00+00:00", "2026-09-15T05:14:00+00:00")
+        con_migrada.commit()
+
+        c = api._recent_cycles(con_migrada)
+        assert c["slow"] is False
+        assert c["max_minutes"] == pytest.approx(14.0)
+
+    def test_marca_lento_cuando_la_mediana_pasa_dos_tercios(self, con_migrada) -> None:
+        # Dos tercios de 15 min son 10.
+        for h in ("01", "02", "03"):
+            self._run(con_migrada, f"2026-09-15T{h}:00:00+00:00", f"2026-09-15T{h}:11:00+00:00")
+        con_migrada.commit()
+
+        c = api._recent_cycles(con_migrada)
+        assert c["slow"] is True
+        assert c["tolerated_minutes"] == pytest.approx(10.0)
+
+    def test_ignora_las_corridas_sin_terminar(self, con_migrada) -> None:
+        self._run(con_migrada, "2026-09-15T01:00:00+00:00", "2026-09-15T01:05:00+00:00")
+        self._run(con_migrada, "2026-09-15T02:00:00+00:00", None)
+        con_migrada.commit()
+
+        assert api._recent_cycles(con_migrada)["recent_minutes"] == [5.0]
+
+    def test_sin_corridas_devuelve_vacio(self, con_migrada) -> None:
+        assert api._recent_cycles(con_migrada) == {}
+
+    def test_una_fecha_ilegible_no_rompe_el_resto(self, con_migrada) -> None:
+        self._run(con_migrada, "no-es-una-fecha", "tampoco")
+        self._run(con_migrada, "2026-09-15T01:00:00+00:00", "2026-09-15T01:05:00+00:00")
+        con_migrada.commit()
+
+        assert api._recent_cycles(con_migrada)["recent_minutes"] == [5.0]
