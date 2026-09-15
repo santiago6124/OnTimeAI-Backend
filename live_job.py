@@ -6,6 +6,7 @@ import resource
 import shutil
 import sys
 import time
+from contextlib import contextmanager
 from pathlib import Path
 
 from ontimeai.training_store import read_bool_env
@@ -44,6 +45,23 @@ os.environ["DB_PATH"] = str(TMP_DB)
 
 class GCSGenerationConflict(RuntimeError):
     """The shared DB changed after this process selected its base generation."""
+
+
+@contextmanager
+def _fase(nombre: str):
+    """Cronometra una fase del ciclo y la deja en el log.
+
+    Sin esto solo se sabia el total. El pipeline ya se instrumenta por dentro
+    —clima 54 s, features + inferencia 91 s, medido— pero eso suma 2,4 min
+    contra ejecuciones de Cloud Run de 4 a 8,7: el resto se reparte entre
+    arranque, descarga, agregados, purga y subida, y no habia forma de saber
+    en que proporcion. Ver issue #4.
+    """
+    inicio = time.monotonic()
+    try:
+        yield
+    finally:
+        print(f"[fase] {nombre}: {time.monotonic() - inicio:.1f} s")
 
 
 def _validate_training_store_config() -> None:
@@ -313,9 +331,10 @@ def _run_pipeline_attempt(extra_args: list[str]) -> int:
 
             con = sqlite3.connect(TMP_DB)
             try:
-                n = rollup_daily_metrics(
-                    con, model_version=os.environ.get("ACTIVE_MODEL", "")
-                )
+                with _fase("agregados diarios"):
+                    n = rollup_daily_metrics(
+                        con, model_version=os.environ.get("ACTIVE_MODEL", "")
+                    )
                 print(f"[job] Agregados diarios: {n} filas (dia, segmento)")
             finally:
                 con.close()
@@ -327,11 +346,12 @@ def _run_pipeline_attempt(extra_args: list[str]) -> int:
         print("[job] Running database pruning...")
         try:
             from scripts.prune_db import prune_db
-            prune_db(
-                TMP_DB,
-                days=30,
-                dry_run=False,
-            )
+            with _fase("purga"):
+                prune_db(
+                    TMP_DB,
+                    days=30,
+                    dry_run=False,
+                )
         except Exception as e:
             print(f"[job] Error running database pruning: {e}")
 
@@ -400,7 +420,8 @@ def main() -> int:
 
     for attempt in range(GCS_GENERATION_RETRIES + 1):
         try:
-            base_generation = _gcs_download()
+            with _fase("descarga"):
+                base_generation = _gcs_download()
             os.environ["LIVE_DB_BASE_GENERATION"] = str(base_generation)
             print(
                 f"[job] mutation attempt {attempt + 1}/"
@@ -411,15 +432,18 @@ def main() -> int:
             # simply retries against the winner; GCS objects are create-only.
             if not _handle_training_publish(mark_delivered=True):
                 return 4
-            exit_code = _run_pipeline_attempt(extra_args)
+            with _fase("pipeline"):
+                exit_code = _run_pipeline_attempt(extra_args)
             if exit_code != 0:
                 return exit_code
             if not TMP_DB.exists():
                 raise FileNotFoundError(f"pipeline did not produce {TMP_DB}")
 
-            _cleanup_old_data()
+            with _fase("limpieza (agregados + purga + vacuum)"):
+                _cleanup_old_data()
             _record_job_duration()
-            _gcs_upload(base_generation)
+            with _fase("subida"):
+                _gcs_upload(base_generation)
             # Publish the newly durable outbox immediately, but acknowledge it
             # next cycle so no second full-DB upload is needed.
             if not _handle_training_publish(mark_delivered=False):
