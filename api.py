@@ -660,6 +660,21 @@ SOURCE_FRESHNESS: dict[str, tuple[str, int, str]] = {
 }
 
 
+def _chain_calibrator_status(con: sqlite3.Connection) -> dict:
+    """Estado del calibrador post-cadena: cuando se ajusto y si sigue vigente.
+
+    Se expone porque un calibrador vencido no se nota mirando el dashboard: los
+    numeros siguen saliendo, solo que exagerados. Es lo que paso con el
+    artefacto de agosto durante un mes. Ver ontimeai/chain_calibration.py.
+    """
+    try:
+        from ontimeai.chain_calibration import calibrator_status
+
+        return calibrator_status(con)
+    except Exception as exc:
+        return {"present": False, "stale": True, "detail": f"no se pudo leer: {exc}"}
+
+
 def _recent_cycles(con: sqlite3.Connection, limit: int = 8) -> dict:
     """Duracion de los ultimos ciclos completos del job.
 
@@ -2096,6 +2111,7 @@ def db_stats(request: Request):
             "table_dates": table_dates,
             "sources": _source_freshness(con),
             "cycles": _recent_cycles(con),
+            "chain_calibrator": _chain_calibrator_status(con),
             "db_size_warn_mb": DB_SIZE_WARN_MB,
             "db_size_over_warn": size_mb > DB_SIZE_WARN_MB,
             "prediction_dates": date_range,
