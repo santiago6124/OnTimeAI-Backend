@@ -329,3 +329,170 @@ class TestEndpointDeHistoria:
         assert len(puntos) == 1
         assert puntos[0]["day"] == "2026-07-01"
         assert puntos[0]["n_flights"] == 500
+
+
+def _prediccion_extra(con, fid, *, predicted_at, proba, flagged, phase,
+                      threshold=0.09):
+    """Otra prediccion del mismo vuelo, en otra fase o mas tarde."""
+    con.execute(
+        "INSERT INTO predictions (fa_flight_id, stable_id, predicted_at_utc,"
+        " proba_delay, predicted_delay, threshold_used, prediction_phase)"
+        " VALUES (?,?,?,?,?,?,?)",
+        (fid, fid, predicted_at, proba, flagged, threshold, phase),
+    )
+    con.commit()
+
+
+class TestSegmentosPorFase:
+    """
+    Predecir con el avion volando es facil: media hora despues se sabe solo. El
+    valor esta en acertar antes de que salga, que es cuando todavia se puede
+    hacer algo. Medir las dos fases juntas esconde exactamente esa diferencia.
+    """
+
+    def test_un_vuelo_aporta_a_las_dos_fases(self, con) -> None:
+        # Antes de salir el modelo le daba poco; ya en el aire, mucho.
+        _vuelo(con, "A", proba=0.10, flagged=0, arr_delay=40,
+               phase="PRE_DEPARTURE", predicted_at="2026-09-10T09:00:00+00:00")
+        _prediccion_extra(con, "A", predicted_at="2026-09-10T13:00:00+00:00",
+                          proba=0.90, flagged=1, phase="EN_ROUTE")
+
+        filas = {f["segment"]: f for f in rollup.compute_daily_rollup(con)}
+        assert filas["phase:PRE_DEPARTURE"]["mean_proba"] == pytest.approx(0.10)
+        assert filas["phase:EN_ROUTE"]["mean_proba"] == pytest.approx(0.90)
+
+    def test_no_lo_cuenta_dos_veces_en_el_total(self, con) -> None:
+        """
+        El mismo vuelo aporta una prediccion a cada fase, pero sigue siendo un
+        vuelo. Si las fases se mezclaran con los demas segmentos, `all` diria
+        dos.
+        """
+        _vuelo(con, "A", proba=0.10, arr_delay=40, phase="PRE_DEPARTURE",
+               predicted_at="2026-09-10T09:00:00+00:00")
+        _prediccion_extra(con, "A", predicted_at="2026-09-10T13:00:00+00:00",
+                          proba=0.90, flagged=1, phase="EN_ROUTE")
+
+        filas = {f["segment"]: f for f in rollup.compute_daily_rollup(con)}
+        assert filas["all"]["n_flights"] == 1
+        assert filas["carrier:DL"]["n_flights"] == 1
+
+    def test_toma_la_ultima_de_cada_fase_no_la_primera(self, con) -> None:
+        _vuelo(con, "A", proba=0.20, arr_delay=40, phase="PRE_DEPARTURE",
+               predicted_at="2026-09-10T08:00:00+00:00")
+        _prediccion_extra(con, "A", predicted_at="2026-09-10T10:00:00+00:00",
+                          proba=0.55, flagged=1, phase="PRE_DEPARTURE")
+
+        filas = {f["segment"]: f for f in rollup.compute_daily_rollup(con)}
+        assert filas["phase:PRE_DEPARTURE"]["mean_proba"] == pytest.approx(0.55)
+
+    def test_post_landing_no_entra(self, con) -> None:
+        """
+        Una prediccion hecha con el avion ya en tierra sabe el resultado: meterla
+        inflaria las metricas con algo que nadie llego a usar.
+        """
+        _vuelo(con, "A", proba=0.30, arr_delay=40, phase="PRE_DEPARTURE",
+               predicted_at="2026-09-10T09:00:00+00:00")
+        _prediccion_extra(con, "A", predicted_at="2026-09-10T20:00:00+00:00",
+                          proba=0.99, flagged=1, phase="POST_LANDING")
+
+        filas = {f["segment"]: f for f in rollup.compute_daily_rollup(con)}
+        assert "phase:POST_LANDING" not in filas
+        assert filas["phase:PRE_DEPARTURE"]["mean_proba"] == pytest.approx(0.30)
+
+    def test_un_vuelo_que_solo_tuvo_una_fase_no_inventa_la_otra(self, con) -> None:
+        _vuelo(con, "A", proba=0.30, arr_delay=40, phase="EN_ROUTE")
+
+        filas = {f["segment"]: f for f in rollup.compute_daily_rollup(con)}
+        assert "phase:PRE_DEPARTURE" not in filas
+        assert filas["phase:EN_ROUTE"]["n_flights"] == 1
+
+
+class TestBreakdown:
+    """
+    Las tablas por aerolinea y por hora de Frontend #3.
+
+    Lo que se agrega no se promedia: sumar conteos y recalcular sobre el total
+    es distinto de promediar los promedios diarios, y la diferencia importa
+    justo donde el trafico es desparejo.
+    """
+
+    def _dia(self, segment, day, **campos):
+        fila = {"day": day, "segment": segment, "n_flights": 0, "n_delayed": 0,
+                "n_flagged": 0, "tp": 0, "fp": 0, "tn": 0, "fn": 0,
+                "auc": None, "brier": None, "ece": None, "mean_proba": None,
+                "mean_threshold": None, "model_version": "4year_v9",
+                "computed_at_utc": "2026-09-16T00:00:00+00:00"}
+        fila.update(campos)
+        return fila
+
+    def test_suma_los_conteos_en_vez_de_promediarlos(self, api_con_base) -> None:
+        api, abrir = api_con_base
+        con = abrir()
+        rollup.upsert_daily_rollup(con, [
+            self._dia("carrier:DL", "2026-09-14", n_flights=100, tp=10, fp=10, tn=80, fn=0),
+            self._dia("carrier:DL", "2026-09-15", n_flights=300, tp=30, fp=30, tn=240, fn=0),
+        ])
+        con.close()
+
+        fila = api.metrics_breakdown(by="carrier", days=3650)["rows"][0]
+        assert fila["key"] == "DL"
+        assert fila["n_flights"] == 400
+        assert fila["n_days"] == 2
+        # 40 de 80 marcados: la precision sale del total, no del promedio de dias.
+        assert fila["precision"] == pytest.approx(0.5)
+
+    def test_una_aerolinea_chica_no_pesa_igual_que_una_grande(self, api_con_base) -> None:
+        """
+        Promediar los promedios le daria a un dia de 8 vuelos el mismo peso que
+        a uno de 400. El AUC se pondera por vuelos por la misma razon.
+        """
+        api, abrir = api_con_base
+        con = abrir()
+        rollup.upsert_daily_rollup(con, [
+            self._dia("carrier:DL", "2026-09-14", n_flights=8, auc=0.20),
+            self._dia("carrier:DL", "2026-09-15", n_flights=392, auc=0.80),
+        ])
+        con.close()
+
+        fila = api.metrics_breakdown(by="carrier", days=3650)["rows"][0]
+        # Promediando los promedios daria 0.50. Ponderado da ~0.788.
+        assert fila["auc"] == pytest.approx(0.788, abs=0.001)
+
+    def test_ordena_por_volumen(self, api_con_base) -> None:
+        api, abrir = api_con_base
+        con = abrir()
+        rollup.upsert_daily_rollup(con, [
+            self._dia("carrier:F9", "2026-09-15", n_flights=10),
+            self._dia("carrier:DL", "2026-09-15", n_flights=400),
+            self._dia("carrier:AA", "2026-09-15", n_flights=90),
+        ])
+        con.close()
+
+        filas = api.metrics_breakdown(by="carrier", days=3650)["rows"]
+        assert [f["key"] for f in filas] == ["DL", "AA", "F9"]
+
+    def test_no_mezcla_los_tipos_de_segmento(self, api_con_base) -> None:
+        """`hour:14` no puede aparecer en la tabla de aerolineas."""
+        api, abrir = api_con_base
+        con = abrir()
+        rollup.upsert_daily_rollup(con, [
+            self._dia("carrier:DL", "2026-09-15", n_flights=400),
+            self._dia("hour:14", "2026-09-15", n_flights=50),
+            self._dia("all", "2026-09-15", n_flights=500),
+            self._dia("phase:EN_ROUTE", "2026-09-15", n_flights=500),
+        ])
+        con.close()
+
+        assert [f["key"] for f in api.metrics_breakdown(by="carrier", days=3650)["rows"]] == ["DL"]
+        assert [f["key"] for f in api.metrics_breakdown(by="hour", days=3650)["rows"]] == ["14"]
+        assert [f["key"] for f in api.metrics_breakdown(by="phase", days=3650)["rows"]] == ["EN_ROUTE"]
+
+    def test_rechaza_un_corte_que_no_existe(self, api_con_base) -> None:
+        api, _ = api_con_base
+        with pytest.raises(Exception) as e:
+            api.metrics_breakdown(by="ruta")
+        assert "400" in str(e.value) or "by" in str(e.value)
+
+    def test_sin_datos_devuelve_vacio_y_no_rompe(self, api_con_base) -> None:
+        api, _ = api_con_base
+        assert api.metrics_breakdown(by="carrier", days=3650)["rows"] == []

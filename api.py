@@ -1741,6 +1741,89 @@ def metrics_history(segment: str = "all", days: int = 56):
         con.close()
 
 
+@app.get("/metrics/breakdown")
+def metrics_breakdown(by: str = "carrier", days: int = 28):
+    """Calidad del modelo agregada por aerolinea, por hora del dia o por fase.
+
+    Suma las filas diarias de `metrics_daily` sobre la ventana pedida en vez de
+    promediar los promedios: un dia con 8 vuelos de una aerolinea chica no puede
+    pesar lo mismo que uno con 200. Los conteos se suman y las metricas se
+    recalculan sobre el total.
+
+    El AUC no se puede sumar —depende del orden entre vuelos, no de conteos— asi
+    que se promedia ponderando por vuelos y se devuelve aparte, dicho como lo
+    que es. Ver Frontend #3.
+    """
+    prefijos = {"carrier": "carrier:", "hour": "hour:", "phase": "phase:"}
+    if by not in prefijos:
+        raise HTTPException(400, f"`by` debe ser uno de: {', '.join(prefijos)}")
+    prefijo = prefijos[by]
+
+    con = get_db()
+    try:
+        try:
+            filas = con.execute(
+                """SELECT segment, n_flights, n_delayed, n_flagged, tp, fp, tn, fn,
+                          auc, brier, ece
+                     FROM metrics_daily
+                    WHERE segment LIKE ?
+                      AND day >= date('now', ?)""",
+                (f"{prefijo}%", f"-{max(1, min(int(days), 3650))} days"),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return {"by": by, "days": days, "rows": []}
+
+        acumulado: dict[str, dict] = {}
+        for r in filas:
+            clave = r["segment"][len(prefijo):]
+            acc = acumulado.setdefault(clave, {
+                "key": clave, "n_flights": 0, "n_delayed": 0, "n_flagged": 0,
+                "tp": 0, "fp": 0, "tn": 0, "fn": 0,
+                "_auc_peso": 0.0, "_auc_suma": 0.0,
+                "_brier_suma": 0.0, "_ece_suma": 0.0, "_metrica_peso": 0.0,
+                "n_days": 0,
+            })
+            for c in ("n_flights", "n_delayed", "n_flagged", "tp", "fp", "tn", "fn"):
+                acc[c] += r[c]
+            acc["n_days"] += 1
+            peso = float(r["n_flights"] or 0)
+            if r["auc"] is not None and peso:
+                acc["_auc_suma"] += float(r["auc"]) * peso
+                acc["_auc_peso"] += peso
+            if peso:
+                if r["brier"] is not None:
+                    acc["_brier_suma"] += float(r["brier"]) * peso
+                if r["ece"] is not None:
+                    acc["_ece_suma"] += float(r["ece"]) * peso
+                acc["_metrica_peso"] += peso
+
+        salida = []
+        for acc in acumulado.values():
+            tp, fp, fn, n = acc["tp"], acc["fp"], acc["fn"], acc["n_flights"]
+            aciertos = acc["tp"] + acc["tn"]
+            salida.append({
+                "key": acc["key"],
+                "n_flights": n,
+                "n_days": acc["n_days"],
+                "n_delayed": acc["n_delayed"],
+                "n_flagged": acc["n_flagged"],
+                "actual_delay_rate": round(acc["n_delayed"] / n, 4) if n else None,
+                "accuracy": round(aciertos / n, 4) if n else None,
+                "precision": round(tp / (tp + fp), 4) if (tp + fp) else None,
+                "recall": round(tp / (tp + fn), 4) if (tp + fn) else None,
+                "auc": round(acc["_auc_suma"] / acc["_auc_peso"], 4)
+                       if acc["_auc_peso"] else None,
+                "brier": round(acc["_brier_suma"] / acc["_metrica_peso"], 4)
+                         if acc["_metrica_peso"] else None,
+                "ece": round(acc["_ece_suma"] / acc["_metrica_peso"], 4)
+                       if acc["_metrica_peso"] else None,
+            })
+        salida.sort(key=lambda x: (-x["n_flights"], x["key"]))
+        return {"by": by, "days": days, "rows": salida}
+    finally:
+        con.close()
+
+
 @app.get("/metrics/model")
 def metrics_model():
     try:
