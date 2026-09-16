@@ -9,8 +9,8 @@ los escenarios de la demo (#11). Ver issue #12.
 La salida no es subir la retencion —la base ya pesa 720 MB— sino separar lo que
 se purga de lo que se conserva. Los agregados son kilobytes por semana:
 
-    ~55 filas por dia (todos + por aerolinea + por hora)
-    ~20.000 filas por anio
+    ~57 filas por dia (todos + por aerolinea + por hora + por fase)
+    ~21.000 filas por anio
 
 `prune_db` borra con una lista explicita de DELETE, asi que esta tabla queda
 afuera sin necesidad de excluirla. Aun asi conviene no agregarla nunca a esa
@@ -43,7 +43,7 @@ DELAY_THRESHOLD_MIN = 15.0
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS metrics_daily (
     day TEXT NOT NULL,              -- YYYY-MM-DD, dia operativo (scheduled_out)
-    segment TEXT NOT NULL,          -- 'all' | 'carrier:DL' | 'hour:14'
+    segment TEXT NOT NULL,          -- 'all'|'carrier:DL'|'hour:14'|'phase:PRE_DEPARTURE'
     n_flights INTEGER NOT NULL,     -- vuelos con resultado real
     n_delayed INTEGER NOT NULL,     -- los que efectivamente llegaron tarde
     n_flagged INTEGER NOT NULL,     -- los que el modelo marco
@@ -149,17 +149,59 @@ def _load_flights(con: sqlite3.Connection, days_back: int) -> list[sqlite3.Row]:
         con.row_factory = previo
 
 
+def _load_by_phase(con: sqlite3.Connection, days_back: int) -> list[sqlite3.Row]:
+    """Una fila por (vuelo, fase): la ultima prediccion que hizo en esa fase.
+
+    Distinto de `_load_flights`, que toma una sola por vuelo —la ultima de
+    todas— y por eso casi siempre mide al avion ya en el aire.
+
+    La diferencia entre las dos fases es la pregunta que importa: predecir con
+    el avion volando es facil, porque media hora despues se sabe solo. El valor
+    esta en acertar **antes de que salga**, que es cuando todavia se puede hacer
+    algo. Medirlas juntas esconde exactamente eso.
+    """
+    previo = con.row_factory
+    con.row_factory = sqlite3.Row
+    try:
+        return con.execute(
+            """
+            SELECT substr(f.scheduled_out_utc, 1, 10)               AS day,
+                   p.prediction_phase                               AS phase,
+                   p.proba_delay                                    AS proba,
+                   p.predicted_delay                                AS flagged,
+                   p.threshold_used                                 AS threshold,
+                   CASE WHEN a.arr_delay_min > ? THEN 1 ELSE 0 END  AS y
+              FROM flights f
+              JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
+              JOIN predictions p ON p.fa_flight_id = f.fa_flight_id
+             WHERE a.arr_delay_min IS NOT NULL
+               AND COALESCE(a.cancelled, 0) = 0
+               AND COALESCE(a.diverted, 0) = 0
+               AND f.scheduled_out_utc >= datetime('now', ?)
+               AND p.prediction_phase IN ('PRE_DEPARTURE', 'EN_ROUTE')
+               AND p.predicted_at_utc = (
+                     SELECT MAX(p2.predicted_at_utc) FROM predictions p2
+                      WHERE p2.fa_flight_id = p.fa_flight_id
+                        AND p2.prediction_phase = p.prediction_phase)
+            """,
+            (DELAY_THRESHOLD_MIN, f"-{int(days_back)} days"),
+        ).fetchall()
+    finally:
+        con.row_factory = previo
+
+
 def compute_daily_rollup(
     con: sqlite3.Connection, *, days_back: int = DEFAULT_DAYS_BACK,
     model_version: str = "",
 ) -> list[dict]:
-    """Una fila por (dia, segmento). Segmentos: todos, por aerolinea, por hora.
+    """Una fila por (dia, segmento): todos, por aerolinea, por hora y por fase.
 
     No se segmenta por ruta: ATL tiene cientos, y multiplicarlas por dia haria
     crecer la tabla mas rapido de lo que justifica lo que se consulta hoy.
     """
     filas = _load_flights(con, days_back)
-    if not filas:
+    por_fase = _load_by_phase(con, days_back)
+    if not filas and not por_fase:
         return []
 
     por_clave: dict[tuple[str, str], list[sqlite3.Row]] = {}
@@ -169,6 +211,15 @@ def compute_daily_rollup(
             continue
         for segmento in ("all", f"carrier:{r['carrier']}", f"hour:{r['hour']:02d}"):
             por_clave.setdefault((day, segmento), []).append(r)
+
+    # Las fases van aparte porque un mismo vuelo aporta a las dos, con una
+    # prediccion distinta en cada una. Sumarlas a los segmentos de arriba lo
+    # contaria dos veces.
+    for r in por_fase:
+        day = r["day"]
+        if not day or not r["phase"]:
+            continue
+        por_clave.setdefault((day, f"phase:{r['phase']}"), []).append(r)
 
     ahora = datetime.now(timezone.utc).isoformat()
     salida: list[dict] = []
