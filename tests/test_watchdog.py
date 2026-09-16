@@ -264,3 +264,97 @@ class TestCapacidad:
 
         assert watchdog.main() == 0
         assert llamadas == []
+
+
+# ── Frescura: distinguir "el pipeline se detuvo" de "no habia nada que hacer" ──
+
+
+class TestFrescuraDelBackend:
+    """
+    El 16/09 a las 04:38 UTC sono una alerta de datos viejos con los dos jobs
+    sanos: 80 corridas seguidas sin fallar. A esa hora ATL —00:38 local— no
+    tenia una sola salida programada en la ventana, asi que el ciclo corrio,
+    no encontro nada que predecir, y `last_tick_utc` se quedo clavado.
+
+    Un monitor que grita en falso cada madrugada se empieza a ignorar, y asi es
+    como se pasa por alto el incidente de verdad: el del 13/09, donde el backend
+    devolvia 200 con un snapshot de dos dias atras.
+    """
+
+    def _con_resumen(self, monkeypatch, resumen):
+        import watchdog
+
+        monkeypatch.setattr(watchdog, "_login", lambda: "token")
+
+        class _Respuesta:
+            @staticmethod
+            def json():
+                return resumen
+
+        monkeypatch.setattr(watchdog.requests, "get", lambda *a, **k: _Respuesta())
+        return watchdog.check_backend_data_fresh()
+
+    def _hace(self, minutos):
+        from datetime import datetime, timedelta, timezone
+
+        return (datetime.now(timezone.utc) - timedelta(minutes=minutos)).isoformat()
+
+    def test_la_madrugada_de_atl_ya_no_dispara(self, monkeypatch) -> None:
+        # El caso exacto del 16/09: ciclo reciente, tick viejo, sin vuelos.
+        check = self._con_resumen(monkeypatch, {
+            "last_run_utc": self._hace(6),
+            "last_tick_utc": self._hace(49),
+            "total_flights": 0,
+        })
+        assert check.ok is True
+        assert "sin vuelos" in check.detail
+
+    def test_el_pipeline_detenido_sigue_disparando(self, monkeypatch) -> None:
+        """Lo que el chequeo existe para atrapar tiene que seguir atrapandose."""
+        check = self._con_resumen(monkeypatch, {
+            "last_run_utc": self._hace(2880),
+            "last_tick_utc": self._hace(2880),
+            "total_flights": 0,
+        })
+        assert check.ok is False
+        assert "ciclo" in check.detail.lower()
+
+    def test_hay_vuelos_y_no_se_predice_es_un_problema(self, monkeypatch) -> None:
+        """
+        El ciclo corre, hay trabajo en la ventana y nadie lo hace. Esto no es
+        la madrugada: es una falla que antes quedaba tapada junto con ella.
+        """
+        check = self._con_resumen(monkeypatch, {
+            "last_run_utc": self._hace(5),
+            "last_tick_utc": self._hace(120),
+            "total_flights": 171,
+        })
+        assert check.ok is False
+        assert "171" in check.detail
+
+    def test_operacion_normal_pasa(self, monkeypatch) -> None:
+        check = self._con_resumen(monkeypatch, {
+            "last_run_utc": self._hace(5),
+            "last_tick_utc": self._hace(14),
+            "total_flights": 136,
+        })
+        assert check.ok is True
+        assert "136" in check.detail
+
+    def test_un_backend_viejo_cae_al_criterio_anterior(self, monkeypatch) -> None:
+        """
+        Sin `last_run_utc` —backend sin desplegar todavia— el chequeo no puede
+        quedarse mudo: vuelve a mirar el tick.
+        """
+        viejo = self._con_resumen(monkeypatch, {
+            "last_tick_utc": self._hace(2880), "total_flights": 0,
+        })
+        assert viejo.ok is False
+
+        sano = self._con_resumen(monkeypatch, {
+            "last_tick_utc": self._hace(10), "total_flights": 100,
+        })
+        assert sano.ok is True
+
+    def test_sin_ningun_dato_reporta_falla(self, monkeypatch) -> None:
+        assert self._con_resumen(monkeypatch, {}).ok is False

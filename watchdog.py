@@ -225,7 +225,22 @@ def check_backend_data_fresh() -> Check:
     ¿El backend sirve datos frescos?
 
     Responder no alcanza: en el incidente del 13/09 devolvía 200 con un
-    snapshot de dos días atrás. Este chequeo compara contra el último tick.
+    snapshot de dos días atrás. Este chequeo compara contra el último ciclo.
+
+    Se mira `last_run_utc` y no `last_tick_utc`. El tick sale de las
+    predicciones servidas, así que es *el último ciclo que produjo algo*: de
+    madrugada ATL pasa horas sin una sola salida programada en la ventana, el
+    ciclo corre, no encuentra nada que predecir, y el tick se queda quieto con
+    el pipeline perfecto. El 16/09 a las 04:38 UTC eso disparó una alerta con
+    los dos jobs sanos, 80 corridas seguidas sin fallar.
+
+    Un monitor que grita en falso cada madrugada se empieza a ignorar, y así es
+    como se pasa por alto el incidente de verdad. `runs` recibe una fila por
+    ciclo pase lo que pase: esa es la señal que distingue "el pipeline se
+    detuvo" de "no había nada que hacer".
+
+    El tick viejo con vuelos en la ventana sí es un problema —significa que hay
+    trabajo y no se está haciendo— y se sigue reportando aparte.
     """
     try:
         token = _login()
@@ -236,23 +251,56 @@ def check_backend_data_fresh() -> Check:
             timeout=HTTP_TIMEOUT,
         ).json()
 
+        vuelos = summary.get("total_flights", 0)
+        corrida = summary.get("last_run_utc")
         tick = summary.get("last_tick_utc")
-        if not tick:
-            return Check("backend_data", False, "El backend no reporta ningún tick")
 
-        age = _minutes_since(_parse_utc(tick))
-        if age > STALE_AFTER_MIN:
+        if not corrida:
+            # Backend anterior a este campo, o base sin tabla `runs`: se cae al
+            # criterio viejo en vez de quedarse sin chequeo.
+            if not tick:
+                return Check("backend_data", False, "El backend no reporta ningún ciclo")
+            edad = _minutes_since(_parse_utc(tick))
+            if edad > STALE_AFTER_MIN:
+                return Check(
+                    "backend_data", False,
+                    f"El backend sirve datos de hace {edad:.0f} min ({vuelos} vuelos). "
+                    "Los jobs pueden estar bien: suele ser el refresh desde GCS.",
+                )
+            return Check("backend_data", True, f"Datos de hace {edad:.0f} min ({vuelos} vuelos)")
+
+        edad_ciclo = _minutes_since(_parse_utc(corrida))
+        if edad_ciclo > STALE_AFTER_MIN:
             return Check(
-                "backend_data",
-                False,
-                f"El backend sirve datos de hace {age:.0f} min "
-                f"({summary.get('total_flights', 0)} vuelos). "
-                "Los jobs pueden estar bien: suele ser el refresh desde GCS.",
+                "backend_data", False,
+                f"El último ciclo que ve el backend es de hace {edad_ciclo:.0f} min "
+                f"({vuelos} vuelos). O los jobs se detuvieron, o el backend no "
+                "refresca desde GCS.",
             )
+
+        # El ciclo corre. Si además hay vuelos servidos, el tick tiene que
+        # acompañar: un tick viejo con vuelos en la ventana significa que hay
+        # trabajo y no se esta haciendo.
+        if tick and vuelos:
+            edad_tick = _minutes_since(_parse_utc(tick))
+            if edad_tick > STALE_AFTER_MIN:
+                return Check(
+                    "backend_data", False,
+                    f"El ciclo corre (hace {edad_ciclo:.0f} min) pero la última "
+                    f"predicción es de hace {edad_tick:.0f} min, con {vuelos} "
+                    "vuelos en la ventana.",
+                )
+            return Check(
+                "backend_data", True,
+                f"Ciclo de hace {edad_ciclo:.0f} min, predicciones de hace "
+                f"{edad_tick:.0f} min ({vuelos} vuelos)",
+            )
+
+        # Sin vuelos servidos no hay nada que predecir: es la madrugada de ATL,
+        # no una falla.
         return Check(
-            "backend_data",
-            True,
-            f"Datos de hace {age:.0f} min ({summary.get('total_flights', 0)} vuelos)",
+            "backend_data", True,
+            f"Ciclo de hace {edad_ciclo:.0f} min, sin vuelos en la ventana",
         )
     except Exception as exc:
         return Check("backend_data", False, f"No se pudo verificar la frescura: {exc}")
