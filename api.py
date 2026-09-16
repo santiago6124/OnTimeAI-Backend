@@ -1614,10 +1614,34 @@ def _compute_shap(fa_flight_id: str) -> list[dict]:
         return []
 
 
+def _last_run_utc(con) -> str:
+    """Cuando corrio el ultimo ciclo, haya predicho algo o no.
+
+    Distinto de `last_tick_utc`, que sale de las predicciones servidas y por lo
+    tanto es *el ultimo ciclo que produjo algo*. De madrugada ATL pasa horas sin
+    una sola salida programada en la ventana: el ciclo corre, no encuentra nada
+    que predecir, y `last_tick_utc` se queda quieto aunque el pipeline este
+    perfecto.
+
+    El 16/09 a las 04:38 UTC eso disparo una alerta de datos viejos con los dos
+    jobs sanos —80 corridas seguidas sin fallar—. La tabla `runs` recibe una
+    fila por ciclo pase lo que pase, asi que es la senial que distingue "el
+    pipeline se detuvo" de "no habia nada que hacer".
+    """
+    try:
+        fila = con.execute(
+            "SELECT MAX(COALESCE(finished_utc, started_utc)) AS ultimo FROM runs"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return ""
+    return (fila["ultimo"] or "") if fila else ""
+
+
 @app.get("/metrics/summary")
 def metrics_summary():
     con = get_db()
     try:
+        ultimo_ciclo = _last_run_utc(con)
         rows = _latest_predictions_active(con)
         if not rows:
             return {
@@ -1625,6 +1649,7 @@ def metrics_summary():
                 "low_risk": 0, "avg_delay_probability": 0.0,
                 "predicted_positive_rate": 0.0,
                 "model_version": ACTIVE_MODEL, "last_tick_utc": "",
+                "last_run_utc": ultimo_ciclo,
             }
         probas = [float(r["proba_delay"]) for r in rows]
         preds  = [int(r["predicted_delay"]) for r in rows]
@@ -1641,6 +1666,8 @@ def metrics_summary():
             "predicted_positive_rate": round(float(np.mean(preds)), 4),
             "model_version":           ACTIVE_MODEL,
             "last_tick_utc":           max(ticks) if ticks else "",
+            # El ciclo corre aunque no haya vuelos que predecir; el tick no.
+            "last_run_utc":            ultimo_ciclo,
         }
     finally:
         con.close()
