@@ -365,7 +365,15 @@ def _migrate_stable_ids(conn: sqlite3.Connection) -> None:
                 )
 
 
-def _repair_stable_ids(conn: sqlite3.Connection) -> int:
+# `open_db` se llama por request —`_compute_shap` abre una conexion por vuelo—
+# asi que la reparacion no puede escanear las tablas cada vez. Basta una pasada
+# por proceso: lo que persiste es la corrida del job, que sube la base corregida
+# a GCS; el backend solo arregla su copia local, que de todos modos se reemplaza
+# en cada refresco.
+_stable_ids_revisados = False
+
+
+def _repair_stable_ids(conn: sqlite3.Connection, *, forzar: bool = False) -> int:
     """Recalcula los `stable_id` que quedaron mal escritos. Ver #64.
 
     `_migrate_stable_ids` solo rellena cuando crea la columna, asi que una base
@@ -377,6 +385,11 @@ def _repair_stable_ids(conn: sqlite3.Connection) -> int:
     guardan el id entero, asi que ni se leen. Despues de la primera corrida no
     queda ninguna por corregir y esto no actualiza nada.
     """
+    global _stable_ids_revisados
+    if _stable_ids_revisados and not forzar:
+        return 0
+    _stable_ids_revisados = True
+
     total = 0
     for table in ("flights", "predictions", "actuals"):
         cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}

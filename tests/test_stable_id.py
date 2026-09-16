@@ -17,6 +17,7 @@ import sqlite3
 
 import pytest
 
+import ontimeai.live as live
 from ontimeai.live import SCHEMA, _repair_stable_ids, stable_id
 
 
@@ -58,6 +59,13 @@ class TestQueRecorta:
 
 class TestReparacion:
     """Las filas ya escritas con el valor degenerado hay que corregirlas."""
+
+    @pytest.fixture(autouse=True)
+    def _sin_guardado(self):
+        """El guardado es por proceso; cada test necesita su propia pasada."""
+        live._stable_ids_revisados = False
+        yield
+        live._stable_ids_revisados = False
 
     @pytest.fixture
     def con(self):
@@ -116,3 +124,27 @@ class TestReparacion:
             "SELECT COUNT(DISTINCT stable_id) FROM predictions"
         ).fetchone()[0]
         assert distintos == 3
+
+
+class TestGuardadoPorProceso:
+    """
+    `open_db` se llama por request —`_compute_shap` abre una conexion por
+    vuelo—, asi que la reparacion no puede escanear las tres tablas cada vez.
+    """
+
+    def test_no_repite_el_escaneo_en_la_misma_corrida(self) -> None:
+        live._stable_ids_revisados = False
+        con = sqlite3.connect(":memory:")
+        con.executescript(SCHEMA)
+        con.execute(
+            "INSERT INTO predictions (fa_flight_id, stable_id, predicted_at_utc,"
+            " proba_delay, predicted_delay) VALUES (?,?,?,?,?)",
+            ("SYN-DL2595-ATL-BOS-2026-09-16", "SYN-DL2595",
+             "2026-09-16T12:00:00+00:00", 0.3, 0),
+        )
+        con.commit()
+
+        assert _repair_stable_ids(con) == 1
+        # Sin el guardado esto volveria a escanear; con el, sale de una.
+        assert _repair_stable_ids(con) == 0
+        live._stable_ids_revisados = False
