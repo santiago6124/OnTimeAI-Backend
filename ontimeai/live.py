@@ -228,7 +228,19 @@ def stable_id(fa_flight_id: str | None) -> str | None:
     if not fa_flight_id:
         return None
     parts = str(fa_flight_id).split("-")
-    if len(parts) >= 2:
+    # Solo se recorta lo que TIENE la forma de AeroAPI: el segundo segmento es
+    # el timestamp Unix, o sea digitos. Recortar por "tiene al menos dos
+    # segmentos" rompia los ids sinteticos del harvester:
+    #
+    #     SYN-DL2595-ATL-BOS-2026-09-16  ->  SYN-DL2595
+    #
+    # que colapsaba todas las instancias diarias del mismo numero de vuelo en
+    # un solo identificador —hasta 27 vuelos distintos bajo `SYN-DL3027`— y
+    # hacia que /flight-history devolviera un mes de ciclos ajenos. Ver #64.
+    #
+    # Se mira la forma y no un prefijo `SYN-`: asi cualquier formato nuevo que
+    # no sea de AeroAPI queda bien sin tener que acordarse de agregarlo aca.
+    if len(parts) >= 2 and parts[1].isdigit():
         return f"{parts[0]}-{parts[1]}"
     return fa_flight_id
 
@@ -243,6 +255,7 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
     _migrate_nas_status(conn)
     _migrate_estimated_times(conn)
     _migrate_prediction_phase(conn)
+    _repair_stable_ids(conn)
     _migrate_weather_provenance(conn)
     _migrate_actuals_provenance(conn)
     conn.commit()
@@ -350,6 +363,58 @@ def _migrate_stable_ids(conn: sqlite3.Connection) -> None:
                     f"UPDATE {table} SET stable_id = ? WHERE fa_flight_id = ?",
                     updates,
                 )
+
+
+# `open_db` se llama por request —`_compute_shap` abre una conexion por vuelo—
+# asi que la reparacion no puede escanear las tablas cada vez. Basta una pasada
+# por proceso: lo que persiste es la corrida del job, que sube la base corregida
+# a GCS; el backend solo arregla su copia local, que de todos modos se reemplaza
+# en cada refresco.
+_stable_ids_revisados = False
+
+
+def _repair_stable_ids(conn: sqlite3.Connection, *, forzar: bool = False) -> int:
+    """Recalcula los `stable_id` que quedaron mal escritos. Ver #64.
+
+    `_migrate_stable_ids` solo rellena cuando crea la columna, asi que una base
+    que ya la tiene se queda con los valores viejos para siempre. Esto corrige
+    los que difieren de lo que la funcion devuelve hoy.
+
+    Solo mira filas con guion y con un `stable_id` distinto del id completo:
+    los ids hexadecimales de FR24 —el 99% de la base— no tienen guiones y ya
+    guardan el id entero, asi que ni se leen. Despues de la primera corrida no
+    queda ninguna por corregir y esto no actualiza nada.
+    """
+    global _stable_ids_revisados
+    if _stable_ids_revisados and not forzar:
+        return 0
+    _stable_ids_revisados = True
+
+    total = 0
+    for table in ("flights", "predictions", "actuals"):
+        cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "stable_id" not in cols:
+            continue
+        filas = conn.execute(
+            f"""SELECT DISTINCT fa_flight_id, stable_id FROM {table}
+                 WHERE fa_flight_id LIKE '%-%'
+                   AND stable_id IS NOT NULL
+                   AND stable_id != fa_flight_id"""
+        ).fetchall()
+        arreglos = [
+            (correcto, r[0])
+            for r in filas
+            if (correcto := stable_id(r[0])) != r[1]
+        ]
+        if arreglos:
+            conn.executemany(
+                f"UPDATE {table} SET stable_id = ? WHERE fa_flight_id = ?", arreglos
+            )
+            total += len(arreglos)
+    if total:
+        conn.commit()
+        print(f"[migracion] stable_id corregidos: {total}")
+    return total
 
 
 def _migrate_estimated_times(conn: sqlite3.Connection) -> None:
