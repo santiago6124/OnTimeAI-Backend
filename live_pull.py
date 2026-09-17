@@ -492,8 +492,10 @@ def main() -> int:
     if not target_ids:
         print("   no flights to predict")
         conn.execute(
-            "UPDATE runs SET finished_utc=?, flights_pulled=?, flights_predicted=?, actuals_updated=?, weather_obs_added=? WHERE run_id=?",
-            (datetime.now(timezone.utc).isoformat(), len(sched) + len(arr_sched), 0, n_act, n_wx, run_id),
+            "UPDATE runs SET finished_utc=?, flights_pulled=?, flights_predicted=?,"
+            " flights_targeted=?, actuals_updated=?, weather_obs_added=? WHERE run_id=?",
+            (datetime.now(timezone.utc).isoformat(), len(sched) + len(arr_sched), 0,
+             0, n_act, n_wx, run_id),
         )
         conn.commit()
         conn.close()
@@ -504,10 +506,11 @@ def main() -> int:
         print("   inference frame empty")
         conn.execute(
             """UPDATE runs SET finished_utc=?, flights_pulled=?, flights_predicted=?,
-                      actuals_updated=?, weather_obs_added=? WHERE run_id=?""",
+                      flights_targeted=?, actuals_updated=?, weather_obs_added=?
+                WHERE run_id=?""",
             (
                 datetime.now(timezone.utc).isoformat(),
-                len(sched) + len(arr_sched), 0, n_act, n_wx, run_id,
+                len(sched) + len(arr_sched), 0, len(target_ids), n_act, n_wx, run_id,
             ),
         )
         conn.commit()
@@ -1017,10 +1020,11 @@ def main() -> int:
             print(f"   ⚠ SHAP persistence failed (non-fatal): {type(e).__name__}: {e}")
 
     conn.execute(
-        "UPDATE runs SET finished_utc=?, flights_pulled=?, flights_predicted=?, actuals_updated=?, weather_obs_added=? WHERE run_id=?",
+        "UPDATE runs SET finished_utc=?, flights_pulled=?, flights_predicted=?,"
+        " flights_targeted=?, actuals_updated=?, weather_obs_added=? WHERE run_id=?",
         (datetime.now(timezone.utc).isoformat(),
          len(sched) + len(arr_sched) + len(arrived),
-         len(pred_rows), n_act, n_wx, run_id),
+         len(pred_rows), len(target_ids), n_act, n_wx, run_id),
     )
     conn.commit()
     # Close the connection so SQLite flushes cached pages to disk BEFORE the

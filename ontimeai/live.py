@@ -255,6 +255,7 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
     _migrate_nas_status(conn)
     _migrate_estimated_times(conn)
     _migrate_prediction_phase(conn)
+    _migrate_runs_flights_targeted(conn)
     _repair_stable_ids(conn)
     _migrate_weather_provenance(conn)
     _migrate_actuals_provenance(conn)
@@ -415,6 +416,19 @@ def _repair_stable_ids(conn: sqlite3.Connection, *, forzar: bool = False) -> int
         conn.commit()
         print(f"[migracion] stable_id corregidos: {total}")
     return total
+
+
+def _migrate_runs_flights_targeted(conn: sqlite3.Connection) -> None:
+    """Cuantos vuelos tenia el ciclo para predecir, haya predicho o no.
+
+    Sin este numero no se puede distinguir "no habia nada que hacer" de "habia
+    trabajo y no se hizo": las dos se ven igual desde afuera, con
+    `flights_predicted = 0`. De madrugada ATL pasa horas sin una sola salida por
+    delante, y esa es la primera; que el armado de features falle es la segunda.
+    """
+    cols = {row[1] for row in conn.execute("PRAGMA table_info(runs)").fetchall()}
+    if "flights_targeted" not in cols:
+        conn.execute("ALTER TABLE runs ADD COLUMN flights_targeted INTEGER")
 
 
 def _migrate_estimated_times(conn: sqlite3.Connection) -> None:
