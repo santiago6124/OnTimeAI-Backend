@@ -239,8 +239,11 @@ def check_backend_data_fresh() -> Check:
     ciclo pase lo que pase: esa es la señal que distingue "el pipeline se
     detuvo" de "no había nada que hacer".
 
-    El tick viejo con vuelos en la ventana sí es un problema —significa que hay
-    trabajo y no se está haciendo— y se sigue reportando aparte.
+    Que el ciclo tuviera vuelos para predecir y no predijera ninguno sí es un
+    problema, y se reporta aparte. Eso se mide con `last_run_targeted`, el
+    número que el ciclo mismo calcula, y no con los vuelos servidos: esos son
+    los que están en el aire, no los que esperan predicción. Confundir una cosa
+    con la otra fue la falsa alarma del 17/09.
     """
     try:
         token = _login()
@@ -278,29 +281,48 @@ def check_backend_data_fresh() -> Check:
                 "refresca desde GCS.",
             )
 
-        # El ciclo corre. Si además hay vuelos servidos, el tick tiene que
-        # acompañar: un tick viejo con vuelos en la ventana significa que hay
-        # trabajo y no se esta haciendo.
-        if tick and vuelos:
-            edad_tick = _minutes_since(_parse_utc(tick))
-            if edad_tick > STALE_AFTER_MIN:
-                return Check(
-                    "backend_data", False,
-                    f"El ciclo corre (hace {edad_ciclo:.0f} min) pero la última "
-                    f"predicción es de hace {edad_tick:.0f} min, con {vuelos} "
-                    "vuelos en la ventana.",
-                )
+        # El ciclo corre. Lo que falta saber es si TENÍA algo que hacer.
+        #
+        # La versión anterior miraba `total_flights`, los vuelos servidos en la
+        # ventana activa, y los tomaba como trabajo pendiente. No lo son: son
+        # vuelos ya predichos que todavía no aterrizaron. El 17/09 a las 05:08
+        # eso disparó una alerta con el pipeline sano, porque a esa hora ATL no
+        # tenía una sola salida por delante y aun así quedaban 185 en el aire.
+        #
+        # `last_run_targeted` es el número que el ciclo mismo calcula: cuántos
+        # vuelos tenía para predecir. Con cero no hay nada que reprochar.
+        objetivo = summary.get("last_run_targeted")
+        predichos = summary.get("last_run_predicted")
+
+        if objetivo is None:
+            # Backend sin el campo todavía: se informa el ciclo y nada más, en
+            # vez de emitir un juicio sobre datos que no están.
             return Check(
                 "backend_data", True,
-                f"Ciclo de hace {edad_ciclo:.0f} min, predicciones de hace "
-                f"{edad_tick:.0f} min ({vuelos} vuelos)",
+                f"Ciclo de hace {edad_ciclo:.0f} min ({vuelos} vuelos)",
             )
 
-        # Sin vuelos servidos no hay nada que predecir: es la madrugada de ATL,
-        # no una falla.
+        if objetivo > 0 and not predichos:
+            # Esto sí es una falla: el ciclo se encontró con vuelos por predecir
+            # y no produjo ninguno. Es lo que pasaría si el modelo no cargara o
+            # el armado de features se rompiera, y de otro modo es invisible.
+            return Check(
+                "backend_data", False,
+                f"El último ciclo tenía {objetivo} vuelos para predecir y no "
+                f"predijo ninguno (hace {edad_ciclo:.0f} min).",
+            )
+
+        if objetivo == 0:
+            return Check(
+                "backend_data", True,
+                f"Ciclo de hace {edad_ciclo:.0f} min, sin salidas por delante "
+                f"({vuelos} vuelos en el aire)",
+            )
+
         return Check(
             "backend_data", True,
-            f"Ciclo de hace {edad_ciclo:.0f} min, sin vuelos en la ventana",
+            f"Ciclo de hace {edad_ciclo:.0f} min, {predichos} de {objetivo} "
+            f"vuelos predichos ({vuelos} en la ventana)",
         )
     except Exception as exc:
         return Check("backend_data", False, f"No se pudo verificar la frescura: {exc}")
