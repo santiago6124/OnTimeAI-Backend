@@ -1180,12 +1180,16 @@ def auth_me(request: Request):
         "SELECT email, provider, user_type FROM users WHERE username=?", (username,)
     ).fetchone()
     con.close()
+    # Un JWT valido de una cuenta que ya no existe (se elimino a si misma)
+    # tiene que caer aca como sesion vencida, no como un usuario fantasma.
+    if row is None:
+        raise HTTPException(401, "La cuenta ya no existe")
     return {
         "username": username,
         "role": payload.get("role", "user"),
-        "email": row["email"] if row else None,
-        "provider": row["provider"] if row else "local",
-        "user_type": row["user_type"] if row else None,
+        "email": row["email"],
+        "provider": row["provider"],
+        "user_type": row["user_type"],
     }
 
 
@@ -1210,6 +1214,68 @@ def update_me(request: Request, body: MeUpdate):
     con.close()
     _upload_users_db()
     return {"ok": True, "user_type": body.user_type}
+
+
+def _delete_firebase_account(email: str) -> None:
+    """Borra de Firebase Authentication la cuenta con ese correo.
+
+    Es lo que hace que una baja sea una baja: sin esto el correo sigue
+    pudiendo entrar y /auth/firebase lo daria de alta otra vez como usuario
+    nuevo. Corre con la identidad del servicio (google.auth.default), que
+    necesita roles/firebaseauth.admin en el proyecto.
+
+    Es best effort a proposito: la fila propia ya se borro, y un fallo aca no
+    tiene que devolverle un error a alguien que acaba de eliminar su cuenta.
+    Se deja rastro en el log para limpiarlo a mano.
+    """
+    if not FIREBASE_PROJECT_ID:
+        return
+    try:
+        import google.auth
+        from google.auth.transport.requests import AuthorizedSession
+
+        creds, _ = google.auth.default(
+            scopes=["https://www.googleapis.com/auth/identitytoolkit"]
+        )
+        session = AuthorizedSession(creds)
+        base = f"https://identitytoolkit.googleapis.com/v1/projects/{FIREBASE_PROJECT_ID}/accounts"
+        r = session.post(f"{base}:lookup", json={"email": [email]}, timeout=10)
+        r.raise_for_status()
+        for user in r.json().get("users", []):
+            session.post(
+                f"{base}:delete", json={"localId": user["localId"]}, timeout=10
+            ).raise_for_status()
+    except Exception as e:  # noqa: BLE001 - se registra y se sigue
+        print(f"[users] no se pudo borrar la cuenta de Firebase de {email}: {e}")
+
+
+@app.delete("/users/me", status_code=204)
+def delete_me(request: Request):
+    """Baja de la propia cuenta, sin confirmacion del lado del servidor.
+
+    App Store (guia 5.1.1) y Google Play exigen que una app que permite crear
+    cuentas permita tambien eliminarlas desde adentro. Borra la fila, las
+    preferencias y la cuenta de Firebase; el JWT que la persona todavia tiene
+    deja de servir en cuanto cualquier endpoint consulte la tabla.
+
+    Las cuentas sembradas desde el entorno (API_USERNAME) vuelven a existir en
+    el proximo arranque; eso es deliberado y no un bug.
+    """
+    username = _payload_of(request).get("sub")
+    con = _get_users_con()
+    row = con.execute(
+        "SELECT email, provider FROM users WHERE username=?", (username,)
+    ).fetchone()
+    if row is None:
+        con.close()
+        raise HTTPException(404, "Usuario no encontrado")
+    con.execute("DELETE FROM user_preferences WHERE username=?", (username,))
+    con.execute("DELETE FROM users WHERE username=?", (username,))
+    con.commit()
+    con.close()
+    _upload_users_db()
+    if row["provider"] == "firebase" and row["email"]:
+        _delete_firebase_account(row["email"])
 
 
 # ── User management (superadmin only) ──────────────────────────────────────
