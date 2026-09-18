@@ -290,3 +290,43 @@ def test_operations_congestion_values(client):
 def test_operations_404(client):
     r = client.get("/operations/ZZZZ")
     assert r.status_code == 404
+
+
+# ── DELETE /users/me ───────────────────────────────────────────────────────
+
+def test_delete_me_removes_the_account(client):
+    """Alta, baja y comprobacion de que la sesion vieja ya no sirve.
+
+    Es el unico test del archivo que escribe en users.db, y deja la tabla
+    como la encontro: el usuario que crea es el que borra.
+    """
+    from starlette.testclient import TestClient
+    import api
+
+    creado = client.post(
+        "/admin/users",
+        json={"username": "baja-temporal", "password": "solo-para-este-test"},
+    )
+    assert creado.status_code == 201, creado.text
+
+    # Cliente aparte para no pisar el Authorization del fixture compartido.
+    with TestClient(api.app) as propio:
+        login = propio.post(
+            "/auth/login",
+            json={"username": "baja-temporal", "password": "solo-para-este-test"},
+        )
+        assert login.status_code == 200, login.text
+        propio.headers.update(
+            {"Authorization": f"Bearer {login.json()['access_token']}"}
+        )
+        assert propio.get("/auth/me").status_code == 200
+
+        assert propio.delete("/users/me").status_code == 204
+
+        # El JWT sigue firmado y vigente, pero la cuenta no esta: sesion vencida.
+        assert propio.get("/auth/me").status_code == 401
+        assert propio.delete("/users/me").status_code == 404
+
+    lista = client.get("/admin/users")
+    assert lista.status_code == 200
+    assert "baja-temporal" not in {u["username"] for u in lista.json()}
