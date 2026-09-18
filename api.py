@@ -1614,6 +1614,32 @@ def _compute_shap(fa_flight_id: str) -> list[dict]:
         return []
 
 
+def _last_run(con) -> dict:
+    """El ultimo ciclo: cuando corrio, cuantos vuelos tenia y cuantos predijo.
+
+    `flights_targeted` es lo que distingue "no habia nada que hacer" de "habia
+    trabajo y no se hizo". Sin ese numero las dos se ven igual desde afuera,
+    porque en ambas `flights_predicted` es cero.
+    """
+    try:
+        fila = con.execute(
+            """SELECT COALESCE(finished_utc, started_utc) AS cuando,
+                      flights_targeted, flights_predicted
+                 FROM runs
+                WHERE finished_utc IS NOT NULL
+                ORDER BY COALESCE(finished_utc, started_utc) DESC LIMIT 1"""
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {"utc": "", "targeted": None, "predicted": None}
+    if not fila:
+        return {"utc": "", "targeted": None, "predicted": None}
+    return {
+        "utc": fila["cuando"] or "",
+        "targeted": fila["flights_targeted"],
+        "predicted": fila["flights_predicted"],
+    }
+
+
 def _last_run_utc(con) -> str:
     """Cuando corrio el ultimo ciclo, haya predicho algo o no.
 
@@ -1641,7 +1667,8 @@ def _last_run_utc(con) -> str:
 def metrics_summary():
     con = get_db()
     try:
-        ultimo_ciclo = _last_run_utc(con)
+        ciclo = _last_run(con)
+        ultimo_ciclo = ciclo["utc"]
         rows = _latest_predictions_active(con)
         if not rows:
             return {
@@ -1650,6 +1677,8 @@ def metrics_summary():
                 "predicted_positive_rate": 0.0,
                 "model_version": ACTIVE_MODEL, "last_tick_utc": "",
                 "last_run_utc": ultimo_ciclo,
+                "last_run_targeted": ciclo["targeted"],
+                "last_run_predicted": ciclo["predicted"],
             }
         probas = [float(r["proba_delay"]) for r in rows]
         preds  = [int(r["predicted_delay"]) for r in rows]
@@ -1668,6 +1697,10 @@ def metrics_summary():
             "last_tick_utc":           max(ticks) if ticks else "",
             # El ciclo corre aunque no haya vuelos que predecir; el tick no.
             "last_run_utc":            ultimo_ciclo,
+            # Con cuantos vuelos se encontro el ciclo y cuantos predijo. Sin el
+            # primero no se distingue la madrugada de una falla.
+            "last_run_targeted":       ciclo["targeted"],
+            "last_run_predicted":      ciclo["predicted"],
         }
     finally:
         con.close()

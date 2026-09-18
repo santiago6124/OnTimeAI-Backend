@@ -305,9 +305,61 @@ class TestFrescuraDelBackend:
             "last_run_utc": self._hace(6),
             "last_tick_utc": self._hace(49),
             "total_flights": 0,
+            "last_run_targeted": 0, "last_run_predicted": 0,
         })
         assert check.ok is True
-        assert "sin vuelos" in check.detail
+
+    def test_la_madrugada_CON_vuelos_en_el_aire_tampoco_dispara(self, monkeypatch) -> None:
+        """
+        El caso del 17/09 a las 05:08, que la version anterior de este chequeo
+        marcaba como falla: el ciclo corria hace 7 min, la ultima prediccion era
+        de hace 49, y habia 185 vuelos servidos.
+
+        Esos 185 no son trabajo pendiente: son vuelos ya predichos que todavia
+        no aterrizaron. El ciclo no tenia ni una salida por delante.
+        """
+        check = self._con_resumen(monkeypatch, {
+            "last_run_utc": self._hace(7),
+            "last_tick_utc": self._hace(49),
+            "total_flights": 185,
+            "last_run_targeted": 0, "last_run_predicted": 0,
+        })
+        assert check.ok is True
+        assert "sin salidas por delante" in check.detail
+
+    def test_habia_vuelos_y_no_predijo_ninguno_es_falla(self, monkeypatch) -> None:
+        """
+        Lo que este chequeo existe para atrapar: el ciclo se encontro con vuelos
+        por predecir y no produjo ninguno. Pasaria si el modelo no cargara o el
+        armado de features se rompiera, y de otro modo es invisible.
+        """
+        check = self._con_resumen(monkeypatch, {
+            "last_run_utc": self._hace(5),
+            "last_tick_utc": self._hace(120),
+            "total_flights": 185,
+            "last_run_targeted": 42, "last_run_predicted": 0,
+        })
+        assert check.ok is False
+        assert "42" in check.detail
+
+    def test_operacion_normal_con_vuelos_predichos(self, monkeypatch) -> None:
+        check = self._con_resumen(monkeypatch, {
+            "last_run_utc": self._hace(5),
+            "last_tick_utc": self._hace(6),
+            "total_flights": 150,
+            "last_run_targeted": 42, "last_run_predicted": 42,
+        })
+        assert check.ok is True
+        assert "42 de 42" in check.detail
+
+    def test_sin_el_campo_nuevo_no_inventa_un_juicio(self, monkeypatch) -> None:
+        """Watchdog desplegado antes que la API: informa y no acusa."""
+        check = self._con_resumen(monkeypatch, {
+            "last_run_utc": self._hace(5),
+            "last_tick_utc": self._hace(120),
+            "total_flights": 185,
+        })
+        assert check.ok is True
 
     def test_el_pipeline_detenido_sigue_disparando(self, monkeypatch) -> None:
         """Lo que el chequeo existe para atrapar tiene que seguir atrapandose."""
@@ -315,31 +367,10 @@ class TestFrescuraDelBackend:
             "last_run_utc": self._hace(2880),
             "last_tick_utc": self._hace(2880),
             "total_flights": 0,
+            "last_run_targeted": 0, "last_run_predicted": 0,
         })
         assert check.ok is False
         assert "ciclo" in check.detail.lower()
-
-    def test_hay_vuelos_y_no_se_predice_es_un_problema(self, monkeypatch) -> None:
-        """
-        El ciclo corre, hay trabajo en la ventana y nadie lo hace. Esto no es
-        la madrugada: es una falla que antes quedaba tapada junto con ella.
-        """
-        check = self._con_resumen(monkeypatch, {
-            "last_run_utc": self._hace(5),
-            "last_tick_utc": self._hace(120),
-            "total_flights": 171,
-        })
-        assert check.ok is False
-        assert "171" in check.detail
-
-    def test_operacion_normal_pasa(self, monkeypatch) -> None:
-        check = self._con_resumen(monkeypatch, {
-            "last_run_utc": self._hace(5),
-            "last_tick_utc": self._hace(14),
-            "total_flights": 136,
-        })
-        assert check.ok is True
-        assert "136" in check.detail
 
     def test_un_backend_viejo_cae_al_criterio_anterior(self, monkeypatch) -> None:
         """
