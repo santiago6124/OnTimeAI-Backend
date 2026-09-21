@@ -56,7 +56,21 @@ API_PASSWORD = _env("API_PASSWORD")
 # Los predictores corren cada 15 min. Tres ciclos perdidos es una señal clara y
 # deja margen para un ciclo lento o un reintento.
 STALE_AFTER_MIN = int(os.getenv("WATCHDOG_STALE_AFTER_MIN", "45"))
-HTTP_TIMEOUT = 30
+# Mas alto de lo que parece necesario, a proposito.
+#
+# El backend refresca su copia de la base DENTRO de un request, no en un hilo
+# de fondo: Cloud Run con throttling solo asigna CPU mientras se procesa un
+# pedido, y un hilo de fondo se queda sin CPU y la descarga agoniza. Es una
+# decision deliberada, documentada en `get_db()` de api.py.
+#
+# La consecuencia es que cada ~16 minutos un pedido paga la descarga entera. El
+# 21/09 eran 665 MB y se pasó de 30 s, asi que el watchdog reporto caido un
+# backend que estaba haciendo exactamente lo que debe. Con 90 s entra esa
+# descarga y sigue detectando un backend realmente muerto.
+#
+# Si la base sigue creciendo, esto hay que volver a mirarlo: el numero
+# acompaña al tamaño.
+HTTP_TIMEOUT = int(os.getenv("WATCHDOG_HTTP_TIMEOUT", "90"))
 
 
 @dataclass

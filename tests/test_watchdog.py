@@ -411,3 +411,23 @@ def test_predictions_no_se_vigila_como_fuente_externa() -> None:
     # Las externas se quedan: esas si llegan solas y su silencio es una falla.
     for externa in ("actuals", "weather_obs", "nas_status", "aircraft_position"):
         assert externa in api.SOURCE_FRESHNESS
+
+
+def test_el_timeout_tolera_un_refresco_de_la_base() -> None:
+    """
+    El backend refresca su copia de la base DENTRO de un request, no en un hilo
+    de fondo: Cloud Run con throttling solo asigna CPU mientras se procesa un
+    pedido, asi que un hilo de fondo se queda sin CPU y la descarga agoniza.
+    Es una decision deliberada, documentada en `get_db()` de api.py, y ya se
+    revirtio una vez el intento de hacerlo en segundo plano.
+
+    La consecuencia es que cada ~16 minutos un pedido paga la descarga entera.
+    El 21/09 eran 665 MB, tardo mas de 30 s, y el watchdog reporto caido un
+    backend que estaba funcionando bien.
+
+    El timeout tiene que dejar entrar esa descarga. Si algun dia baja de ahi,
+    las falsas alarmas vuelven.
+    """
+    import watchdog
+
+    assert watchdog.HTTP_TIMEOUT >= 60
