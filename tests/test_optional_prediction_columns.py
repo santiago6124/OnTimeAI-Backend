@@ -156,26 +156,23 @@ class TestFrescuraPorFuente:
 
         ahora = datetime.now(timezone.utc).isoformat()
         con_migrada.execute(
-            "INSERT INTO predictions (fa_flight_id, stable_id, predicted_at_utc,"
-            " proba_delay, predicted_delay) VALUES (?,?,?,?,?)",
-            ("FA1", "DL100", ahora, 0.1, 0),
+            "INSERT INTO actuals (fa_flight_id, stable_id, settled_at_utc)"
+            " VALUES (?,?,?)", ("X", "X", ahora),
         )
         fuentes = api._source_freshness(con_migrada)
-        assert fuentes["predictions"]["stale"] is False
-        assert fuentes["predictions"]["age_minutes"] < 1
+        assert fuentes["actuals"]["stale"] is False
 
     def test_una_escritura_vieja_esta_caida(self, con_migrada) -> None:
         from datetime import datetime, timedelta, timezone
 
-        viejo = (datetime.now(timezone.utc) - timedelta(hours=5)).isoformat()
+        viejo = (datetime.now(timezone.utc) - timedelta(minutes=300)).isoformat()
         con_migrada.execute(
-            "INSERT INTO predictions (fa_flight_id, stable_id, predicted_at_utc,"
-            " proba_delay, predicted_delay) VALUES (?,?,?,?,?)",
-            ("FA1", "DL100", viejo, 0.1, 0),
+            "INSERT INTO actuals (fa_flight_id, stable_id, settled_at_utc)"
+            " VALUES (?,?,?)", ("X", "X", viejo),
         )
         fuentes = api._source_freshness(con_migrada)
-        assert fuentes["predictions"]["stale"] is True
-        assert fuentes["predictions"]["age_minutes"] == pytest.approx(300, abs=2)
+        assert fuentes["actuals"]["stale"] is True
+        assert fuentes["actuals"]["age_minutes"] == pytest.approx(300, abs=2)
 
     def test_una_fecha_sin_zona_se_lee_como_utc(self, con_migrada) -> None:
         # weather_obs guarda `valid_utc` sin offset. Leerla como hora local
@@ -199,7 +196,7 @@ class TestFrescuraPorFuente:
         con_migrada.execute("DROP TABLE aircraft_position")
         fuentes = api._source_freshness(con_migrada)
         assert "aircraft_position" not in fuentes
-        assert "predictions" in fuentes
+        assert "actuals" in fuentes
 
 
 class TestDuracionDeCiclos:

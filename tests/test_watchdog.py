@@ -167,13 +167,13 @@ class TestFrescuraPorFuente:
     """
 
     def test_una_fuente_caida_avisa_por_su_cuenta(self, monkeypatch) -> None:
-        sources = [_ok("source:predictions"), _fail("source:aircraft_position", "vacia")]
+        sources = [_ok("source:weather_obs"), _fail("source:aircraft_position", "vacia")]
         sent, saved = _run_with(ALL_OK, {}, monkeypatch, sources=sources)
 
         assert len(sent) == 1
         assert "aircraft_position" in sent[0]
         assert saved["source:aircraft_position"] is False
-        assert saved["source:predictions"] is True
+        assert saved["source:weather_obs"] is True
 
     def test_cada_fuente_es_su_propia_alerta(self, monkeypatch) -> None:
         """Una caida no puede quedar tapada por el resto funcionando."""
@@ -389,3 +389,25 @@ class TestFrescuraDelBackend:
 
     def test_sin_ningun_dato_reporta_falla(self, monkeypatch) -> None:
         assert self._con_resumen(monkeypatch, {}).ok is False
+
+
+def test_predictions_no_se_vigila_como_fuente_externa() -> None:
+    """
+    `predictions` no es una fuente: es nuestra propia salida, y solo se produce
+    cuando hay vuelos que predecir.
+
+    Atlanta no opera salidas entre las 23:00 y las 05:00 locales. Verificado
+    contra un tablero publico independiente y contra la guia del aeropuerto,
+    cuyos controles de seguridad abren recien a las 3:30. Asi que cada madrugada
+    pasaban mas de cinco horas sin escribir nada, y con una tolerancia de 60
+    minutos la alarma sonaba sin que pasara nada.
+
+    Lo que importa lo cubre el chequeo de frescura del backend, que pregunta si
+    el ciclo tenia vuelos y si los predijo.
+    """
+    import api
+
+    assert "predictions" not in api.SOURCE_FRESHNESS
+    # Las externas se quedan: esas si llegan solas y su silencio es una falla.
+    for externa in ("actuals", "weather_obs", "nas_status", "aircraft_position"):
+        assert externa in api.SOURCE_FRESHNESS
