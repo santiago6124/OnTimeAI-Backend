@@ -665,8 +665,20 @@ SCHEDULER_INTERVAL_MIN = 15
 # que la transferencia domine el ciclo.
 DB_SIZE_WARN_MB = int(os.getenv("DB_SIZE_WARN_MB", "800"))
 
+# Fuentes EXTERNAS: llegan solas, con su propio ritmo, sin importar lo que pase
+# en ATL. Si una deja de escribir, algo se rompio afuera.
+#
+# `predictions` estuvo aca y no corresponde: no es una fuente, es nuestra propia
+# salida, y solo se produce cuando hay vuelos que predecir. Atlanta no opera
+# salidas entre las 23:00 y las 05:00 locales —verificado contra un tablero
+# publico independiente y contra la guia operativa del aeropuerto, cuyos
+# controles de seguridad abren recien a las 3:30—, asi que cada madrugada pasaba
+# mas de una hora sin escribir y la alarma sonaba sin que pasara nada.
+#
+# Lo que importa de `predictions` lo cubre `/metrics/summary`: si el ciclo se
+# detuvo (`last_run_utc`) y si tenia vuelos y no los predijo
+# (`last_run_targeted` contra `last_run_predicted`). Ver el watchdog.
 SOURCE_FRESHNESS: dict[str, tuple[str, int, str]] = {
-    "predictions":       ("predicted_at_utc",  60,  "live-pull (cada 15 min)"),
     "actuals":           ("settled_at_utc",   120,  "harvester FR24 + AeroAPI"),
     "weather_obs":       ("valid_utc",        180,  "IEM METAR (publica cada ~1 h)"),
     "nas_status":        ("captured_at_utc",  180,  "NAS status FAA"),
