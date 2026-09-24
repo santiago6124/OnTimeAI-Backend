@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 
@@ -53,6 +54,31 @@ from ontimeai.config import ARTIFACTS_DIR
 
 def _iso(dt: datetime) -> str:
     return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+# Cuanto vale una observacion antes de volver a pedirla. IEM publica METAR una
+# vez por hora; 50 minutos deja margen para que el ciclo siguiente la renueve
+# sin pedirla cuatro veces de gusto.
+WEATHER_FRESH_MINUTES = int(os.getenv("WEATHER_FRESH_MINUTES", "50"))
+
+
+def _airports_with_fresh_weather(conn, minutos: int) -> set[str]:
+    """Estaciones con una observacion de menos de `minutos`.
+
+    `valid_utc` se guarda sin offset, asi que se compara contra `datetime('now')`
+    que en SQLite tambien es UTC. Leerlo como hora local daria tres horas de mas
+    en Argentina y ningun aeropuerto figuraria fresco.
+    """
+    try:
+        filas = conn.execute(
+            """SELECT station FROM weather_obs
+                GROUP BY station
+               HAVING MAX(valid_utc) > datetime('now', ?)""",
+            (f"-{int(minutos)} minutes",),
+        ).fetchall()
+    except sqlite3.OperationalError:
+        return set()
+    return {r[0] for r in filas if r[0]}
 
 
 def load_gate_departure_delays(
@@ -367,12 +393,26 @@ def main() -> int:
             if r.get("dest"):
                 active_airports.add(r["dest"])
         active_airports &= AIRPORTS  # keep only ones we have IEM network info for
-        print(f"   fetching weather for {len(active_airports)} airports (from today's flights)")
-        wx = fetch_iem_obs(active_airports, sched_start - timedelta(hours=2),
-                           sched_end + timedelta(hours=2))
-        if not wx.empty:
-            n_wx = upsert_weather(conn, wx)
-            print(f"   upserted {n_wx} weather observations")
+
+        # No volver a pedir el clima que ya tenemos fresco.
+        #
+        # IEM publica METAR una vez por hora, y el ciclo corre cada 15 minutos:
+        # tres de cada cuatro pedidos traian exactamente el mismo dato. Eso era
+        # gratis mientras eran ~6 aeropuertos. Al descubrir el horario futuro
+        # pasaron a ser 135, con 46 pedidos de red, y como IEM limita por tasa
+        # cada uno paga 5 segundos de espera: el ciclo salto de 4,8 a 13,5
+        # minutos contra un scheduler de 15.
+        frescos = _airports_with_fresh_weather(conn, WEATHER_FRESH_MINUTES)
+        pendientes = active_airports - frescos
+        print(f"   {len(active_airports)} aeropuertos activos, "
+              f"{len(frescos)} ya frescos (<{WEATHER_FRESH_MINUTES} min), "
+              f"{len(pendientes)} a consultar")
+        if pendientes:
+            wx = fetch_iem_obs(pendientes, sched_start - timedelta(hours=2),
+                               sched_end + timedelta(hours=2))
+            if not wx.empty:
+                n_wx = upsert_weather(conn, wx)
+                print(f"   upserted {n_wx} weather observations")
 
     # ---- 4a. Bootstrap unseen tails (Layer 2 lineage fix) ----
     # When a tail appears in today's schedule but is not in `tail_lineage_cache`,
