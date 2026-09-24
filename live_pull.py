@@ -404,9 +404,12 @@ def main() -> int:
         # minutos contra un scheduler de 15.
         frescos = _airports_with_fresh_weather(conn, WEATHER_FRESH_MINUTES)
         pendientes = active_airports - frescos
+        # Se informan los frescos ENTRE LOS ACTIVOS, no todos los de la base:
+        # `frescos` incluye estaciones de vuelos viejos y el conteo salia mayor
+        # que el de activos, que no tiene sentido leerlo.
         print(f"   {len(active_airports)} aeropuertos activos, "
-              f"{len(frescos)} ya frescos (<{WEATHER_FRESH_MINUTES} min), "
-              f"{len(pendientes)} a consultar")
+              f"{len(active_airports & frescos)} ya frescos "
+              f"(<{WEATHER_FRESH_MINUTES} min), {len(pendientes)} a consultar")
         if pendientes:
             wx = fetch_iem_obs(pendientes, sched_start - timedelta(hours=2),
                                sched_end + timedelta(hours=2))
