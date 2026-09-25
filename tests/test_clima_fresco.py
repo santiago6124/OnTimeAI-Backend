@@ -29,8 +29,10 @@ def con():
 
 def _obs(con, station, hace_minutos):
     cuando = datetime.now(timezone.utc) - timedelta(minutes=hace_minutos)
+    # Con `T`, que es como lo guarda produccion: `2026-09-25T14:56:00`. El test
+    # anterior usaba espacio y por eso no vio el bug que rompio el clima.
     con.execute("INSERT INTO weather_obs VALUES (?,?)",
-                (station, cuando.strftime("%Y-%m-%d %H:%M:%S")))
+                (station, cuando.strftime("%Y-%m-%dT%H:%M:%S")))
     con.commit()
 
 
@@ -66,11 +68,37 @@ def test_sin_tabla_no_rompe(con) -> None:
 def test_las_fechas_se_leen_como_utc(con) -> None:
     """
     `valid_utc` se guarda sin offset. Leerlo como hora local daria tres horas de
-    mas en Argentina y ningun aeropuerto figuraria fresco, o sea que el cache no
-    serviria para nada y nadie se enteraria.
+    mas en Argentina y ningun aeropuerto figuraria fresco.
     """
     _obs(con, "ATL", 30)
     assert "ATL" in _airports_with_fresh_weather(con, 50)
+
+
+def test_una_observacion_vieja_con_T_no_pasa_por_fresca(con) -> None:
+    """
+    El bug que rompio el clima en produccion el 25/09.
+
+    La columna guarda `2026-09-25T14:56:00` y `datetime('now', ...)` devuelve
+    `2026-09-25 18:26:04`. Comparadas como texto, la `T` (0x54) le gana al
+    espacio (0x20), asi que cualquier observacion —de hace tres horas o de hace
+    tres dias— daba "fresca". El clima dejo de pedirse por completo: 138 de 148
+    estaciones figuraban frescas cuando la verdad eran 0.
+    """
+    _obs(con, "ATL", 240)   # cuatro horas: viejisima
+    assert _airports_with_fresh_weather(con, 50) == set(), (
+        "una observacion de hace 4 h no puede figurar fresca"
+    )
+
+
+def test_el_formato_del_test_es_el_de_produccion(con) -> None:
+    """
+    Habia un test para el bug de arriba y paso igual, porque insertaba las
+    fechas con espacio en vez de con T. Usaba un formato que produccion no usa,
+    y por eso no vio nada.
+    """
+    _obs(con, "ATL", 10)
+    guardado = con.execute("SELECT valid_utc FROM weather_obs").fetchone()[0]
+    assert "T" in guardado, "produccion guarda con T; el test tiene que imitarlo"
 
 
 def test_el_umbral_deja_margen_para_el_ciclo_siguiente() -> None:
