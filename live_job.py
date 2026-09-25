@@ -42,6 +42,25 @@ GCS_GENERATION_RETRIES = max(0, int(os.environ.get("GCS_GENERATION_RETRIES", "2"
 # del archivo, y con eso la descarga de la base dejo de entrar en el timeout del
 # backend. El espacio libre es lo que el VACUUM recupera, asi que es lo que hay
 # que medir.
+# Dias de historia cruda que se conservan en la base caliente.
+#
+# Bajo de 30 a 14 el 25/09. La base llego a 813 MB y el harvester —que la baja
+# entera, la modifica y la sube en cada ciclo— empezo a morir en su timeout de
+# 900 s: dos horas sin recolectar. El crecimiento es consecuencia de descubrir
+# el horario futuro, que cuadruplico los vuelos que seguimos.
+#
+# No se pierde nada: el historico completo vive en BigQuery
+# (`ontimeai-prod.ontimeai_archivo`), verificado fila por fila antes de bajar
+# este numero. Lo que sale de aca deja de viajar cien veces por dia, no deja de
+# existir.
+#
+# Efecto secundario a tener presente: el rollup diario recalcula 35 dias hacia
+# atras para capturar actuals que llegan tarde, y con 14 dias de retencion
+# recalcula menos. Las filas ya escritas en `metrics_daily` quedan intactas
+# —esa tabla no se purga— pero un actual que llegue con tres semanas de atraso
+# ya no se incorpora. En la practica llegan en horas.
+RETENTION_DAYS = int(os.environ.get("RETENTION_DAYS", "14"))
+
 PRUNE_VACUUM_MIN_FREE_MB = max(
     0,
     int(os.environ.get("PRUNE_VACUUM_MIN_FREE_MB", "50")),
@@ -381,7 +400,7 @@ def _run_pipeline_attempt(extra_args: list[str]) -> int:
             with _fase("purga"):
                 prune_db(
                     TMP_DB,
-                    days=30,
+                    days=RETENTION_DAYS,
                     dry_run=False,
                 )
         except Exception as e:
