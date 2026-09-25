@@ -701,6 +701,51 @@ def _chain_calibrator_status(con: sqlite3.Connection) -> dict:
         return {"present": False, "stale": True, "detail": f"no se pudo leer: {exc}"}
 
 
+# Cuanto puede pasar sin que el harvester complete una corrida antes de que sea
+# un problema. Corre cada 15 minutos; 45 son tres oportunidades perdidas.
+HARVESTER_STALE_MIN = int(os.getenv("HARVESTER_STALE_MIN", "45"))
+
+
+def _harvester_health(con: sqlite3.Connection) -> dict:
+    """Hace cuanto que el harvester completo una corrida.
+
+    Se mira la ausencia, no la duracion: cuando lo matan por timeout nunca llega
+    a escribir su fila en `harvester_runs`, asi que una corrida caida es
+    invisible mirando duraciones y evidente mirando cuando fue la ultima.
+
+    El 25/09 el harvester estuvo mas de dos horas muriendo en su timeout de
+    900 s —la base habia llegado a 813 MB y el job la baja y la sube entera— y
+    ninguna alarma aviso. `cycle_duration` mide la tabla `runs`, que solo
+    escribe el job de prediccion; nadie miraba este.
+    """
+    try:
+        fila = con.execute(
+            """SELECT MAX(run_at_utc) AS ultima FROM harvester_runs
+                WHERE COALESCE(status,'') != 'failed'"""
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return {"last_utc": None, "age_minutes": None,
+                "tolerated_minutes": HARVESTER_STALE_MIN, "stale": False}
+
+    ultima = (fila["ultima"] if fila else None) or None
+    edad = None
+    if ultima:
+        try:
+            t = datetime.fromisoformat(str(ultima).replace("Z", "+00:00"))
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=timezone.utc)
+            edad = round((datetime.now(timezone.utc) - t).total_seconds() / 60, 1)
+        except ValueError:
+            edad = None
+    return {
+        "last_utc": ultima,
+        "age_minutes": edad,
+        "tolerated_minutes": HARVESTER_STALE_MIN,
+        # Sin tabla no se opina; sin filas o con filas viejas, si.
+        "stale": ultima is not None and (edad is None or edad > HARVESTER_STALE_MIN),
+    }
+
+
 def _recent_cycles(con: sqlite3.Connection, limit: int = 8) -> dict:
     """Duracion de los ultimos ciclos completos del job.
 
@@ -2482,6 +2527,7 @@ def db_stats(request: Request):
             "table_dates": table_dates,
             "sources": _source_freshness(con),
             "cycles": _recent_cycles(con),
+            "harvester": _harvester_health(con),
             "chain_calibrator": _chain_calibrator_status(con),
             "db_size_warn_mb": DB_SIZE_WARN_MB,
             "db_size_over_warn": size_mb > DB_SIZE_WARN_MB,

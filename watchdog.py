@@ -181,6 +181,44 @@ def check_sources_fresh() -> list[Check]:
     return checks
 
 
+def check_harvester() -> list[Check]:
+    """¿El harvester sigue recolectando?
+
+    Se mira hace cuanto completo una corrida, no cuanto tarda: cuando lo matan
+    por timeout nunca escribe su fila, asi que una corrida caida es invisible
+    mirando duraciones.
+
+    El 25/09 estuvo mas de dos horas muriendo en su timeout —la base habia
+    llegado a 813 MB y el job la baja y la sube entera— y nadie aviso.
+    `cycle_duration` mide la tabla `runs`, que solo escribe el job de
+    prediccion. Este job no tenia quien lo mirara.
+    """
+    try:
+        stats = requests.get(
+            f"{BACKEND_URL}/admin/db-stats",
+            headers={"Authorization": f"Bearer {_login()}"},
+            timeout=HTTP_TIMEOUT,
+        ).json()
+    except Exception as exc:  # noqa: BLE001
+        return [Check("harvester", False, f"No se pudo consultar: {exc}")]
+
+    h = stats.get("harvester")
+    if not h or h.get("last_utc") is None:
+        # Backend sin el campo, o base sin la tabla: se informa y no se acusa.
+        return [Check("harvester", True, "sin datos del harvester todavía")]
+
+    edad = h.get("age_minutes")
+    tolerado = h.get("tolerated_minutes")
+    if h.get("stale"):
+        return [Check(
+            "harvester", False,
+            f"El harvester no completa una corrida hace {edad} min "
+            f"(se toleran {tolerado}, corre cada 15). Suele ser que muere en su "
+            "timeout: la base crece y el job la baja y la sube entera.",
+        )]
+    return [Check("harvester", True, f"Última corrida hace {edad} min")]
+
+
 def check_capacity() -> list[Check]:
     """Tamano de la base y duracion del ciclo, antes de que sean un problema.
 
@@ -396,6 +434,7 @@ def main() -> int:
     if all(c.ok for c in checks):
         checks.extend(check_sources_fresh())
         checks.extend(check_capacity())
+        checks.extend(check_harvester())
     state = load_state()
     # Se arranca del estado previo en vez de vacio. Una clave que no se pudo
     # evaluar en esta corrida —las fuentes cuando el backend esta caido— tiene
