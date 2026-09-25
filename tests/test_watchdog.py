@@ -23,7 +23,8 @@ os.environ.setdefault("API_PASSWORD", "test-password")
 import watchdog  # noqa: E402
 
 
-def _run_with(checks, previous_state, monkeypatch, sources=None, capacity=None):
+def _run_with(checks, previous_state, monkeypatch, sources=None, capacity=None,
+              harvester=None):
     """Corre main() con chequeos fijos y devuelve (mensajes, estado guardado)."""
     sent: list[str] = []
     saved: dict = {}
@@ -33,6 +34,7 @@ def _run_with(checks, previous_state, monkeypatch, sources=None, capacity=None):
     monkeypatch.setattr(watchdog, "check_backend_data_fresh", lambda: checks[2])
     monkeypatch.setattr(watchdog, "check_sources_fresh", lambda: list(sources or []))
     monkeypatch.setattr(watchdog, "check_capacity", lambda: list(capacity or []))
+    monkeypatch.setattr(watchdog, "check_harvester", lambda: list(harvester or []))
     monkeypatch.setattr(watchdog, "load_state", lambda: previous_state)
     monkeypatch.setattr(watchdog, "save_state", lambda s: saved.update(s))
     monkeypatch.setattr(watchdog, "notify", lambda text: sent.append(text))
@@ -431,3 +433,73 @@ def test_el_timeout_tolera_un_refresco_de_la_base() -> None:
     import watchdog
 
     assert watchdog.HTTP_TIMEOUT >= 60
+
+
+class TestHarvester:
+    """
+    El harvester no tenia quien lo mirara.
+
+    El 25/09 estuvo mas de dos horas muriendo en su timeout de 900 s —la base
+    habia llegado a 813 MB y el job la baja y la sube entera en cada ciclo— y
+    ninguna alarma aviso. `cycle_duration` mide la tabla `runs`, que solo
+    escribe el job de prediccion.
+
+    Se mira hace cuanto COMPLETO una corrida, no cuanto tarda: al morir por
+    timeout nunca escribe su fila, asi que una corrida caida es invisible
+    mirando duraciones y evidente mirando la ultima.
+    """
+
+    def _con_stats(self, monkeypatch, stats):
+        import watchdog
+
+        monkeypatch.setattr(watchdog, "_login", lambda: "token")
+
+        class _R:
+            @staticmethod
+            def json():
+                return stats
+
+        monkeypatch.setattr(watchdog.requests, "get", lambda *a, **k: _R())
+        return watchdog.check_harvester()[0]
+
+    def test_una_corrida_reciente_esta_bien(self, monkeypatch) -> None:
+        c = self._con_stats(monkeypatch, {"harvester": {
+            "last_utc": "2026-09-25T14:00:00+00:00", "age_minutes": 8.0,
+            "tolerated_minutes": 45, "stale": False}})
+        assert c.ok is True
+
+    def test_el_caso_del_25_09_dispara(self, monkeypatch) -> None:
+        """Dos horas sin completar una corrida."""
+        c = self._con_stats(monkeypatch, {"harvester": {
+            "last_utc": "2026-09-25T12:08:00+00:00", "age_minutes": 127.0,
+            "tolerated_minutes": 45, "stale": True}})
+        assert c.ok is False
+        assert "127" in c.detail
+
+    def test_sin_el_campo_no_inventa_un_juicio(self, monkeypatch) -> None:
+        """Watchdog desplegado antes que la API."""
+        assert self._con_stats(monkeypatch, {}).ok is True
+
+    def test_base_sin_la_tabla_tampoco_acusa(self, monkeypatch) -> None:
+        c = self._con_stats(monkeypatch, {"harvester": {
+            "last_utc": None, "age_minutes": None,
+            "tolerated_minutes": 45, "stale": False}})
+        assert c.ok is True
+
+    def test_el_backend_caido_se_reporta_como_tal(self, monkeypatch) -> None:
+        import watchdog
+
+        monkeypatch.setattr(watchdog, "_login", lambda: "token")
+        def _explota(*a, **k):
+            raise RuntimeError("timeout")
+        monkeypatch.setattr(watchdog.requests, "get", _explota)
+        c = watchdog.check_harvester()[0]
+        assert c.ok is False
+
+
+def test_el_harvester_entra_en_la_ronda_de_chequeos() -> None:
+    """Un chequeo que existe pero nadie llama no sirve de nada."""
+    from pathlib import Path
+
+    fuente = Path(__file__).resolve().parent.parent / "watchdog.py"
+    assert "checks.extend(check_harvester())" in fuente.read_text()
