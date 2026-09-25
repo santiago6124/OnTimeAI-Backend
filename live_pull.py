@@ -65,15 +65,25 @@ WEATHER_FRESH_MINUTES = int(os.getenv("WEATHER_FRESH_MINUTES", "50"))
 def _airports_with_fresh_weather(conn, minutos: int) -> set[str]:
     """Estaciones con una observacion de menos de `minutos`.
 
-    `valid_utc` se guarda sin offset, asi que se compara contra `datetime('now')`
-    que en SQLite tambien es UTC. Leerlo como hora local daria tres horas de mas
-    en Argentina y ningun aeropuerto figuraria fresco.
+    `datetime(valid_utc)` y no `valid_utc` a secas. La columna guarda
+    `2026-09-25T14:56:00` —con T— y `datetime('now', ...)` devuelve
+    `2026-09-25 18:26:04` —con espacio—. Comparadas como texto, la `T` (0x54)
+    le gana al espacio (0x20) en la posicion 11, asi que CUALQUIER observacion
+    daba "fresca".
+
+    El efecto fue que el clima dejo de actualizarse por completo: 138 de 148
+    estaciones figuraban frescas cuando la verdad eran 0, y la observacion mas
+    nueva quedo congelada tres horas y media. Envolver las dos partes en
+    `datetime()` las normaliza antes de comparar.
+
+    Habia un test para esto y paso igual, porque insertaba las fechas con
+    espacio en vez de con T: usaba un formato que produccion no usa.
     """
     try:
         filas = conn.execute(
             """SELECT station FROM weather_obs
                 GROUP BY station
-               HAVING MAX(valid_utc) > datetime('now', ?)""",
+               HAVING MAX(datetime(valid_utc)) > datetime('now', ?)""",
             (f"-{int(minutos)} minutes",),
         ).fetchall()
     except sqlite3.OperationalError:
