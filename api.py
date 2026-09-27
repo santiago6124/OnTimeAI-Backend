@@ -678,11 +678,24 @@ DB_SIZE_WARN_MB = int(os.getenv("DB_SIZE_WARN_MB", "800"))
 # Lo que importa de `predictions` lo cubre `/metrics/summary`: si el ciclo se
 # detuvo (`last_run_utc`) y si tenia vuelos y no los predijo
 # (`last_run_targeted` contra `last_run_predicted`). Ver el watchdog.
-SOURCE_FRESHNESS: dict[str, tuple[str, int, str]] = {
-    "actuals":           ("settled_at_utc",   120,  "harvester FR24 + AeroAPI"),
-    "weather_obs":       ("valid_utc",        180,  "IEM METAR (publica cada ~1 h)"),
-    "nas_status":        ("captured_at_utc",  180,  "NAS status FAA"),
-    "aircraft_position": ("captured_at_utc",  120,  "ADS-B airplanes.live / OpenSky"),
+#
+# La clave es el nombre con el que sale la alarma; la tabla va adentro de la
+# tupla porque no siempre coinciden. `nas_status` es el caso: guarda una fila
+# por aeropuerto bajo programa, asi que un cielo sin programas no deja rastro
+# y mirarla ahi responde "hay demoras en el pais?", no "la FAA contesta?".
+#
+# La madrugada del 27/09 la alarma sono tras 499 minutos sin filas. No habia
+# nada roto: no hubo un solo programa activo en Estados Unidos en ocho horas,
+# que es el estado mas sano posible. En esa misma ventana `weather_obs`
+# escribio 1.242 filas, `actuals` 15.463 y `predictions` 5.300.
+#
+# Por eso `nas_status` se vigila contra `faa_nas_fetch`, que registra cada
+# consulta que la FAA contesto de verdad, haya o no programas. Ver live.py.
+SOURCE_FRESHNESS: dict[str, tuple[str, str, int, str]] = {
+    "actuals":           ("actuals",       "settled_at_utc",  120,  "harvester FR24 + AeroAPI"),
+    "weather_obs":       ("weather_obs",   "valid_utc",       180,  "IEM METAR (publica cada ~1 h)"),
+    "nas_status":        ("faa_nas_fetch", "checked_at_utc",  180,  "NAS status FAA"),
+    "aircraft_position": ("aircraft_position", "captured_at_utc", 120, "ADS-B airplanes.live / OpenSky"),
 }
 
 
@@ -828,7 +841,7 @@ def _source_freshness(con: sqlite3.Connection) -> dict[str, dict]:
     """
     now = datetime.now(timezone.utc)
     out: dict[str, dict] = {}
-    for table, (column, tolerated_min, fed_by) in SOURCE_FRESHNESS.items():
+    for nombre, (table, column, tolerated_min, fed_by) in SOURCE_FRESHNESS.items():
         try:
             row = con.execute(f"SELECT MAX({column}) FROM {table}").fetchone()
         except sqlite3.OperationalError:
@@ -843,7 +856,7 @@ def _source_freshness(con: sqlite3.Connection) -> dict[str, dict]:
                 age_min = round((now - parsed).total_seconds() / 60, 1)
             except ValueError:
                 age_min = None
-        out[table] = {
+        out[nombre] = {
             "last_utc": last,
             "age_minutes": age_min,
             "tolerated_minutes": tolerated_min,
