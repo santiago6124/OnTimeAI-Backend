@@ -158,6 +158,13 @@ class GdpClient:
         self._cache_ttl = cache_ttl
         self._cache: dict[str, dict] = {}  # {iata: {type, delay_min, reason}}
         self._last_fetch: float = 0.0
+        # Si el ultimo `_refresh()` llego a leer y parsear la respuesta de la
+        # FAA. Hace falta porque `_refresh` degrada en silencio: ante un fallo
+        # de red o de parseo avisa con `warnings.warn`, deja el cache como
+        # estaba y vuelve sin lanzar nada. Visto desde afuera, una caida de la
+        # FAA y un cielo sin programas son identicos —cache vacio en los dos
+        # casos—, y quien quiera distinguirlos no tiene de donde agarrarse.
+        self.last_refresh_ok: bool = False
 
     def _refresh(self) -> None:
         """Fetch and parse FAA NAS status. Silently degrades on error."""
@@ -177,6 +184,7 @@ class GdpClient:
         except Exception as exc:
             warnings.warn(f"GdpClient: FAA fetch failed — {exc}. Using stale/empty cache.")
             self._last_fetch = time.time()
+            self.last_refresh_ok = False
             return
 
         new_cache: dict[str, dict] = {}
@@ -244,10 +252,15 @@ class GdpClient:
         except Exception as exc:
             warnings.warn(f"GdpClient: XML parse failed — {exc}")
             self._last_fetch = time.time()
+            self.last_refresh_ok = False
             return
 
         self._cache = new_cache
         self._last_fetch = time.time()
+        # Solo aca: se leyo la respuesta y se parseo entera. Que `new_cache`
+        # quede vacio es una respuesta valida —no hay ningun programa activo en
+        # el pais— y cuenta como exito.
+        self.last_refresh_ok = True
 
     def _ensure_fresh(self) -> None:
         age = time.time() - self._last_fetch

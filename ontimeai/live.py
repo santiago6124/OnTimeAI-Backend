@@ -209,6 +209,25 @@ CREATE TABLE IF NOT EXISTS nas_status (
     PRIMARY KEY (captured_at_utc, airport)
 );
 CREATE INDEX IF NOT EXISTS idx_nas_airport ON nas_status(airport, captured_at_utc);
+
+-- Cuando se le pregunto a la FAA, aparte de que contesto.
+--
+-- `nas_status` guarda una fila por aeropuerto bajo programa, asi que un cielo
+-- sin programas no deja rastro. Eso es correcto para el modelo, pero vuelve la
+-- tabla inservible para vigilar la fuente: la madrugada del 27/09 estuvo ocho
+-- horas sin escribir porque no habia un solo programa activo en el pais —el
+-- estado mas sano posible— y el watchdog lo leyo como que la fuente se habia
+-- caido. En esa misma ventana `weather_obs` escribio 1.242 filas, `actuals`
+-- 15.463 y `predictions` 5.300: el pipeline estaba entero.
+--
+-- Aca se escribe una fila por consulta que la FAA contesto de verdad, tenga o
+-- no programas que informar. `airports` en 0 es un dato, no una ausencia. El
+-- watchdog mira esta tabla y no `nas_status`, asi que ahora mide si la fuente
+-- responde y no si el pais tiene demoras.
+CREATE TABLE IF NOT EXISTS faa_nas_fetch (
+    checked_at_utc TEXT PRIMARY KEY,
+    airports INTEGER NOT NULL
+);
 """
 
 
@@ -833,10 +852,24 @@ def snapshot_nas_status(conn: sqlite3.Connection) -> int:
         print(f"  [NAS] snapshot failed: {e}")
         return 0
 
+    now_iso = datetime.now(timezone.utc).isoformat()
+
+    # El latido depende de `last_refresh_ok` y no de que el `try` de arriba no
+    # haya saltado. `_refresh()` degrada en silencio: ante un fallo de red o de
+    # parseo avisa con `warnings.warn`, deja el cache como estaba y vuelve sin
+    # lanzar nada, asi que este `except` no se entera. Escribir el latido solo
+    # por haber llegado hasta aca marcaria como viva una fuente caida, que es
+    # justo lo contrario de lo que se busca.
+    if getattr(client, "last_refresh_ok", False):
+        conn.execute(
+            "INSERT OR REPLACE INTO faa_nas_fetch (checked_at_utc, airports) VALUES (?,?)",
+            (now_iso, len(snapshot or {})),
+        )
+        conn.commit()
+
     if not snapshot:
         return 0
 
-    now_iso = datetime.now(timezone.utc).isoformat()
     rows = [
         (now_iso, ap, info["type"], float(info["delay_min"]),
          info.get("reason", ""),
