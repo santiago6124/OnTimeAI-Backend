@@ -27,6 +27,7 @@ def _prunable_db(path: Path, *, old_predictions: int) -> None:
         CREATE TABLE harvester_runs(run_at_utc TEXT);
         CREATE TABLE nas_status(captured_at_utc TEXT);
         CREATE TABLE aircraft_position(captured_at_utc TEXT);
+        CREATE TABLE faa_nas_fetch(checked_at_utc TEXT, airports INTEGER);
         """
     )
     con.executemany(
@@ -101,6 +102,7 @@ def _db_con_vuelos(tmp_path, filas):
         CREATE TABLE harvester_runs(run_at_utc TEXT);
         CREATE TABLE nas_status(captured_at_utc TEXT);
         CREATE TABLE aircraft_position(captured_at_utc TEXT);
+        CREATE TABLE faa_nas_fetch(checked_at_utc TEXT, airports INTEGER);
         """
     )
     for fid, sched, first_seen in filas:
@@ -225,6 +227,7 @@ class TestBarridoDeHuerfanos:
             CREATE TABLE harvester_runs(run_at_utc TEXT);
             CREATE TABLE nas_status(captured_at_utc TEXT);
             CREATE TABLE aircraft_position(captured_at_utc TEXT);
+            CREATE TABLE faa_nas_fetch(checked_at_utc TEXT, airports INTEGER);
             """
         )
         ahora = datetime.now(timezone.utc).isoformat()

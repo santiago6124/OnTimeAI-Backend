@@ -110,6 +110,12 @@ def prune_db(
         pos_cnt = con.execute("SELECT count(*) FROM aircraft_position WHERE captured_at_utc < ?", (cutoff_iso,)).fetchone()[0]
         print(f"aircraft_position: {pos_cnt:,} rows older than cutoff")
 
+        # 10. FAA NAS heartbeat. Una fila por ciclo, ~35k al anio: no pesa,
+        # pero se depura con el resto para que la retencion sea una sola regla
+        # y no una lista de excepciones.
+        fetch_cnt = con.execute("SELECT count(*) FROM faa_nas_fetch WHERE checked_at_utc < ?", (cutoff_iso,)).fetchone()[0]
+        print(f"faa_nas_fetch: {fetch_cnt:,} rows older than cutoff")
+
         if dry_run:
             print(f"actuals: {actual_cnt:,} rows would be orphaned and deleted")
             print("Dry run completed. No modifications made.")
@@ -166,6 +172,7 @@ def prune_db(
         con.execute("DELETE FROM harvester_runs WHERE run_at_utc < ?", (cutoff_iso,))
         con.execute("DELETE FROM nas_status WHERE captured_at_utc < ?", (cutoff_iso,))
         con.execute("DELETE FROM aircraft_position WHERE captured_at_utc < ?", (cutoff_iso,))
+        con.execute("DELETE FROM faa_nas_fetch WHERE checked_at_utc < ?", (cutoff_iso,))
         
         total_deleted = con.total_changes - changes_before_prune
         con.commit()
