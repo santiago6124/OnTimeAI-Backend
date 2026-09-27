@@ -30,6 +30,7 @@ from ontimeai.live import (
     aeroapi_to_flight_row, upsert_flights, upsert_actuals_from_aeroapi, upsert_weather,
     build_inference_frame, chain_walk_inbound, AIRPORTS, stable_id,
     snapshot_nas_status, latest_nas_status, gdp_post_prediction_adjust,
+    estado_del_dia, estado_dia_adjust,
     compute_atl_arrival_congestion, carrier_delay_rate_bayesian,
     intermediate_dep_delay_adjust, estimated_dep_delay_adjust,
     compute_adsb_eta_delay, adsb_eta_adjust,
@@ -701,6 +702,16 @@ def main() -> int:
     # by adjusting `proba` after the fact when ORIGIN or DEST is under a
     # program. `proba_raw` is preserved so we can A/B test the lift.
     nas_state = latest_nas_status(conn, max_age_minutes=30)
+
+    # Como viene ATL hoy, medido sobre las salidas que ya se resolvieron.
+    # Los programas de la FAA casi nunca mencionan a ATL —en 14 dias aparece 5,
+    # y dos de los peores con cero filas—, asi que `nas_state` no cubre esto.
+    dia = estado_del_dia(conn)
+    if dia["tasa"] is not None:
+        print(f"\n[5a] estado del dia: {dia['tasa']:.1%} de salidas demoradas "
+              f"sobre {dia['n']} vuelos (base {0.447:.1%}) → factor {dia['factor']:.2f}")
+    else:
+        print(f"\n[5a] estado del dia: sin datos suficientes ({dia['n']} vuelos) → factor 1.00")
     gdp_adjust_enabled = os.getenv("GDP_ADJUST", "1").lower() in ("1", "true", "yes")
     if nas_state and gdp_adjust_enabled:
         affected = [a for a in nas_state if a in {df.loc[i, "origin"] for i in df.index[target_mask]} | {df.loc[i, "dest"] for i in df.index[target_mask]}]
@@ -790,11 +801,18 @@ def main() -> int:
         gdp_orig = nas_state.get(origin, {}).get("delay_min", 0.0) if nas_state else 0.0
         gdp_dest = nas_state.get(dest, {}).get("delay_min", 0.0) if nas_state else 0.0
 
-        # Adjustment chain: raw → GDP → estimated dep_delay (if not departed) OR intermediate dep_delay (if departed) → ADS-B ETA.
+        # Adjustment chain: raw → estado del dia → GDP → estimated dep_delay
+        # (if not departed) OR intermediate dep_delay (if departed) → ADS-B ETA.
+        #
+        # El estado del dia va PRIMERO y no al final: corrige el nivel general
+        # de la jornada, y los ajustes que siguen son por vuelo. Aplicado
+        # despues estaria corrigiendo un numero que ya incorporo circunstancias
+        # particulares de ese vuelo, y las escalaria de nuevo.
+        proba_dia = estado_dia_adjust(proba_raw, dia["factor"])
         proba_after_gdp = (
-            gdp_post_prediction_adjust(proba_raw, gdp_orig, gdp_dest)
+            gdp_post_prediction_adjust(proba_dia, gdp_orig, gdp_dest)
             if gdp_adjust_enabled
-            else proba_raw
+            else proba_dia
         )
         sid = stable_id(df.loc[i, "fa_flight_id"])
         dep_delay = dep_delay_map.get(sid)  # None if target hasn't departed yet
