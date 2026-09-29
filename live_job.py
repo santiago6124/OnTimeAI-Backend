@@ -180,8 +180,20 @@ def _cleanup_old_data() -> None:
     """Trim stale data to keep DB small. prediction_shap is not needed for retraining."""
     import sqlite3 as _sqlite3
     con = _sqlite3.connect(str(TMP_DB))
-    # SHAP values: keep 7 days only (UI only, never used for retraining)
-    con.execute("DELETE FROM prediction_shap WHERE predicted_at_utc < datetime('now', '-7 days')")
+    # SHAP: 2 dias.
+    #
+    # Eran 7, y `prediction_shap` llego a ser el 68% de la base —232,8 MB de
+    # tabla mas 158,4 MB de su indice de clave primaria sobre 815 MB totales—
+    # creciendo 345.000 filas por dia. La cuenta: 15 features por prediccion,
+    # 21,6 predicciones por vuelo, ~1.070 vuelos por dia.
+    #
+    # Se guardan 15 filas por CADA ciclo de cada vuelo, pero la pantalla de
+    # detalle muestra solo el SHAP de la ultima prediccion, y nada lo usa para
+    # reentrenar. Dos dias alcanzan de sobra para los vuelos del dia, que es lo
+    # unico que alguien abre.
+    _SHAP_DIAS = int(os.environ.get("SHAP_RETENTION_DAYS", "2"))
+    con.execute(
+        f"DELETE FROM prediction_shap WHERE predicted_at_utc < datetime('now', '-{_SHAP_DIAS} days')")
     shap_deleted = con.total_changes
     # Weather observations: keep 30 days (can be re-pulled from IEM if needed)
     con.execute("DELETE FROM weather_obs WHERE valid_utc < datetime('now', '-30 days')")
