@@ -99,20 +99,43 @@ def main() -> int:
     df = pd.read_sql_query(
         f"""
         SELECT p.fa_flight_id, p.proba_delay, p.predicted_delay,
+               p.predicted_at_utc, f.scheduled_out_utc,
                a.arr_delay_min, a.cancelled, a.diverted
         FROM predictions p
         JOIN actuals a ON a.fa_flight_id = p.fa_flight_id
+        JOIN flights  f ON f.fa_flight_id = p.fa_flight_id
         WHERE a.cancelled = 0
           AND a.diverted  = 0
           AND a.arr_delay_min IS NOT NULL
+          AND f.scheduled_out_utc IS NOT NULL
+          AND p.predicted_at_utc <= f.scheduled_out_utc
           {since_clause}
           {strategy_clause}
         """,
         conn,
     )
 
-    # Una predicción por vuelo: la más reciente
-    df = df.sort_values("proba_delay").groupby("fa_flight_id", as_index=False).last()
+    # Una predicción por vuelo: la última anterior a la salida programada.
+    #
+    # Antes esto ordenaba por `proba_delay`, no por fecha: el comentario decía
+    # "la más reciente" pero `.last()` se quedaba con la predicción de
+    # PROBABILIDAD MÁS ALTA de cada vuelo. Y `predicted_at_utc` ni siquiera
+    # estaba en el SELECT, así que ordenar por tiempo era imposible.
+    #
+    # No es un detalle. Medido el 27/09 sobre 8.372 vuelos de ATL, las dos
+    # selecciones eligen distinto en el 86% de los casos, y la probabilidad
+    # media pasa de 9,6% (la última) a 18,0% (la máxima). O sea que el
+    # calibrador se ajustaba contra una distribución con casi el doble de
+    # media que la que después ve en producción, y aprendía a encoger.
+    #
+    # Eso explica el artefacto `4year_v9_recal` que nadie activó: simulado
+    # sobre los mismos datos, empuja la probabilidad media a 4,5% cuando la
+    # tasa real es 12,7%, con Brier 0,1106 contra 0,1094 sin recalibrar. Era
+    # peor que no hacer nada.
+    #
+    # La última predicción anterior a la salida es la que operaciones tiene en
+    # la mano al decidir, así que es contra esa que hay que calibrar.
+    df = df.sort_values("predicted_at_utc").groupby("fa_flight_id", as_index=False).last()
 
     n_total = len(df)
     print(f"Predicciones asentadas disponibles: {n_total:,}")
