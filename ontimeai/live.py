@@ -193,7 +193,13 @@ CREATE TABLE IF NOT EXISTS prediction_shap (
     rank INTEGER NOT NULL,         -- 1..K by |shap_value| DESC
     PRIMARY KEY (fa_flight_id, predicted_at_utc, feature_name)
 );
-CREATE INDEX IF NOT EXISTS idx_shap_pred ON prediction_shap(fa_flight_id, predicted_at_utc);
+-- NO agregar un indice sobre (fa_flight_id, predicted_at_utc): la PRIMARY KEY
+-- ya es (fa_flight_id, predicted_at_utc, feature_name) y SQLite la respalda con
+-- `sqlite_autoindex_prediction_shap_1`, que empieza por esas dos columnas. Un
+-- indice sobre el prefijo no aporta ningun plan nuevo y duplica la escritura.
+-- Existio como `idx_shap_pred` y pesaba 120,8 MB sobre una base de 815 MB, el
+-- 16% del archivo, mientras el harvester moria en su timeout por el tamanio.
+-- `_migrate_drop_idx_shap_pred()` lo borra de las bases que lo tengan.
 
 -- FAA NAS Status snapshots, captured once per tick. Used to:
 --   1. Build a historical dataset for future retrain (v9 lacks GDP feature)
@@ -272,6 +278,7 @@ def open_db(path: Path = DB_PATH) -> sqlite3.Connection:
     _migrate_predictions_gdp_adjustment(conn)
     _migrate_predictions_chain_probability(conn)
     _migrate_nas_status(conn)
+    _migrate_drop_idx_shap_pred(conn)
     _migrate_estimated_times(conn)
     _migrate_prediction_phase(conn)
     _migrate_runs_flights_targeted(conn)
@@ -351,6 +358,21 @@ def _migrate_predictions_threshold(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE predictions ADD COLUMN threshold_used REAL")
     if "threshold_strategy" not in cols:
         conn.execute("ALTER TABLE predictions ADD COLUMN threshold_strategy TEXT")
+
+
+def _migrate_drop_idx_shap_pred(conn: sqlite3.Connection) -> None:
+    """Borra `idx_shap_pred`, que era un prefijo de la PRIMARY KEY.
+
+    La PK de `prediction_shap` es (fa_flight_id, predicted_at_utc, feature_name)
+    y SQLite la respalda con un indice propio que empieza por esas dos columnas.
+    El indice extra no habilitaba ningun plan de consulta nuevo: solo ocupaba
+    lugar y duplicaba el trabajo de cada INSERT.
+
+    Medido el 29/09: 120,8 MB sobre un archivo de 815 MB. Ese dia el harvester
+    fallo en cinco corridas seguidas porque baja y sube la base entera en cada
+    pasada y no le entraba en el timeout.
+    """
+    conn.execute("DROP INDEX IF EXISTS idx_shap_pred")
 
 
 def _migrate_nas_status(conn: sqlite3.Connection) -> None:
