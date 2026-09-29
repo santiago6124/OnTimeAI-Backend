@@ -1331,6 +1331,95 @@ def estimated_dep_delay_adjust(proba: float, est_delay_min: float | None) -> flo
 
 
 
+# Ventana con la que se mide como viene el dia en ATL.
+#
+# Va DESFASADA a proposito. El dato de salida de FR24 llega con unas tres horas
+# de retraso —medido el 27/09: de los vuelos que salieron hace 0-1 h lo tiene el
+# 0%, hace 2-3 h el 43%, hace 3-6 h el 94%, hace 6-12 h el 99%—, asi que mirar
+# "las ultimas tres horas" agarra justo la franja donde todavia no llego nada.
+# Una medicion sobre esa franja dio 38 vuelos: puro ruido.
+ESTADO_DIA_DESDE_H = int(os.getenv("ESTADO_DIA_DESDE_H", "9"))   # borde lejano
+ESTADO_DIA_HASTA_H = int(os.getenv("ESTADO_DIA_HASTA_H", "3"))   # borde cercano
+ESTADO_DIA_MIN_VUELOS = int(os.getenv("ESTADO_DIA_MIN_VUELOS", "80"))
+
+# Tasa de demora de salida de referencia para ATL, sobre la que se compara lo
+# observado. Mediana diaria del 14 al 25/09 sobre 12 dias completos.
+ESTADO_DIA_BASE = float(os.getenv("ESTADO_DIA_BASE", "0.447"))
+
+# Cuanto se deja mover la probabilidad. El ajuste es un multiplicador acotado:
+# sin tope, un dia con 77% de salidas demoradas contra una base de 45% daria
+# un factor de 1,7 aplicado a vuelos que ya venian altos, y los empujaria a
+# certezas que el modelo no tiene con que sostener.
+ESTADO_DIA_FACTOR_MIN = float(os.getenv("ESTADO_DIA_FACTOR_MIN", "0.7"))
+ESTADO_DIA_FACTOR_MAX = float(os.getenv("ESTADO_DIA_FACTOR_MAX", "1.8"))
+
+
+def estado_del_dia(conn: sqlite3.Connection, ahora: datetime | None = None) -> dict:
+    """Como viene ATL ahora mismo, medido sobre las salidas que ya se resolvieron.
+
+    Devuelve `{"tasa": float|None, "n": int, "factor": float}`. `factor` es lo
+    que hay que multiplicarle a la probabilidad del modelo; vale 1.0 cuando no
+    hay con que decidir, asi que el llamador no necesita ramificar.
+
+    POR QUE HACE FALTA. La tasa real de demora en ATL va de 8% a 39% segun el
+    dia —medido del 14 al 26/09— y el modelo asigna ~9,5% todos los dias. Le
+    pega en los tranquilos y se queda cortisimo en los malos.
+
+    El modelo no es ciego del todo: en dias malos sube la probabilidad media de
+    7,2% a 14,6%, asi que la cadena del avion, la congestion y el clima llevan
+    algo de senal. Pero no alcanza. Dentro del tramo donde dice "entre 10 y
+    20%", la realidad es 12,1% en un dia calmo y 30,7% en uno malo: misma
+    prediccion, resultado dos veces y media distinto.
+
+    Lo que esto agrega es ortogonal a lo que ya hay. La cadena mide *este avion
+    viene tarde*, no *el aeropuerto se esta cayendo*: un avion puntual en un
+    aeropuerto colapsado se ve perfecto desde la cadena y sale tarde igual. Y
+    los programas de la FAA casi no existen para ATL —en 14 dias aparece en
+    `nas_status` solo 5, y los dias 14 y 18, ambos malos, con cero filas—.
+
+    Se usa la demora de SALIDA y no la de llegada porque la de llegada exige
+    que el vuelo aterrice en destino y tarda dias. La de salida se sabe a los
+    minutos del despegue, y las dos correlacionan r=+0,97 por dia: alcanza
+    para saber como viene la jornada.
+    """
+    ahora = ahora or datetime.now(timezone.utc)
+    fila = conn.execute(
+        """SELECT COUNT(*) n,
+                  AVG(CASE WHEN x.departure_delay_min > 15 THEN 1.0 ELSE 0 END) tasa
+             FROM flights f JOIN actuals x ON x.fa_flight_id = f.fa_flight_id
+            WHERE f.origin = 'ATL'
+              AND x.departure_delay_min IS NOT NULL
+              AND COALESCE(x.cancelled, 0) = 0
+              AND datetime(f.scheduled_out_utc) > datetime(?, ?)
+              AND datetime(f.scheduled_out_utc) <= datetime(?, ?)""",
+        (ahora.isoformat(), f"-{ESTADO_DIA_DESDE_H} hours",
+         ahora.isoformat(), f"-{ESTADO_DIA_HASTA_H} hours"),
+    ).fetchone()
+
+    n = int(fila[0] or 0)
+    tasa = float(fila[1]) if fila[1] is not None else None
+    if tasa is None or n < ESTADO_DIA_MIN_VUELOS:
+        return {"tasa": tasa, "n": n, "factor": 1.0}
+
+    factor = tasa / ESTADO_DIA_BASE if ESTADO_DIA_BASE > 0 else 1.0
+    factor = min(max(factor, ESTADO_DIA_FACTOR_MIN), ESTADO_DIA_FACTOR_MAX)
+    return {"tasa": tasa, "n": n, "factor": factor}
+
+
+def estado_dia_adjust(proba: float, factor: float) -> float:
+    """Corre la probabilidad segun como viene el dia, en el espacio de odds.
+
+    Multiplicar la probabilidad directamente rompe en el extremo alto: 0,8 por
+    1,8 da 1,44, que hay que recortar a 1 y aplasta las diferencias entre los
+    vuelos mas riesgosos. Sobre los odds no hay nada que recortar y el efecto
+    es fuerte donde hay lugar y suave donde ya casi no queda.
+    """
+    if factor == 1.0 or proba <= 0.0 or proba >= 1.0:
+        return min(max(proba, 0.0), 0.999)
+    odds = proba / (1.0 - proba)
+    return min(max((odds * factor) / (1.0 + odds * factor), 0.0), 0.999)
+
+
 def gdp_post_prediction_adjust(proba: float, gdp_orig_min: float, gdp_dest_min: float) -> float:
     """Boost the delay probability when origin or destination is under a GDP/GS.
 
