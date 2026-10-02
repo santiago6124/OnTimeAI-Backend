@@ -159,6 +159,30 @@ def _init_users_db() -> None:
             palette TEXT DEFAULT 'default',
             updated_at TEXT DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
         );
+        -- Vuelos que un viajero guarda para seguir.
+        --
+        -- Vive en la base de usuarios y no en `live_data.db` a proposito: esta
+        -- la escribe el backend y nadie la purga, mientras que la otra la
+        -- reescriben los jobs enteros cada ciclo y tiene retencion de 14 dias.
+        -- Un vuelo guardado tiene que sobrevivir a eso: el pedido es que
+        -- queden historicamente.
+        --
+        -- Por eso se guarda tambien una copia de los datos del vuelo. Cuando
+        -- la fila de `flights` se purgue a los 14 dias, el guardado se sigue
+        -- pudiendo mostrar: numero, ruta y horario son lo que el viajero
+        -- reconoce, y sin eso la lista queda con identificadores vacios.
+        CREATE TABLE IF NOT EXISTS user_saved_flights (
+            username TEXT NOT NULL,
+            fa_flight_id TEXT NOT NULL,
+            ident_iata TEXT,
+            origin TEXT,
+            dest TEXT,
+            scheduled_out_utc TEXT,
+            saved_at_utc TEXT NOT NULL,
+            PRIMARY KEY (username, fa_flight_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_saved_user
+            ON user_saved_flights(username, scheduled_out_utc DESC);
     """)
     # Migration: identity provider columns (added for Google sign-in, issue #8)
     existing = {r["name"] for r in con.execute("PRAGMA table_info(users)")}
@@ -448,6 +472,10 @@ class UserUpdate(BaseModel):
 class PreferencesUpdate(BaseModel):
     theme: Optional[str] = None
     palette: Optional[str] = None
+
+
+class SavedFlightCreate(BaseModel):
+    fa_flight_id: str
 
 
 # ── Feature labels ─────────────────────────────────────────────────────────
@@ -1453,6 +1481,226 @@ def update_preferences(request: Request, body: PreferencesUpdate):
     con.commit(); con.close()
     _upload_users_db()
     return {"ok": True}
+
+
+
+# ── Modo viajero ────────────────────────────────────────────────────────────
+
+@app.get("/users/me/flights")
+def list_saved_flights(request: Request):
+    """Los vuelos que el viajero guardó, del más próximo al más viejo.
+
+    Se devuelve la predicción actual cuando el vuelo sigue vivo en
+    `live_data.db`, y la copia guardada cuando ya se purgó. Un vuelo guardado
+    hace tres semanas tiene que seguir apareciendo con su número y su ruta
+    aunque el pipeline ya no lo tenga: el pedido es que queden históricamente.
+    """
+    username = _payload_of(request).get("sub")
+    ucon = _get_users_con()
+    try:
+        guardados = ucon.execute(
+            """SELECT fa_flight_id, ident_iata, origin, dest,
+                      scheduled_out_utc, saved_at_utc
+                 FROM user_saved_flights WHERE username = ?
+                ORDER BY scheduled_out_utc DESC""",
+            (username,),
+        ).fetchall()
+    finally:
+        ucon.close()
+
+    if not guardados:
+        return []
+
+    ids = [g["fa_flight_id"] for g in guardados]
+    vivos: dict[str, dict] = {}
+    con = get_db()
+    try:
+        marcas = ",".join("?" * len(ids))
+        for fila in con.execute(
+            f"""SELECT f.*, p.proba_delay, p.predicted_delay, p.threshold_used,
+                       p.predicted_at_utc, a.arr_delay_min,
+                       a.fa_flight_id AS actual_id
+                  FROM flights f
+                  JOIN (SELECT fa_flight_id, proba_delay, predicted_delay,
+                               threshold_used, predicted_at_utc,
+                               ROW_NUMBER() OVER (PARTITION BY fa_flight_id
+                                   ORDER BY predicted_at_utc DESC) rn
+                          FROM predictions) p
+                    ON p.fa_flight_id = f.fa_flight_id AND p.rn = 1
+                  LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
+                 WHERE f.fa_flight_id IN ({marcas})""",
+            ids,
+        ):
+            vivos[fila["fa_flight_id"]] = _flight_row_to_dict(fila)
+    finally:
+        con.close()
+
+    salida = []
+    for g in guardados:
+        vivo = vivos.get(g["fa_flight_id"])
+        if vivo is not None:
+            vivo["saved_at_utc"] = g["saved_at_utc"]
+            vivo["archived"] = False
+            salida.append(vivo)
+            continue
+        # Ya no está en el pipeline: se muestra la copia, marcada como tal
+        # para que la pantalla no prometa una predicción que no existe.
+        salida.append({
+            "fa_flight_id":      g["fa_flight_id"],
+            "ident_iata":        g["ident_iata"],
+            "origin":            g["origin"],
+            "dest":              g["dest"],
+            "scheduled_out_utc": g["scheduled_out_utc"],
+            "saved_at_utc":      g["saved_at_utc"],
+            "archived":          True,
+            "delay_probability": None,
+            "predicted_delay":   None,
+            "risk":              None,
+        })
+    return salida
+
+
+@app.post("/users/me/flights")
+def save_flight(request: Request, body: SavedFlightCreate):
+    """Guarda un vuelo, con una copia de lo que el viajero reconoce."""
+    username = _payload_of(request).get("sub")
+
+    con = get_db()
+    try:
+        fila = con.execute(
+            """SELECT fa_flight_id, ident_iata, origin, dest, scheduled_out_utc
+                 FROM flights WHERE fa_flight_id = ?""",
+            (body.fa_flight_id,),
+        ).fetchone()
+    finally:
+        con.close()
+    if fila is None:
+        raise HTTPException(status_code=404, detail="Vuelo no encontrado")
+
+    ucon = _get_users_con()
+    try:
+        ucon.execute(
+            """INSERT INTO user_saved_flights
+                 (username, fa_flight_id, ident_iata, origin, dest,
+                  scheduled_out_utc, saved_at_utc)
+               VALUES (?,?,?,?,?,?, strftime('%Y-%m-%dT%H:%M:%SZ','now'))
+               ON CONFLICT(username, fa_flight_id) DO NOTHING""",
+            (username, fila["fa_flight_id"], fila["ident_iata"], fila["origin"],
+             fila["dest"], fila["scheduled_out_utc"]),
+        )
+        ucon.commit()
+    finally:
+        ucon.close()
+    _upload_users_db()
+    return {"ok": True}
+
+
+@app.delete("/users/me/flights/{fa_flight_id:path}")
+def unsave_flight(request: Request, fa_flight_id: str):
+    username = _payload_of(request).get("sub")
+    ucon = _get_users_con()
+    try:
+        ucon.execute(
+            "DELETE FROM user_saved_flights WHERE username=? AND fa_flight_id=?",
+            (username, fa_flight_id),
+        )
+        ucon.commit()
+    finally:
+        ucon.close()
+    _upload_users_db()
+    return {"ok": True}
+
+
+# Umbrales de severidad del clima, en las unidades que ya guarda `weather_obs`.
+#
+# Son los que usa el propio pipeline para marcar sus banderas, así que la
+# pantalla y el modelo coinciden en qué cuenta como mal tiempo.
+WX_VIS_ALTA_SM = 1.0      # por debajo: alto
+WX_VIS_MEDIA_SM = 3.0     # por debajo: medio
+WX_VIENTO_ALTO_KT = 30.0
+WX_VIENTO_MEDIO_KT = 20.0
+
+
+def _severidad_clima(fila) -> tuple[str, list[str]]:
+    """Clasifica una observación en alto / medio / bajo, con sus motivos."""
+    motivos: list[str] = []
+    alto = medio = False
+
+    vis = fila["vsby"]
+    if vis is not None:
+        if vis < WX_VIS_ALTA_SM:
+            alto = True; motivos.append(f"visibilidad {vis:.1f} SM")
+        elif vis < WX_VIS_MEDIA_SM:
+            medio = True; motivos.append(f"visibilidad {vis:.1f} SM")
+
+    viento = max(fila["sknt"] or 0.0, fila["gust"] or 0.0)
+    if viento >= WX_VIENTO_ALTO_KT:
+        alto = True; motivos.append(f"viento {viento:.0f} kt")
+    elif viento >= WX_VIENTO_MEDIO_KT:
+        medio = True; motivos.append(f"viento {viento:.0f} kt")
+
+    if fila["wx_precip_flag"]:
+        medio = True; motivos.append("precipitación")
+
+    return ("alto" if alto else "medio" if medio else "bajo"), motivos
+
+
+@app.get("/weather/alerts")
+def weather_alerts(severity: str = "high", max_age_minutes: int = 180):
+    """Aeropuertos con mal tiempo ahora, de peor a mejor.
+
+    `severity` filtra: `high` solo los graves, `medium` graves y moderados,
+    `all` todos los que tengan observación fresca.
+
+    Se mira solo la observación más reciente de cada estación y se descarta lo
+    viejo: un METAR de hace seis horas no describe el clima de ahora, y una
+    alerta sobre dato vencido es peor que no mostrarla.
+    """
+    pedido = (severity or "high").strip().lower()
+    if pedido not in {"high", "medium", "all"}:
+        raise HTTPException(status_code=400,
+                            detail="severity debe ser high, medium o all")
+    edad = max(15, min(int(max_age_minutes), 24 * 60))
+
+    con = get_db()
+    try:
+        filas = con.execute(
+            """SELECT w.station, w.valid_utc, w.vsby, w.sknt, w.gust, w.tmpc,
+                      w.wxcodes, w.wx_precip_flag, w.wx_low_vis_flag,
+                      w.wx_strong_wind_flag
+                 FROM weather_obs w
+                 JOIN (SELECT station, MAX(valid_utc) ultima
+                         FROM weather_obs GROUP BY station) u
+                   ON u.station = w.station AND u.ultima = w.valid_utc
+                WHERE datetime(w.valid_utc) > datetime('now', ?)""",
+            (f"-{edad} minutes",),
+        ).fetchall()
+    finally:
+        con.close()
+
+    orden = {"alto": 0, "medio": 1, "bajo": 2}
+    admitidos = ({"alto"} if pedido == "high"
+                 else {"alto", "medio"} if pedido == "medium"
+                 else {"alto", "medio", "bajo"})
+
+    salida = []
+    for fila in filas:
+        nivel, motivos = _severidad_clima(fila)
+        if nivel not in admitidos:
+            continue
+        salida.append({
+            "airport_code":     fila["station"],
+            "valid_utc":        fila["valid_utc"],
+            "severity":         nivel,
+            "reasons":          motivos,
+            "visibility_miles": fila["vsby"],
+            "wind_knots":       fila["sknt"],
+            "gust_knots":       fila["gust"],
+            "temperature_c":    fila["tmpc"],
+            "wx_codes":         fila["wxcodes"],
+        })
+    salida.sort(key=lambda a: (orden[a["severity"]], a["airport_code"]))
+    return salida
 
 
 # ── Protected routes ────────────────────────────────────────────────────────
