@@ -1622,16 +1622,41 @@ def list_saved_flights(request: Request):
     con = get_db()
     try:
         marcas = ",".join("?" * len(ids))
+        # Las columnas son EXACTAMENTE las de `_latest_predictions_active`,
+        # porque `_flight_row_to_dict` las lee por nombre y revienta con
+        # `IndexError: No item with that key` si falta una. La primera version
+        # de esta consulta traia `f.*` y omitia `has_actual`, que es calculada:
+        # el POST guardaba bien, el GET devolvia 500, y el frontend lo
+        # escondia mostrando "Guardar" otra vez.
         for fila in con.execute(
-            f"""SELECT f.*, p.proba_delay, p.predicted_delay, p.threshold_used,
-                       p.predicted_at_utc, a.arr_delay_min,
-                       a.fa_flight_id AS actual_id
+            f"""SELECT f.fa_flight_id,
+                       f.ident_iata,
+                       f.op_carrier,
+                       f.flight_number,
+                       f.origin,
+                       f.dest,
+                       f.scheduled_out_utc,
+                       f.scheduled_in_utc,
+                       f.estimated_out_utc,
+                       f.estimated_in_utc,
+                       f.aircraft_type,
+                       p.proba_delay,
+                       p.predicted_delay,
+                       p.threshold_used,
+                       p.predicted_at_utc,
+                       CASE WHEN a.arr_delay_min IS NOT NULL THEN 1 ELSE 0 END AS has_actual,
+                       a.arr_delay_min,
+                       a.departure_delay_min,
+                       a.actual_out_utc,
+                       a.actual_off_utc,
+                       a.actual_on_utc,
+                       a.actual_in_utc
                   FROM flights f
-                  JOIN (SELECT fa_flight_id, proba_delay, predicted_delay,
-                               threshold_used, predicted_at_utc,
-                               ROW_NUMBER() OVER (PARTITION BY fa_flight_id
-                                   ORDER BY predicted_at_utc DESC) rn
-                          FROM predictions) p
+                  JOIN (SELECT p2.fa_flight_id, p2.proba_delay, p2.predicted_delay,
+                               p2.threshold_used, p2.predicted_at_utc,
+                               ROW_NUMBER() OVER (PARTITION BY p2.fa_flight_id
+                                   ORDER BY p2.predicted_at_utc DESC) rn
+                          FROM predictions p2) p
                     ON p.fa_flight_id = f.fa_flight_id AND p.rn = 1
                   LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
                  WHERE f.fa_flight_id IN ({marcas})""",
