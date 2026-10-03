@@ -481,32 +481,138 @@ class SavedFlightCreate(BaseModel):
 # ── Feature labels ─────────────────────────────────────────────────────────
 
 FEATURE_LABELS: dict[str, str] = {
-    "prev_arr_delay_tail":      "Demora previa del avión",
-    "prev_turnaround_tail_min": "Tiempo en tierra previo",
-    "tail_flights_today_prior": "Vuelos previos del avión hoy",
-    "carrier_delay_rate_yday":  "Tasa demora aerolínea ayer",
-    "origin_delay_rate_yday":   "Tasa demora origen ayer",
-    "origin_delay_rate_1h":     "Tasa demora origen (1h)",
-    "origin_delay_rate_6h":     "Tasa demora origen (6h)",
-    "origin_delay_rate_24h":    "Tasa demora origen (24h)",
-    "dest_delay_rate_1h":       "Tasa demora destino (1h)",
-    "dest_delay_rate_6h":       "Tasa demora destino (6h)",
-    "carrier_delay_rate_24h":   "Tasa demora aerolínea (24h)",
-    "carrier_delay_rate_7d":    "Tasa demora aerolínea (7d)",
-    "DISTANCE":                 "Distancia de vuelo",
-    "CRS_ELAPSED_TIME":         "Duración programada",
-    "AIRCRAFT_FAMILY":          "Tipo de aeronave",
-    "PAGERANK_ORIGIN":          "Importancia origen (red)",
-    "PAGERANK_DEST":            "Importancia destino (red)",
-    "TAIL_DELAY_DECAY":         "Historial demoras avión",
-    "tmpf_origin":              "Temperatura origen",
-    "sknt_origin":              "Viento origen",
-    "vsby_origin":              "Visibilidad origen",
-    "alti_origin":              "Presión origen",
-    "CRS_DEP_MIN_sin":          "Hora salida (cíclica)",
-    "CRS_DEP_MIN_cos":          "Hora salida (cíclica)",
-    "absorb_score":             "Capacidad absorción ATL",
-    "congestion_score":         "Congestión aeropuerto",
+    # Los nombres salen de consultar `prediction_shap` en produccion, no del
+    # codigo de entrenamiento. La version anterior tenia 26 entradas, de las
+    # cuales 11 apuntaban a features que el modelo no usa —`congestion_score`,
+    # `vsby_origin`, `CRS_DEP_MIN_sin`— mientras 38 de las 53 reales se
+    # quedaban sin etiqueta y caian al respaldo
+    # `feat.replace("_"," ").title()`, que las mostraba como "Dest Wx Dwpc" o
+    # "Congestion Orig Window". Medio ingles, medio tecnico, en la pantalla de
+    # operaciones.
+    #
+    # Si el modelo cambia de features, esto se actualiza mirando que nombres
+    # aparecen de verdad en `prediction_shap`.
+
+    # -- El avion y su rotacion --
+    "TAIL_DELAY_DECAY":          "Historial de demoras del avión",
+    "prev_turnaround_tail_min":  "Tiempo en tierra previo",
+    "prev_arr_delay_tail":       "Demora previa del avión",
+    "tail_flights_today_prior":  "Tramos previos del avión hoy",
+
+    # -- El vuelo --
+    "CRS_ELAPSED_TIME":          "Duración programada",
+    "DISTANCE":                  "Distancia",
+    "DEST":                      "Aeropuerto de destino",
+    "ORIGIN":                    "Aeropuerto de origen",
+    "PAR_AIRPORT":               "Par origen-destino",
+    "BEARING_DEG":               "Rumbo del vuelo",
+    "DEST_PAGERANK":             "Centralidad del destino (red)",
+    "AIRCRAFT_FAMILY":           "Familia de aeronave",
+    "OP_CARRIER":                "Aerolínea operadora",
+
+    # -- Hora y calendario --
+    "CRS_DEP_MIN":               "Hora de salida programada",
+    "dep_hour_sin":              "Hora de salida (cíclica, seno)",
+    "dep_hour_cos":              "Hora de salida (cíclica, coseno)",
+    "dep_dow_sin":               "Día de la semana (cíclico)",
+    "dep_month_sin":             "Mes (cíclico)",
+    "DAY_OF_WEEK":               "Día de la semana",
+    "DAY_OF_MONTH":              "Día del mes",
+
+    # -- Congestion --
+    "congestion_orig_window":    "Congestión en origen (ventana)",
+    "congestion_dest_window":    "Congestión en destino (ventana)",
+    "absorb_score_origin":       "Capacidad de absorción en origen",
+
+    # -- Como viene el dia --
+    "origin_delay_rate_1h":      "Tasa demora origen (1 h)",
+    "origin_delay_rate_6h":      "Tasa demora origen (6 h)",
+    "origin_delay_rate_24h":     "Tasa demora origen (24 h)",
+    "dest_delay_rate_1h":        "Tasa demora destino (1 h)",
+    "dest_delay_rate_6h":        "Tasa demora destino (6 h)",
+    "dest_delay_rate_24h":       "Tasa demora destino (24 h)",
+    "carrier_delay_rate_24h":    "Tasa demora aerolínea (24 h)",
+    "carrier_delay_rate_7d":     "Tasa demora aerolínea (7 d)",
+    "carrier_delay_rate_yday":   "Tasa demora aerolínea (ayer)",
+
+    # -- Clima en origen --
+    "ORIG_WX_VSBY":              "Visibilidad en origen",
+    "ORIG_WX_SKNT":              "Viento en origen",
+    "ORIG_WX_CODES":             "Fenómenos METAR en origen",
+    "ORIG_WX_P01M":              "Precipitación en origen",
+    "ORIG_WX_TMPC":              "Temperatura en origen",
+    "ORIG_WX_DWPC":              "Punto de rocío en origen",
+    "ORIG_WX_RELH":              "Humedad en origen",
+    "ORIG_WX_ALTI":              "Presión en origen",
+    "ORIG_WX_MATCH_GAP_MIN":     "Antigüedad del METAR de origen",
+
+    # -- Clima en destino --
+    "DEST_WX_VSBY":              "Visibilidad en destino",
+    "DEST_WX_SKNT":              "Viento en destino",
+    "DEST_WX_GUST":              "Ráfagas en destino",
+    "DEST_WX_CODES":             "Fenómenos METAR en destino",
+    "DEST_WX_P01M":              "Precipitación en destino",
+    "DEST_WX_PRECIP_FLAG":       "Precipitación en destino (bandera)",
+    "DEST_WX_TMPC":              "Temperatura en destino",
+    "DEST_WX_DWPC":              "Punto de rocío en destino",
+    "DEST_WX_RELH":              "Humedad en destino",
+    "DEST_WX_ALTI":              "Presión en destino",
+    "DEST_WX_MATCH_GAP_MIN":     "Antigüedad del METAR de destino",
+
+    # -- Viento en ruta --
+    "ERA5_HEADWIND_KT":          "Viento de frente en ruta",
+    "ERA5_U_KT":                 "Componente zonal del viento",
+
+    # -- Las 30 que faltaban. Se completan contra `feature_cols` del artefacto,
+    #    que es la lista autoritativa: `prediction_shap` solo guarda el top 15
+    #    de cada prediccion, asi que una feature real puede no aparecer nunca
+    #    ahi y parecer inexistente. --
+
+    # Tramo anterior del mismo avion, via ADS-B
+    "PREV_ACTUAL_BLOCK_MIN":     "Duración real del tramo previo",
+    "PREV_SCHED_BLOCK_MIN":      "Duración programada del tramo previo",
+    "PREV_BLOCK_DELTA_MIN":      "Desvío del tramo previo",
+    "PREV_HOLDING_MIN":          "Espera en el aire del tramo previo",
+    "PREV_ROUTE_DEVIATION_PCT":  "Desvío de ruta del tramo previo",
+    "PREV_ADSB_AVAILABLE":       "Había ADS-B del tramo previo",
+
+    # Red y flujo
+    "ORIGIN_PAGERANK":           "Centralidad del origen (red)",
+    "FLOW_ATL":                  "Flujo de operaciones en ATL",
+
+    # Calendario
+    "MONTH":                     "Mes",
+    "dep_dow_cos":               "Día de la semana (cíclico, coseno)",
+    "dep_month_cos":             "Mes (cíclico, coseno)",
+    "is_us_holiday":             "Feriado en EE.UU.",
+    "is_summer_peak":            "Pico de verano",
+    "is_thanksgiving_window":    "Ventana de Acción de Gracias",
+    "days_to_nearest_holiday":   "Días al feriado más cercano",
+
+    # Tasa de demora que faltaba
+    "origin_delay_rate_yday":    "Tasa demora origen (ayer)",
+
+    # Clima en origen que faltaba
+    "ORIG_WX_DRCT":              "Dirección del viento en origen",
+    "ORIG_WX_GUST":              "Ráfagas en origen",
+    "ORIG_WX_LOW_VIS_FLAG":      "Visibilidad baja en origen (bandera)",
+    "ORIG_WX_PRECIP_FLAG":       "Precipitación en origen (bandera)",
+    "ORIG_WX_STRONG_WIND_FLAG":  "Viento fuerte en origen (bandera)",
+
+    # Clima en destino que faltaba
+    "DEST_WX_DRCT":              "Dirección del viento en destino",
+    "DEST_WX_LOW_VIS_FLAG":      "Visibilidad baja en destino (bandera)",
+    "DEST_WX_STRONG_WIND_FLAG":  "Viento fuerte en destino (bandera)",
+
+    # Clima malo en los dos extremos a la vez
+    "wx_both_low_vis":           "Visibilidad baja en ambos extremos",
+    "wx_both_precip":            "Precipitación en ambos extremos",
+    "wx_both_strong_wind":       "Viento fuerte en ambos extremos",
+
+    # Viento en ruta que faltaba
+    "ERA5_CROSSWIND_KT":         "Viento cruzado en ruta",
+    "ERA5_V_KT":                 "Componente meridional del viento",
+    "ERA5_TAILWIND_FLAG":        "Viento de cola en ruta (bandera)",
 }
 
 # ── App ────────────────────────────────────────────────────────────────────
