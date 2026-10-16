@@ -8,10 +8,16 @@ Este documento describe el proyecto, la infraestructura de producción, los patr
 
 **Tesis de grado — UCC Grupo 9.** Sistema de predicción en tiempo real de retrasos de vuelos en el aeropuerto Hartsfield-Jackson Atlanta (ATL/KATL).
 
-- **Modelo**: LightGBM v9 (`4year_v9`), calibrado con datos live (`4year_v9_recal`). Entrenado sobre dataset BTS full-US 2021-2024. ~69 features. AUC test ≈ 0.847, AUC live ≈ 0.718 (gap por distributional shift).
+- **Modelo**: LightGBM v9 (`4year_v9`). El artefacto activo es ese; la calibración viva es aparte (ver abajo). Entrenado sobre dataset BTS full-US 2021-2024. ~69 features. AUC test ≈ 0.847, AUC live ≈ 0.718 (gap por distributional shift).
 - **Definición de retraso**: `arr_delay_min > 15` minutos (estándar DOT/BTS).
 - **Umbral**: estrategia `quantile@0.22` — se recalcula en cada ciclo para mantener ~22% de predicciones positivas.
-- **Dato live**: FlightAware AeroAPI v4. Clave en Secret Manager (`aeroapi-key`).
+- **Dato live**: el harvester de FlightRadar24 (`OnTimeAI-Scrapper`), seleccionado con
+  `LIVE_DATA_SOURCE=harvester` en el job. AeroAPI v4 quedó como camino alternativo
+  —la clave sigue en Secret Manager (`aeroapi-key`)— pero no es la fuente que corre.
+- **Calibración**: la hace `ontimeai/chain_calibration.py`, que vive en la base y se
+  reajusta cada ciclo con los últimos 30 días. **Los artefactos `*_recal` son residuos
+  de un enfoque anterior y no hay que activarlos**: un corrector congelado corrige en
+  la dirección equivocada (medido: ECE 0,0164 sin `4year_v9_recal`, 0,0490 con él).
 
 ---
 
@@ -29,7 +35,7 @@ Este documento describe el proyecto, la infraestructura de producción, los patr
 │   ├── ontimeai/model.py      ← carga de artefactos, predict_proba
 │   ├── predict.py             ← prepare_inference_frame()
 │   ├── artifacts/4year_v9/    ← modelo activo (booster + calibrador)
-│   ├── artifacts/4year_v9_recal/ ← idem, calibrado con live actuals
+│   ├── artifacts/4year_v9_recal/ ← residuo, NO activar (ver sección 1)
 │   ├── live_data.db           ← SQLite bundleado (fallback arranque)
 │   ├── Dockerfile             ← imagen del backend API
 │   ├── Dockerfile.job         ← imagen del live job
@@ -47,7 +53,7 @@ Este documento describe el proyecto, la infraestructura de producción, los patr
 
 ## 3. Infraestructura GCP
 
-**Proyecto GCP**: `ontimeai`
+**Proyecto GCP**: `ontimeai-prod`
 **Región**: `us-central1`
 **Service Account predeterminada**: `{PROJECT_NUMBER}-compute@developer.gserviceaccount.com`
 
@@ -59,7 +65,7 @@ Este documento describe el proyecto, la infraestructura de producción, los patr
 | Backend (Cloud Run) | `ontimeai-backend` | `https://ontimeai-backend-hq7henvhjq-uc.a.run.app` |
 | Live job (Cloud Run Job) | `ontimeai-live-pull` | — |
 | Scheduler | `ontimeai-pull-scheduler` | `*/30 * * * *` (cada 30 min) |
-| Base de datos | GCS Bucket `ontimeai-live-db` | `gs://ontimeai-live-db/live_data.db` |
+| Base de datos | GCS Bucket `ontimeai-prod-live-db` | `gs://ontimeai-prod-live-db/live_data.db` |
 | AeroAPI key | Secret Manager | `aeroapi-key:latest` |
 
 ### 3.2 Recursos por servicio
@@ -74,7 +80,7 @@ Este documento describe el proyecto, la infraestructura de producción, los patr
 
 SQLite en GCS. Flujo:
 
-1. **Live job** descarga `gs://ontimeai-live-db/live_data.db` → `/tmp/live_data.db`
+1. **Live job** descarga `gs://ontimeai-prod-live-db/live_data.db` → `/tmp/live_data.db`
 2. Ejecuta `live_pull.py` (pipeline completo)
 3. Sube el archivo modificado de vuelta a GCS
 4. **Backend** (api.py) refresca su copia local desde GCS cada 30 min (`_DB_REFRESH_INTERVAL = 1800`). En startup descarga inmediatamente.
@@ -95,7 +101,13 @@ SQLite en GCS. Flujo:
 
 ## 4. Pipeline live (live_pull.py)
 
-Se ejecuta cada 30 min. Pasos en orden:
+Se ejecuta cada 30 min. Pasos en orden.
+
+> **Los pasos 1 a 4 describen el camino de AeroAPI, que NO es el que corre.** Con
+> `LIVE_DATA_SOURCE=harvester` los vuelos y los actuals los trae el harvester de FR24
+> (job `ontimeai-harvester`, cada 15 min, repo `OnTimeAI-Scrapper`), que pide el tablero
+> de KATL con marcas de tiempo futuras. `live_pull.py` se queda con la inferencia.
+> El harvester no está documentado acá todavía.
 
 1. **AeroAPI scheduled_departures** — vuelos saliendo de KATL en las próximas **6 horas** (`--schedule-hours 6`)
 2. **AeroAPI scheduled_arrivals** — vuelos llegando a KATL en las próximas 6 horas
@@ -106,7 +118,7 @@ Se ejecuta cada 30 min. Pasos en orden:
 7. **INSERT predictions** — guarda en SQLite, sube a GCS
 
 **Variables de entorno del job:**
-- `GCS_BUCKET=ontimeai-live-db`
+- `GCS_BUCKET=ontimeai-prod-live-db`
 - `ACTIVE_MODEL=4year_v9`
 - `AEROAPI_KEY` — desde Secret Manager
 
@@ -224,10 +236,10 @@ Todos usan `cache: "no-store"` — no hay caché del navegador ni de Next.js.
 ./deploy.sh --job        # solo Cloud Run Job + scheduler
 ```
 
-Requiere `gcloud` autenticado con el proyecto `ontimeai`:
+Requiere `gcloud` autenticado con el proyecto `ontimeai-prod`:
 ```bash
 gcloud auth login
-gcloud config set project ontimeai
+gcloud config set project ontimeai-prod
 ```
 
 ### Qué hace deploy.sh
@@ -243,27 +255,27 @@ gcloud config set project ontimeai
 
 ```bash
 # Ver logs del último ciclo del job
-gcloud run jobs executions list --job ontimeai-live-pull --region us-central1 --project ontimeai
+gcloud run jobs executions list --job ontimeai-live-pull --region us-central1 --project ontimeai-prod
 
 # Ver logs de una ejecución específica
 gcloud logging read "resource.type=cloud_run_job AND resource.labels.job_name=ontimeai-live-pull" \
-  --project ontimeai --limit 100 --format "value(textPayload)"
+  --project ontimeai-prod --limit 100 --format "value(textPayload)"
 
 # Cuántos ciclos corrieron
-gcloud run jobs describe ontimeai-live-pull --region us-central1 --project ontimeai
+gcloud run jobs describe ontimeai-live-pull --region us-central1 --project ontimeai-prod
 
 # Estado de los servicios
-gcloud run services list --platform managed --region us-central1 --project ontimeai
+gcloud run services list --platform managed --region us-central1 --project ontimeai-prod
 
 # Verificar DB en GCS
-gsutil ls -l gs://ontimeai-live-db/
+gsutil ls -l gs://ontimeai-prod-live-db/
 
 # Descargar DB para inspección local
-gsutil cp gs://ontimeai-live-db/live_data.db /tmp/live_data.db
+gsutil cp gs://ontimeai-prod-live-db/live_data.db /tmp/live_data.db
 sqlite3 /tmp/live_data.db "SELECT COUNT(*) FROM predictions; SELECT COUNT(*) FROM actuals;"
 
 # Forzar ejecución del job manualmente
-gcloud run jobs execute ontimeai-live-pull --region us-central1 --project ontimeai
+gcloud run jobs execute ontimeai-live-pull --region us-central1 --project ontimeai-prod
 ```
 
 ---
@@ -302,14 +314,14 @@ gcloud run jobs execute ontimeai-live-pull --region us-central1 --project ontime
 | Atributo | Valor |
 |---|---|
 | Algoritmo | LightGBM (binary classification) |
-| Artefacto activo | `4year_v9` (sin calibrar) / `4year_v9_recal` (calibrado) |
+| Artefacto activo | `4year_v9`. **No activar los `*_recal`** — ver la nota de calibración en la sección 1 |
 | Features | ~69 (v9 incluye BEARING_DEG, AIRCRAFT_FAMILY, PageRank, GDP_FLAG) |
 | Target | `arr_delay_min > 15` → 1 (demorado), 0 (a tiempo) |
 | Entrenamiento | BTS full-US 2021-2024 (~4 años, ~10M filas) |
 | AUC test | 0.847 |
 | AUC live | ~0.718 (distributional shift: ATL-only vs full-US) |
 | Brier score live | ~0.143 |
-| Calibración | IsotonicRegression sobre 2,266 actuals live (v9_recal, 2026-05-12) |
+| Calibración | `ontimeai/chain_calibration.py`, isotónico sobre `proba_chain`, reajustado cada ciclo con 30 días (~1.825 vuelos) |
 | Umbral | `quantile@0.22` recalculado cada ciclo sobre el batch target |
 | Actuals acumulados | >12,000 (desde 2026-05-19) |
 
