@@ -396,8 +396,35 @@ JWT_SECRET = _require_secret("JWT_SECRET_KEY")
 JWT_ALGORITHM = "HS256"
 JWT_EXPIRE_HOURS = 8
 
-# Google sign-in: audience the ID token must be issued for. Empty disables /auth/google.
-GOOGLE_CLIENT_ID = os.getenv("GOOGLE_CLIENT_ID", "")
+# Google sign-in: las audiencias que un ID token puede declarar. Vacio
+# deshabilita /auth/google.
+#
+# Son varias porque cada plataforma usa su propio cliente OAuth y el `aud` del
+# token es el client ID de ESA plataforma: web, iOS (por bundle id) y Android
+# (por package name y SHA-1 de la clave de firma). Con una sola audiencia, el
+# login nativo falla con "ID token de Google invalido" aunque el token sea
+# legitimo. Ver Frontend #46.
+#
+# `GOOGLE_CLIENT_IDS` acepta una lista separada por comas. Se mantiene
+# `GOOGLE_CLIENT_ID` como nombre alternativo para no romper el entorno que ya
+# esta desplegado con esa variable.
+def _audiencias_de_google(entorno=None) -> tuple[str, ...]:
+    """Resuelve las audiencias permitidas desde el entorno.
+
+    Es una funcion y no una expresion al margen para poder probarla sin
+    recargar el modulo. Recargarlo resetea `DB_PATH` y todo lo demas que las
+    fixtures redirigen, y los tests que corren despues terminan buscando la
+    base real: en CI eso fallaba con `FileNotFoundError: /tmp/live_data.db`
+    mientras en local pasaba, porque ese archivo existia de una descarga.
+    """
+    e = os.environ if entorno is None else entorno
+    crudo = e.get("GOOGLE_CLIENT_IDS") or e.get("GOOGLE_CLIENT_ID", "")
+    return tuple(c for c in (x.strip() for x in crudo.split(",")) if c)
+
+
+GOOGLE_CLIENT_IDS: tuple[str, ...] = _audiencias_de_google()
+# Compatibilidad: algun codigo y los tests viejos leen el nombre en singular.
+GOOGLE_CLIENT_ID = GOOGLE_CLIENT_IDS[0] if GOOGLE_CLIENT_IDS else ""
 
 # Firebase Authentication: el proyecto contra el que se valida el ID token.
 #
@@ -1180,8 +1207,18 @@ def login(body: LoginRequest):
 
 
 def _verify_google_id_token(raw_token: str) -> dict:
-    """Validate a Google ID token against our client ID. Raises HTTPException."""
-    if not GOOGLE_CLIENT_ID:
+    """Valida un ID token de Google contra las audiencias permitidas.
+
+    La audiencia NO se le pasa a `verify_oauth2_token`: esa funcion compara
+    `aud` por igualdad contra un unico valor, asi que una lista nunca casa.
+    Se verifica firma, emisor y vencimiento sin audiencia, y el `aud` se
+    compara aca contra `GOOGLE_CLIENT_IDS`.
+
+    Ese cambio mueve una comprobacion de seguridad de la libreria a este
+    codigo, asi que la lista vacia tiene que rechazar todo —no aceptar
+    cualquier audiencia— y hay un test para eso.
+    """
+    if not GOOGLE_CLIENT_IDS:
         raise HTTPException(503, "Login con Google no está configurado en este entorno")
     try:
         from google.auth.transport import requests as google_requests
@@ -1190,10 +1227,14 @@ def _verify_google_id_token(raw_token: str) -> dict:
         raise HTTPException(503, "Dependencia google-auth no instalada")
     try:
         claims = google_id_token.verify_oauth2_token(
-            raw_token, google_requests.Request(), GOOGLE_CLIENT_ID
+            raw_token, google_requests.Request()
         )
     except ValueError as e:
         raise HTTPException(401, f"ID token de Google inválido: {e}")
+    if claims.get("aud") not in GOOGLE_CLIENT_IDS:
+        # Sin esta comprobacion, un token legitimo emitido para CUALQUIER
+        # cliente de Google serviria para entrar.
+        raise HTTPException(401, "El ID token no fue emitido para esta aplicación")
     if not claims.get("email"):
         raise HTTPException(401, "El ID token no incluye email")
     if not claims.get("email_verified"):
