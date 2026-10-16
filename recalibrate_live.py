@@ -1,5 +1,29 @@
 """Re-calibra un modelo con las predicciones live ya asentadas.
 
+SUPERADO POR `ontimeai/chain_calibration.py`. No generes artefactos con esto
+para ponerlos en producción.
+
+Lo que sirve hoy es el calibrador post-cadena: vive en la base, se reajusta
+cada ciclo con los últimos 30 días y se apaga si no puede hacerlo bien. Este
+script produce un artefacto CONGELADO, y un corrector que no se actualiza
+corrige en la dirección equivocada: medido, `4year_v9_recal` —del 06/08— deja
+el ECE en 0,0490 cuando sin él es 0,0164.
+
+Los artefactos `*_recal` del repo son residuos de este enfoque, no modelos
+para activar vía `ACTIVE_MODEL`.
+
+Queda por dos razones. La primera es que el script ya existía y alguien podía
+correrlo y generar un artefacto malo sin enterarse: ahora hay un control fuera
+de muestra que se niega a guardar si el recalibrado no mejora sobre datos no
+vistos (ver el paso 5b). Fue exactamente esa puerta la que dejó pasar el
+artefacto del 06/08, que declaraba AUC 0,9063 —inflado por el bug de selección
+que elegía la predicción más optimista de cada vuelo—.
+
+La segunda es que `ontimeai/validacion_calibrado.py`, que salió de acá, sirve
+para juzgar cualquier recalibrado caminando cortes hacia adelante, incluido el
+post-cadena.
+
+
 Uso habitual:
     # v9 recalibration (default):
     python3 recalibrate_live.py
@@ -13,6 +37,33 @@ Uso habitual:
 
 El script ajusta un isotonic calibrador de segunda capa sobre las probabilidades
 ya calibradas que se almacenan en live_data.db, produciendo un StackedCalibrator.
+
+OJO AL APILAR: `--source-artifact` tiene que ser el artefacto que PRODUJO las
+predicciones de las que se aprende, o sea el `ACTIVE_MODEL` que estaba corriendo
+en la ventana de `--since`.
+
+El calibrador de segunda capa se ajusta sobre `proba_delay`, que es la salida
+del calibrador del artefacto activo. Si se pasa como fuente un artefacto
+distinto, el resultado aplica una capa que espera una entrada que nunca va a
+recibir, y queda roto sin avisar.
+
+No hay forma de detectarlo desde la base: no se registra qué artefacto generó
+cada predicción —`predictions` no tiene columna de versión y `runs` tampoco— y
+comparar `cal1(proba_raw)` contra `proba_delay` no sirve porque hay ajustes
+posteriores a la calibración (estado del día, GDP, cadena): medido el 11/10 la
+diferencia media es 0,032 y solo el 0,1% coincide. Hasta que exista esa
+columna, la correspondencia es responsabilidad de quien corre el script.
+
+Por qué se apila en vez de reemplazar: ajustar una capa única directo sobre
+`proba_raw` es más simple y no tiene esta trampa, pero sale peor. Medido fuera
+de muestra el 11/10 sobre los mismos 9 cortes:
+
+    produccion (sin recalibrar)   Brier 0,0914  AUC 0,7289  gana   -
+    apilado sobre proba_delay     Brier 0,0882  AUC 0,7240  gana 9/9
+    desde cero sobre proba_raw    Brier 0,0897  AUC 0,7179  gana 3/9
+
+El calibrador del artefacto hace trabajo que va más allá de mover el nivel, y
+reemplazarlo pierde esa información.
 """
 from __future__ import annotations
 
@@ -28,6 +79,8 @@ from sklearn.calibration import calibration_curve
 from sklearn.metrics import brier_score_loss, roc_auc_score
 
 from ontimeai.calibration import Calibrator, StackedCalibrator, fit_calibrator
+from ontimeai.validacion_calibrado import (
+    caminar_cortes, elegir_threshold, veredicto)
 from ontimeai.live import open_db
 from ontimeai.model import load_artifact, save_artifact
 from ontimeai.config import ARTIFACTS_DIR
@@ -74,14 +127,32 @@ def main() -> int:
     p.add_argument("--since", default="2026-05-15 01:43",
                    help="Only use predictions at or after this UTC timestamp (ISO format). "
                         "Default: v9 deploy time. Use '2000-01-01' for all predictions.")
-    p.add_argument("--min-n", type=int, default=200,
+    p.add_argument("--min-n", type=int, default=2000,
                    help="Número mínimo de predicciones asentadas para recalibrar")
+    # 200 era demasiado bajo para isotonic. En el camino de cortes del 11/10,
+    # ajustar con 305 vuelos empeoraba el Brier de 0,0506 a 0,0662 y con 1.253
+    # de 0,0725 a 0,0742; el primer corte que mejora ajusta con 2.006. Con
+    # muestra chica el isotónico sí sobreajusta, que era la advertencia del
+    # comentario que eligió sigmoid —correcta en ese régimen, no en este—.
     p.add_argument("--delay-threshold-min", type=float, default=15.0,
                    help="Umbral de retraso en minutos para clasificación binaria")
     p.add_argument("--target-pos-rate", type=float, default=0.22,
                    help="Tasa positiva objetivo para recalcular threshold")
     p.add_argument("--dry-run", action="store_true",
                    help="Solo muestra métricas, no guarda el artifact")
+    p.add_argument("--method", choices=("isotonic", "sigmoid"), default="isotonic",
+                   help="Familia del calibrador de segunda capa. Isotonic por "
+                        "medición fuera de muestra; ver el comentario en el paso 3.")
+    p.add_argument("--horizonte-dias", type=int, default=2,
+                   help="Días de vuelos que se evalúan después de cada corte")
+    p.add_argument("--minimo-ganados", type=float, default=0.7,
+                   help="Fracción de cortes que el recalibrado debe ganar para "
+                        "que se guarde")
+    p.add_argument("--sin-control", action="store_true",
+                   help="Salta el control fuera de muestra (no recomendado)")
+    p.add_argument("--force", action="store_true",
+                   help="Guarda aunque el control fuera de muestra salga peor "
+                        "que no recalibrar")
     p.add_argument("--strategy-filter", default=None,
                    help="Filtrar por threshold_strategy (e.g. 'artifact_batch_v7'). "
                         "Por defecto usa todas las predicciones.")
@@ -164,11 +235,28 @@ def main() -> int:
     print(cal_before.to_string(index=False))
 
     # ---- 3. ajustar calibrador sobre datos live ----
-    # Usamos sigmoid (Platt scaling) en lugar de isotonic: solo 2 parámetros,
-    # no colapsa rankings ni destruye AUC con muestras limitadas (<10k).
-    # Isotonic puede overfittear con pocas muestras mapeando distintos scores
-    # al mismo valor, perdiendo el orden relativo entre vuelos.
-    live_cal = fit_calibrator(y_proba_live, y_true, method="sigmoid")
+    # Isotonic, no sigmoid.
+    #
+    # Acá decía: "Usamos sigmoid (Platt scaling) en lugar de isotonic: solo 2
+    # parámetros, no colapsa rankings ni destruye AUC con muestras limitadas
+    # (<10k). Isotonic puede overfittear con pocas muestras". El razonamiento
+    # es plausible y la medición dice lo contrario. `evaluar_recalibrado.py`,
+    # caminando 9 cortes sobre 16.483 vuelos de prueba fuera de muestra:
+    #
+    #     estrategia    Brier     AUC     ECE   media   real
+    #     cruda        0.0914  0.7289  0.0515    5.9%  10.9%
+    #     isotonic     0.0882  0.7240  0.0152    9.6%  10.9%
+    #     sigmoid      0.0948  0.6539  0.0208    9.2%  10.9%
+    #
+    # Isotonic le gana a la cruda en 9 de 9 cortes; sigmoid en 2 de 9. Y es
+    # sigmoid el que destroza el AUC —0,654 contra 0,729—, no isotonic, que
+    # pierde 0,005. Con 12.413 vuelos asentados no estamos en el régimen de
+    # pocas muestras que motivaba la elección.
+    #
+    # Medido también: ajustar sobre ventana móvil de 3, 5 o 7 días empata con
+    # usar todo el histórico (0,0882 contra 0,0882). No vale la complejidad;
+    # la retención de `predictions` ya acota el histórico a 14 días.
+    live_cal = fit_calibrator(y_proba_live, y_true, method=args.method)
     y_proba_recal = live_cal.transform(y_proba_live)
 
     # ---- 4. métricas DESPUÉS ----
@@ -185,11 +273,56 @@ def main() -> int:
     print(cal_after.to_string(index=False))
 
     # ---- 5. nuevo threshold ----
-    # Threshold at the (1 - target_pos_rate) quantile of recalibrated probabilities.
-    new_threshold = float(np.quantile(y_proba_recal, 1 - args.target_pos_rate))
+    #
+    # El cuantil directo no sirve con isotonic. El calibrador mapea tramos
+    # enteros de score al mismo valor, así que el cuantil cae DENTRO de un
+    # bloque de probabilidades idénticas y `>=` se lleva el bloque completo.
+    # Medido: cuantil al 0,78 sobre 12.413 vuelos daba threshold 0,0886 y una
+    # tasa positiva de 34,5% con objetivo 22%.
+    #
+    # Se elige el corte entre los valores efectivamente presentes que deje la
+    # tasa positiva más cerca del objetivo.
+    new_threshold = elegir_threshold(y_proba_recal, args.target_pos_rate)
     actual_pos_rate = (y_proba_recal >= new_threshold).mean()
     print(f"\nNuevo threshold (target_pos_rate={args.target_pos_rate}): {new_threshold:.4f}")
     print(f"Pos rate real con nuevo threshold: {actual_pos_rate:.3f}")
+
+    # ---- 5b. control fuera de muestra ----
+    #
+    # Las métricas de arriba son EN MUESTRA: el calibrador vio las respuestas
+    # con que se lo juzga, así que el Brier no puede empeorar y el ECE del
+    # isotónico da exactamente 0,0000. Fue por esa puerta que pasó
+    # `4year_v9_recal`, el artefacto que nadie activó porque en producción
+    # empujaba la media a 4,5% contra una tasa real de 12,7%.
+    #
+    # Se camina sobre varios cortes en vez de reservar un holdout único: el
+    # veredicto de un holdout cambia de signo según cuántos días se reserven,
+    # porque el recalibrado ayuda los días con demoras y casi nada los calmos.
+    # Ver `ontimeai/validacion_calibrado.py`.
+    cortes: list = []
+    resumen_control = "omitido (--sin-control)"
+    if not args.sin_control:
+        cortes = caminar_cortes(
+            df["scheduled_out_utc"], y_true, y_proba_live,
+            metodo=args.method, horizonte_dias=args.horizonte_dias,
+            min_ajuste=args.min_n,
+        )
+        ok, resumen = veredicto(cortes, minimo_ganados=args.minimo_ganados)
+        resumen_control = resumen
+        print(f"\n--- Control fuera de muestra ({len(cortes)} cortes) ---")
+        for c in cortes:
+            marca = "mejora" if c.mejora else "PEOR"
+            print(f"  {c.fecha:%d/%m}  ajuste {c.n_ajuste:>6,}  prueba {c.n_prueba:>5,}  "
+                  f"Brier {c.brier_cruda:.4f} -> {c.brier_recal:.4f}  {marca}")
+        print(f"  {resumen}")
+        if not ok:
+            print("  VEREDICTO: no se guarda.")
+            if not args.force:
+                print("  Usá --force si querés guardarlo igual.")
+                return 1
+            print("  --force: se guarda de todos modos.")
+        else:
+            print("  VEREDICTO: mejora sobre datos no vistos.")
 
     if args.dry_run:
         print("\n[dry-run] No se guarda el artifact.")
@@ -250,6 +383,25 @@ def main() -> int:
         },
         "new_threshold": new_threshold,
         "target_pos_rate": args.target_pos_rate,
+        "method": args.method,
+        # Lo de arriba es EN MUESTRA y por sí solo no dice nada: el isotónico
+        # llega a ECE 0,0000 contra los datos con que se ajustó. Esta sección
+        # es la que hay que mirar para decidir si activarlo.
+        "fuera_de_muestra": {
+            "resumen": resumen_control,
+            "n_cortes": len(cortes),
+            "cortes_ganados": sum(c.mejora for c in cortes),
+            "brier_cruda": round(float(np.mean([c.brier_cruda for c in cortes])), 4)
+                           if cortes else None,
+            "brier_recal": round(float(np.mean([c.brier_recal for c in cortes])), 4)
+                           if cortes else None,
+            "detalle": [
+                {"corte": f"{c.fecha:%Y-%m-%d}", "n_ajuste": c.n_ajuste,
+                 "n_prueba": c.n_prueba, "brier_cruda": round(c.brier_cruda, 4),
+                 "brier_recal": round(c.brier_recal, 4)}
+                for c in cortes
+            ],
+        },
     }
     (out_dir / "recal_report.json").write_text(json.dumps(report, indent=2))
 
