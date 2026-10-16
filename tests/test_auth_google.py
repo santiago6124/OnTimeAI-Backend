@@ -216,29 +216,27 @@ def test_la_lista_vacia_rechaza_todo_y_no_acepta_cualquier_cosa(client, monkeypa
     assert r.status_code == 503
 
 
-def test_la_variable_en_singular_sigue_funcionando(monkeypatch) -> None:
+def test_la_variable_en_singular_sigue_funcionando() -> None:
     """El entorno desplegado define `GOOGLE_CLIENT_ID`. Si el arranque solo
     leyera `GOOGLE_CLIENT_IDS`, el login con Google se caeria al desplegar."""
-    import importlib
-
-    monkeypatch.delenv("GOOGLE_CLIENT_IDS", raising=False)
-    monkeypatch.setenv("GOOGLE_CLIENT_ID", "solo-uno.apps.googleusercontent.com")
-    recargado = importlib.reload(api)
-    try:
-        assert recargado.GOOGLE_CLIENT_IDS == ("solo-uno.apps.googleusercontent.com",)
-    finally:
-        monkeypatch.undo()
-        importlib.reload(api)
+    assert api._audiencias_de_google(
+        {"GOOGLE_CLIENT_ID": "solo-uno.apps.googleusercontent.com"}
+    ) == ("solo-uno.apps.googleusercontent.com",)
 
 
-def test_la_lista_se_separa_por_comas_y_tolera_espacios(monkeypatch) -> None:
-    import importlib
+def test_el_plural_le_gana_al_singular() -> None:
+    assert api._audiencias_de_google({
+        "GOOGLE_CLIENT_IDS": "a.apps.googleusercontent.com",
+        "GOOGLE_CLIENT_ID": "vieja.apps.googleusercontent.com",
+    }) == ("a.apps.googleusercontent.com",)
 
-    monkeypatch.setenv("GOOGLE_CLIENT_IDS", " a.apps.googleusercontent.com , b.apps.googleusercontent.com ,, ")
-    recargado = importlib.reload(api)
-    try:
-        assert recargado.GOOGLE_CLIENT_IDS == (
-            "a.apps.googleusercontent.com", "b.apps.googleusercontent.com")
-    finally:
-        monkeypatch.undo()
-        importlib.reload(api)
+
+def test_la_lista_se_separa_por_comas_y_tolera_espacios() -> None:
+    assert api._audiencias_de_google({
+        "GOOGLE_CLIENT_IDS": " a.apps.googleusercontent.com , b.apps.googleusercontent.com ,, "
+    }) == ("a.apps.googleusercontent.com", "b.apps.googleusercontent.com")
+
+
+def test_un_entorno_sin_nada_no_deja_audiencias() -> None:
+    assert api._audiencias_de_google({}) == ()
+    assert api._audiencias_de_google({"GOOGLE_CLIENT_ID": "   "}) == ()
