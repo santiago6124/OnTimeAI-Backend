@@ -408,13 +408,21 @@ JWT_EXPIRE_HOURS = 8
 # `GOOGLE_CLIENT_IDS` acepta una lista separada por comas. Se mantiene
 # `GOOGLE_CLIENT_ID` como nombre alternativo para no romper el entorno que ya
 # esta desplegado con esa variable.
-GOOGLE_CLIENT_IDS: tuple[str, ...] = tuple(
-    c for c in (
-        x.strip()
-        for x in (os.getenv("GOOGLE_CLIENT_IDS") or os.getenv("GOOGLE_CLIENT_ID", "")).split(",")
-    )
-    if c
-)
+def _audiencias_de_google(entorno=None) -> tuple[str, ...]:
+    """Resuelve las audiencias permitidas desde el entorno.
+
+    Es una funcion y no una expresion al margen para poder probarla sin
+    recargar el modulo. Recargarlo resetea `DB_PATH` y todo lo demas que las
+    fixtures redirigen, y los tests que corren despues terminan buscando la
+    base real: en CI eso fallaba con `FileNotFoundError: /tmp/live_data.db`
+    mientras en local pasaba, porque ese archivo existia de una descarga.
+    """
+    e = os.environ if entorno is None else entorno
+    crudo = e.get("GOOGLE_CLIENT_IDS") or e.get("GOOGLE_CLIENT_ID", "")
+    return tuple(c for c in (x.strip() for x in crudo.split(",")) if c)
+
+
+GOOGLE_CLIENT_IDS: tuple[str, ...] = _audiencias_de_google()
 # Compatibilidad: algun codigo y los tests viejos leen el nombre en singular.
 GOOGLE_CLIENT_ID = GOOGLE_CLIENT_IDS[0] if GOOGLE_CLIENT_IDS else ""
 
