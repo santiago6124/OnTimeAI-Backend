@@ -12,9 +12,9 @@ Sistema de predicción de retrasos de vuelos en tiempo real para el aeropuerto A
 
 | Servicio | URL |
 |---------|-----|
-| Frontend | https://ontimeai-frontend-hq7henvhjq-uc.a.run.app |
-| Backend API | https://ontimeai-backend-hq7henvhjq-uc.a.run.app |
-| Swagger docs | https://ontimeai-backend-hq7henvhjq-uc.a.run.app/docs |
+| Frontend | https://ontimeai-frontend-ldcqq4xt6a-uc.a.run.app |
+| Backend API | https://ontimeai-backend-ldcqq4xt6a-uc.a.run.app |
+| Swagger docs | https://ontimeai-backend-ldcqq4xt6a-uc.a.run.app/docs |
 | DB bucket | gs://ontimeai-live-db/live_data.db |
 
 ---
