@@ -61,8 +61,8 @@ Este documento describe el proyecto, la infraestructura de producción, los patr
 
 | Recurso | Nombre GCP | URL / Referencia |
 |---|---|---|
-| Frontend (Cloud Run) | `ontimeai-frontend` | `https://ontimeai-frontend-hq7henvhjq-uc.a.run.app` |
-| Backend (Cloud Run) | `ontimeai-backend` | `https://ontimeai-backend-hq7henvhjq-uc.a.run.app` |
+| Frontend (Cloud Run) | `ontimeai-frontend` | `https://ontimeai-frontend-ldcqq4xt6a-uc.a.run.app` |
+| Backend (Cloud Run) | `ontimeai-backend` | `https://ontimeai-backend-ldcqq4xt6a-uc.a.run.app` |
 | Live job (Cloud Run Job) | `ontimeai-live-pull` | — |
 | Scheduler | `ontimeai-pull-scheduler` | `*/30 * * * *` (cada 30 min) |
 | Base de datos | GCS Bucket `ontimeai-prod-live-db` | `gs://ontimeai-prod-live-db/live_data.db` |
@@ -126,7 +126,7 @@ Se ejecuta cada 30 min. Pasos en orden.
 
 ## 5. Backend API (api.py)
 
-**Base URL**: `https://ontimeai-backend-hq7henvhjq-uc.a.run.app`
+**Base URL**: `https://ontimeai-backend-ldcqq4xt6a-uc.a.run.app`
 **Docs interactivos**: `/docs` (Swagger UI)
 
 ### Autenticación
@@ -173,7 +173,7 @@ GET  /test-cases                         → CP-01, CP-02 (casos de prueba forma
 
 ## 6. Frontend (Next.js 16 App Router)
 
-**URL**: `https://ontimeai-frontend-hq7henvhjq-uc.a.run.app`
+**URL**: `https://ontimeai-frontend-ldcqq4xt6a-uc.a.run.app`
 **Framework**: Next.js 16.2.4 con Turbopack. React 19. Tailwind v4. shadcn/ui.
 
 ### Páginas y estado actual

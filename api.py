@@ -652,11 +652,21 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="OnTimeAI API", version="1.0.0", lifespan=lifespan)
 # Auth is inner; CORS is outer so it wraps 401 responses too
 app.add_middleware(AuthMiddleware)
+# El default solo aplica si `ALLOWED_ORIGINS` no esta en el entorno. En
+# produccion esta puesta, asi que esto no se usa alla; importa para un
+# despliegue nuevo o para correr local.
+#
+# Tenia la URL del proyecto `ontimeai`, que ya no existe —su facturacion esta
+# dada de baja—, y NO tenia la del proyecto que corre. Un despliegue que no
+# definiera la variable habria rechazado por CORS al frontend real.
 _ALLOWED_ORIGINS = [
     o.strip()
     for o in os.getenv(
         "ALLOWED_ORIGINS",
-        "http://localhost:3000,http://127.0.0.1:3000,https://ontimeai-frontend-hq7henvhjq-uc.a.run.app,https://ontimeai-frontend-150917658060.us-central1.run.app",
+        "http://localhost:3000,http://127.0.0.1:3000,"
+        "https://ontimeai-frontend-ldcqq4xt6a-uc.a.run.app,"
+        "https://ontimeai-frontend-871707213932.us-central1.run.app,"
+        "capacitor://localhost",
     ).split(",")
     if o.strip()
 ]
