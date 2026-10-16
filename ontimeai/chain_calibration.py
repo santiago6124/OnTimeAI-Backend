@@ -119,7 +119,35 @@ def _training_rows(con: sqlite3.Connection, window_days: int) -> list[tuple[floa
             SELECT p.proba_chain,
                    CASE WHEN a.arr_delay_min > ? THEN 1 ELSE 0 END AS y
               FROM predictions p
-              JOIN actuals a ON a.stable_id = p.stable_id
+              -- Por `fa_flight_id`, no por `stable_id`.
+              --
+              -- `predictions.stable_id` se escribe con el id SINTETICO que el
+              -- harvester le pone a un vuelo futuro —`SYN-DL4970-ATL-ABE-...`—
+              -- y no se actualiza cuando el vuelo recibe su id real. En
+              -- `actuals.stable_id` vale el id real. El join no casaba.
+              --
+              -- Medido el 16/10 sobre 306.512 predicciones: por `stable_id`
+              -- encontraban su actual 3.913 (1,3%); por `fa_flight_id`,
+              -- 297.928 (97%). El 98,7% de los `stable_id` de `predictions`
+              -- son SYN-*. Y ninguna prediccion casa SOLO por `stable_id`, asi
+              -- que cambiar la clave no pierde nada.
+              --
+              -- El efecto no era que el calibrador se apagara: ajustaba con
+              -- ~1.825 vuelos y creia estar bien. Esa muestra tiene tasa real
+              -- 6,1% con probabilidades medias de 11,6%, mientras la poblacion
+              -- real tiene 9,5% y 9,6%. O sea que aprendia a empujar fuerte
+              -- para abajo y aplicaba esa correccion a todos.
+              --
+              -- Fuera de muestra, evaluado sobre la poblacion completa:
+              --
+              --     ajustado con            Brier    media    real   gana
+              --     la muestra (como antes) 0,0707     4,1%    7,9%    8/9
+              --     la poblacion completa   0,0690     8,8%    7,9%    9/9
+              --     sin calibrar            0,0725     8,0%    7,9%      -
+              --
+              -- El calibrador era la CAUSA de que la probabilidad servida
+              -- quedara 1,9 veces por debajo de la realidad.
+              JOIN actuals a ON a.fa_flight_id = p.fa_flight_id
              WHERE p.proba_chain IS NOT NULL
                AND a.arr_delay_min IS NOT NULL
                AND COALESCE(a.cancelled, 0) = 0
@@ -127,8 +155,12 @@ def _training_rows(con: sqlite3.Connection, window_days: int) -> list[tuple[floa
                AND p.predicted_at_utc >= datetime('now', ?)
                AND COALESCE(p.prediction_phase, '') IS NOT 'POST_LANDING'
                AND p.predicted_at_utc = (
+                     -- Misma razon: agrupando por `stable_id`, las primeras
+                     -- predicciones de un vuelo (con id SYN) y las posteriores
+                     -- (con el real) caian en grupos distintos y el vuelo
+                     -- aportaba dos "ultimas" en vez de una.
                      SELECT MAX(p2.predicted_at_utc) FROM predictions p2
-                      WHERE p2.stable_id = p.stable_id
+                      WHERE p2.fa_flight_id = p.fa_flight_id
                         AND p2.proba_chain IS NOT NULL
                         AND COALESCE(p2.prediction_phase, '') IS NOT 'POST_LANDING')
             """,
