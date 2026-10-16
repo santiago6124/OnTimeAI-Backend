@@ -90,6 +90,42 @@ def quantile_threshold(proba: np.ndarray, target_pos_rate: float) -> float:
     Robust to monotone shifts in the raw probability distribution (the typical
     failure mode in production cold-start). Requires no ground-truth labels —
     only the proba distribution of the batch being scored.
+
+    No usa `np.quantile`, y la diferencia importa desde que el calibrador
+    post-cadena entró en servicio. Un isotónico mapea tramos enteros de puntaje
+    al MISMO valor, así que el cuantil cae dentro de un bloque de probabilidades
+    idénticas y `>= threshold` se lleva el bloque completo. La tasa positiva se
+    desborda.
+
+    Medido sobre 9 ciclos de producción del 15/10, con objetivo 0,22:
+
+        0,222  0,249  0,257  0,259  0,268  0,276  0,286  0,289  0,542
+
+    Promedio 0,294: el tablero marcaba en promedio 29% de los vuelos como
+    demorados en vez de 22%, y en el peor ciclo 54%.
+
+    En vez del cuantil se evalúa la tasa en cada valor presente y se toma el
+    corte que menos se aparta del objetivo. Sin empates coincide con el cuantil;
+    con empates elige el borde del bloque en vez de su interior.
+
+    Medido sobre 482 lotes y 122.295 vuelos del 06 al 11/10:
+
+                 media   |error|    máx   lotes con error > 0,05
+        antes    0,398     0,178   0,717                     80%
+        después  0,192     0,063   0,202                     54%
+
+    Queda un error de 0,063 y NO es un bug: con 7 a 11 valores distintos por
+    lote, el 22% exacto no siempre es alcanzable. No mejora con lotes más
+    grandes —el error va de 0,059 a 0,068 entre lotes de 50 y de 250+— porque
+    lo que escasea son valores, no vuelos.
+
+    Se evaluó cerrarlo desempatando dentro del bloque por `proba_chain`, que es
+    continua. Se descartó: no aporta ranking —AUC 0,6298 contra 0,6297 sobre
+    136.559 vuelos, ruido— y obliga a elegir entre romper que la etiqueta sea
+    reproducible desde el umbral (`scripts/analyze_adjustment_chain.py` estudia
+    justamente los vuelos que la cadena empuja por encima del corte) o a
+    perturbar la probabilidad que se muestra. No vale ninguna de las dos por
+    acercarse a una convención operativa.
     """
     if proba.ndim != 1:
         raise ValueError("quantile_threshold expects 1-D probability array")
@@ -98,7 +134,11 @@ def quantile_threshold(proba: np.ndarray, target_pos_rate: float) -> float:
     finite = proba[np.isfinite(proba)]
     if finite.size == 0:
         return 0.5
-    return float(np.quantile(finite, 1.0 - target_pos_rate))
+    candidatos = np.unique(finite)
+    ordenada = np.sort(finite)
+    # Tasa positiva de `>= c` para cada candidato, de una sola pasada.
+    tasas = 1.0 - np.searchsorted(ordenada, candidatos, side="left") / finite.size
+    return float(candidatos[int(np.argmin(np.abs(tasas - target_pos_rate)))])
 
 
 def select_threshold(
