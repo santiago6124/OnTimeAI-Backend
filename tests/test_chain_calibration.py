@@ -255,3 +255,81 @@ class TestIndicesDeLaFila:
             assert columnas[i] == columna, (
                 f"{nombre}={i} apunta a `{columnas[i]}`, deberia ser `{columna}`"
             )
+
+
+class TestClaveDeUnion:
+    """El join tiene que ser por `fa_flight_id`, no por `stable_id`.
+
+    `predictions.stable_id` se escribe con el id SINTETICO que el harvester le
+    pone a un vuelo futuro —`SYN-DL4970-ATL-ABE-2026-10-14`— y no se actualiza
+    cuando el vuelo recibe su id real. En `actuals.stable_id` vale el id real.
+
+    Medido en produccion el 16/10 sobre 306.512 predicciones: por `stable_id`
+    encontraban su actual 3.913 (1,3%); por `fa_flight_id`, 297.928 (97%). El
+    98,7% de los `stable_id` de `predictions` empiezan con `SYN-`.
+
+    El efecto no era que el calibrador se apagara —eso se habria notado—: se
+    ajustaba con ~1.825 vuelos y se declaraba sano. Esa muestra tenia tasa real
+    6,1% con probabilidades medias de 11,6%, contra 9,5% y 9,6% en la poblacion
+    real, asi que aprendia a empujar fuerte para abajo. Fuera de muestra dejaba
+    la probabilidad servida en 4,1% contra una realidad de 7,9%.
+
+    La fixture `_sembrar` escribe `stable_id = fa_flight_id`, que es la forma
+    del 1,3% que casaba. Por eso los tests pasaban con el join roto.
+    """
+
+    @staticmethod
+    def _sembrar_como_produccion(con, n=800, *, exagera=2.5):
+        """La forma real: SYN en predictions, id real en actuals."""
+        rng = np.random.default_rng(20261016)
+        cuando = (datetime.now(timezone.utc) - timedelta(days=1)).isoformat()
+        for i in range(n):
+            real = float(rng.uniform(0.02, 0.35))
+            cadena = min(real * exagera, 0.99)
+            y = 1 if rng.random() < real else 0
+            fid = f"F{i:05d}"
+            syn = f"SYN-DL{i:04d}-ATL-MIA-2026-10-14"
+            con.execute("INSERT INTO predictions VALUES (?,?,?,?,?,?)",
+                        (fid, syn, cuando, cadena, cadena, "PRE_DEPARTURE"))
+            con.execute("INSERT INTO actuals VALUES (?,?,?,?,?,?)",
+                        (fid, fid, 40.0 if y else 2.0, 0, 0, cuando))
+        con.commit()
+
+    def test_encuentra_los_vuelos_con_stable_id_sintetico(self, con) -> None:
+        self._sembrar_como_produccion(con, 800)
+        muestras = cc._training_rows(con, window_days=30)
+        assert len(muestras) == 800, (
+            f"encontro {len(muestras)} de 800: el join esta usando stable_id, "
+            "que en predictions trae el id sintetico")
+
+    def test_se_ajusta_con_la_forma_de_produccion(self, con) -> None:
+        """Con el join roto, 800 vuelos se veian como 0 y no se ajustaba nada."""
+        self._sembrar_como_produccion(con, 800)
+        assert cc.fit_chain_calibrator(con, min_samples=500) is not None
+
+    def test_un_vuelo_aporta_una_sola_muestra(self, con) -> None:
+        """Agrupando por `stable_id`, las primeras predicciones de un vuelo (con
+        id SYN) y las posteriores (ya con el real) caen en grupos distintos y el
+        vuelo aporta DOS "ultimas" en vez de una, con el doble de peso."""
+        ahora = datetime.now(timezone.utc)
+        for h, sid in ((6, "SYN-DL0001-ATL-MIA-2026-10-14"), (2, "F00000")):
+            con.execute(
+                "INSERT INTO predictions VALUES (?,?,?,?,?,?)",
+                ("F00000", sid, (ahora - timedelta(hours=h)).isoformat(),
+                 0.5, 0.5, "PRE_DEPARTURE"))
+        con.execute("INSERT INTO actuals VALUES (?,?,?,?,?,?)",
+                    ("F00000", "F00000", 40.0, 0, 0, ahora.isoformat()))
+        con.commit()
+        assert len(cc._training_rows(con, window_days=30)) == 1
+
+    def test_ninguna_prediccion_casa_solo_por_stable_id(self, con) -> None:
+        """Medido en produccion: cero. Por eso cambiar la clave no pierde nada,
+        y este test lo deja escrito para que nadie lo revierta por las dudas."""
+        self._sembrar_como_produccion(con, 100)
+        solo_por_stable = con.execute(
+            """SELECT COUNT(*) FROM predictions p
+                JOIN actuals a ON a.stable_id = p.stable_id
+               WHERE NOT EXISTS(
+                     SELECT 1 FROM actuals a2 WHERE a2.fa_flight_id = p.fa_flight_id)"""
+        ).fetchone()[0]
+        assert solo_por_stable == 0
