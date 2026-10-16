@@ -8,11 +8,28 @@ persistir agregados —kilobytes por semana— fuera del ciclo de purga. Ver #12
 from __future__ import annotations
 
 import sqlite3
+from datetime import datetime, timedelta, timezone
 
 import pytest
 
 from ontimeai import rollup
 from ontimeai.live import SCHEMA
+
+
+# Las fechas van ancladas al reloj, no escritas a mano.
+#
+# `compute_daily_rollup` filtra `scheduled_out_utc >= datetime('now', ?)` con
+# `DEFAULT_DAYS_BACK = 35`. Con una fecha fija el test se vence solo con el
+# calendario: estos pasaban el 11/10 y 15 de ellos empezaron a fallar el 15/10
+# sin que nadie tocara el codigo, porque 2026-09-10 quedo a 35 dias exactos y
+# salio de la ventana. El sintoma era `StopIteration`: el rollup no devolvia
+# ninguna fila y el test parecia roto por otra causa.
+#
+# Diez dias atras deja margen para los seis dias de separacion que algunos
+# casos necesitan entre si.
+_BASE = datetime.now(timezone.utc).date() - timedelta(days=10)
+DIA = _BASE.isoformat()
+DIA_SIG = (_BASE + timedelta(days=1)).isoformat()
 
 
 @pytest.fixture
@@ -23,7 +40,7 @@ def con() -> sqlite3.Connection:
     return c
 
 
-def _vuelo(con, fid, *, day="2026-09-10", hour="12", carrier="DL",
+def _vuelo(con, fid, *, day=DIA, hour="12", carrier="DL",
            proba=0.1, flagged=0, threshold=0.09, arr_delay=None,
            cancelled=0, diverted=0, phase="PRE_DEPARTURE", predicted_at=None):
     sched = f"{day}T{hour}:00:00+00:00"
@@ -90,13 +107,13 @@ class TestUnidadDeAgregacion:
         entro en el ultimo.
         """
         _vuelo(con, "A", proba=0.9, flagged=1, arr_delay=40,
-               predicted_at="2026-09-10T08:00:00+00:00")
+               predicted_at=f"{DIA}T08:00:00+00:00")
         for h in ("09", "10", "11"):
             con.execute(
                 "INSERT INTO predictions (fa_flight_id, stable_id, predicted_at_utc,"
                 " proba_delay, predicted_delay, threshold_used, prediction_phase)"
                 " VALUES (?,?,?,?,?,?,?)",
-                ("A", "A", f"2026-09-10T{h}:00:00+00:00", 0.5, 1, 0.09, "PRE_DEPARTURE"),
+                ("A", "A", f"{DIA}T{h}:00:00+00:00", 0.5, 1, 0.09, "PRE_DEPARTURE"),
             )
         con.commit()
 
@@ -105,19 +122,19 @@ class TestUnidadDeAgregacion:
 
     def test_toma_la_ultima_prediccion_anterior_al_aterrizaje(self, con) -> None:
         _vuelo(con, "A", proba=0.20, flagged=1, arr_delay=40,
-               predicted_at="2026-09-10T08:00:00+00:00")
+               predicted_at=f"{DIA}T08:00:00+00:00")
         con.execute(
             "INSERT INTO predictions (fa_flight_id, stable_id, predicted_at_utc,"
             " proba_delay, predicted_delay, threshold_used, prediction_phase)"
             " VALUES (?,?,?,?,?,?,?)",
-            ("A", "A", "2026-09-10T11:00:00+00:00", 0.60, 1, 0.09, "PRE_DEPARTURE"),
+            ("A", "A", f"{DIA}T11:00:00+00:00", 0.60, 1, 0.09, "PRE_DEPARTURE"),
         )
         # Posterior al aterrizaje: no la vio nadie, no cuenta.
         con.execute(
             "INSERT INTO predictions (fa_flight_id, stable_id, predicted_at_utc,"
             " proba_delay, predicted_delay, threshold_used, prediction_phase)"
             " VALUES (?,?,?,?,?,?,?)",
-            ("A", "A", "2026-09-10T23:00:00+00:00", 0.99, 1, 0.09, "POST_LANDING"),
+            ("A", "A", f"{DIA}T23:00:00+00:00", 0.99, 1, 0.09, "POST_LANDING"),
         )
         con.commit()
 
@@ -139,10 +156,10 @@ class TestSegmentos:
         assert por["hour:17"]["n_flights"] == 1
 
     def test_separa_por_dia(self, con) -> None:
-        _vuelo(con, "A", day="2026-09-10", arr_delay=40)
-        _vuelo(con, "B", day="2026-09-11", arr_delay=1)
+        _vuelo(con, "A", day=DIA, arr_delay=40)
+        _vuelo(con, "B", day=DIA_SIG, arr_delay=1)
         dias = {f["day"] for f in rollup.compute_daily_rollup(con) if f["segment"] == "all"}
-        assert dias == {"2026-09-10", "2026-09-11"}
+        assert dias == {DIA, DIA_SIG}
 
 
 class TestMetricas:
@@ -353,8 +370,8 @@ class TestSegmentosPorFase:
     def test_un_vuelo_aporta_a_las_dos_fases(self, con) -> None:
         # Antes de salir el modelo le daba poco; ya en el aire, mucho.
         _vuelo(con, "A", proba=0.10, flagged=0, arr_delay=40,
-               phase="PRE_DEPARTURE", predicted_at="2026-09-10T09:00:00+00:00")
-        _prediccion_extra(con, "A", predicted_at="2026-09-10T13:00:00+00:00",
+               phase="PRE_DEPARTURE", predicted_at=f"{DIA}T09:00:00+00:00")
+        _prediccion_extra(con, "A", predicted_at=f"{DIA}T13:00:00+00:00",
                           proba=0.90, flagged=1, phase="EN_ROUTE")
 
         filas = {f["segment"]: f for f in rollup.compute_daily_rollup(con)}
@@ -368,8 +385,8 @@ class TestSegmentosPorFase:
         dos.
         """
         _vuelo(con, "A", proba=0.10, arr_delay=40, phase="PRE_DEPARTURE",
-               predicted_at="2026-09-10T09:00:00+00:00")
-        _prediccion_extra(con, "A", predicted_at="2026-09-10T13:00:00+00:00",
+               predicted_at=f"{DIA}T09:00:00+00:00")
+        _prediccion_extra(con, "A", predicted_at=f"{DIA}T13:00:00+00:00",
                           proba=0.90, flagged=1, phase="EN_ROUTE")
 
         filas = {f["segment"]: f for f in rollup.compute_daily_rollup(con)}
@@ -378,8 +395,8 @@ class TestSegmentosPorFase:
 
     def test_toma_la_ultima_de_cada_fase_no_la_primera(self, con) -> None:
         _vuelo(con, "A", proba=0.20, arr_delay=40, phase="PRE_DEPARTURE",
-               predicted_at="2026-09-10T08:00:00+00:00")
-        _prediccion_extra(con, "A", predicted_at="2026-09-10T10:00:00+00:00",
+               predicted_at=f"{DIA}T08:00:00+00:00")
+        _prediccion_extra(con, "A", predicted_at=f"{DIA}T10:00:00+00:00",
                           proba=0.55, flagged=1, phase="PRE_DEPARTURE")
 
         filas = {f["segment"]: f for f in rollup.compute_daily_rollup(con)}
@@ -391,8 +408,8 @@ class TestSegmentosPorFase:
         inflaria las metricas con algo que nadie llego a usar.
         """
         _vuelo(con, "A", proba=0.30, arr_delay=40, phase="PRE_DEPARTURE",
-               predicted_at="2026-09-10T09:00:00+00:00")
-        _prediccion_extra(con, "A", predicted_at="2026-09-10T20:00:00+00:00",
+               predicted_at=f"{DIA}T09:00:00+00:00")
+        _prediccion_extra(con, "A", predicted_at=f"{DIA}T20:00:00+00:00",
                           proba=0.99, flagged=1, phase="POST_LANDING")
 
         filas = {f["segment"]: f for f in rollup.compute_daily_rollup(con)}
@@ -496,3 +513,19 @@ class TestBreakdown:
     def test_sin_datos_devuelve_vacio_y_no_rompe(self, api_con_base) -> None:
         api, _ = api_con_base
         assert api.metrics_breakdown(by="carrier", days=3650)["rows"] == []
+
+
+def test_las_fechas_de_prueba_caen_dentro_de_la_ventana_del_rollup() -> None:
+    """Impide que estos tests se venzan solos con el calendario.
+
+    Sin esto, el 15/10 quince tests de este archivo empezaron a fallar con
+    `StopIteration` sin que nadie tocara el codigo: la fecha escrita a mano
+    quedo a 35 dias exactos y salio de la ventana de `compute_daily_rollup`.
+    El sintoma no apuntaba a la causa.
+    """
+    hoy = datetime.now(timezone.utc).date()
+    for etq, valor in (("DIA", DIA), ("DIA_SIG", DIA_SIG)):
+        dias = (hoy - datetime.fromisoformat(valor).date()).days
+        assert 0 <= dias < rollup.DEFAULT_DAYS_BACK, (
+            f"{etq}={valor} esta a {dias} dias y la ventana es de "
+            f"{rollup.DEFAULT_DAYS_BACK}")
