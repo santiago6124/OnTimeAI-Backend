@@ -195,3 +195,73 @@ def test_select_threshold_abs_adapts_positive_rate_to_conditions() -> None:
     calm_rate = (calm >= t_calm).mean()
     storm_rate = (storm >= t_storm).mean()
     assert calm_rate < 0.22 < storm_rate  # adapts; quantile@0.22 would pin both at 0.22
+
+
+# ---------------------------------------------------------------------------
+# Desborde de la tasa positiva por empates en el calibrador post-cadena
+# ---------------------------------------------------------------------------
+#
+# `quantile_threshold` usaba `np.quantile`, que asume una distribución sin
+# empates. El calibrador post-cadena es un isotónico y colapsa el lote en unos
+# pocos valores: medido el 15/10 sobre producción, 9 valores distintos para 242
+# vuelos. El cuantil cae DENTRO de un bloque de valores idénticos y `>=` se
+# lleva el bloque completo.
+#
+# Medido sobre 9 ciclos reales, con objetivo 0,22, la tasa que salía era:
+#
+#     0,222  0,249  0,257  0,259  0,268  0,276  0,286  0,289  0,542
+#
+# El tablero marcaba en promedio 29% de los vuelos como demorados en vez de
+# 22%, y en el peor ciclo 54%.
+
+
+def test_threshold_no_desborda_con_valores_empatados() -> None:
+    """El caso de producción: pocos valores distintos, bloques grandes."""
+    import numpy as np
+
+    from ontimeai.model import quantile_threshold
+
+    # Siete valores sobre 242 vuelos, con el reparto de un lote real: el
+    # cuantil al 0,78 cae en el índice 188, dentro del bloque de 0,05, y
+    # `>= 0,05` se lleva 92 vuelos (38%) cuando el objetivo es 22%. El borde
+    # siguiente, 0,08, deja 52 vuelos (21,5%), que es lo que había que elegir.
+    lote = np.repeat([0.02, 0.03, 0.05, 0.08, 0.12, 0.20, 0.35],
+                     [100, 50, 40, 25, 15, 8, 4])
+    t = quantile_threshold(lote, 0.22)
+    tasa = float((lote >= t).mean())
+
+    # Con nueve valores el 22% exacto no siempre es alcanzable; se exige que sea
+    # la tasa más cercana entre las posibles, no que coincida.
+    posibles = [float((lote >= v).mean()) for v in np.unique(lote)]
+    mejor = min(posibles, key=lambda x: abs(x - 0.22))
+    assert tasa == pytest.approx(mejor), (
+        f"eligió {tasa:.3f}; la más cercana al 22% era {mejor:.3f}")
+
+    # Y el punto del arreglo: el cuantil directo se desbordaba.
+    tasa_cuantil = float((lote >= float(np.quantile(lote, 0.78))).mean())
+    assert tasa_cuantil > tasa, (
+        "el escenario debe reproducir el desborde que motivó el cambio")
+
+
+def test_threshold_sin_empates_sigue_dando_el_cuantil() -> None:
+    """Sin empates el comportamiento no cambia, que es lo que protege a los
+    lotes servidos sin calibrador post-cadena."""
+    import numpy as np
+
+    from ontimeai.model import quantile_threshold
+
+    rng = np.random.default_rng(5)
+    lote = rng.random(4000)
+    t = quantile_threshold(lote, 0.22)
+    assert float((lote >= t).mean()) == pytest.approx(0.22, abs=0.01)
+
+
+def test_threshold_tolera_nan_y_lote_vacio() -> None:
+    import numpy as np
+
+    from ontimeai.model import quantile_threshold
+
+    assert quantile_threshold(np.array([np.nan, np.nan]), 0.22) == 0.5
+    lote = np.array([0.1, np.nan, 0.2, 0.3, np.inf])
+    t = quantile_threshold(lote, 0.5)
+    assert np.isfinite(t)
