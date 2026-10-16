@@ -2466,6 +2466,213 @@ def metrics_model():
     }
 
 
+def _tabla_existe(con, nombre: str) -> bool:
+    """Si la tabla está en la base que se está sirviendo.
+
+    `flight_estimate_log` la crea el harvester. La API puede estar sirviendo una
+    base que todavía no pasó por ahí —la bundleada en la imagen, que es el
+    fallback de arranque, o un snapshot viejo—, y referenciarla a secas tumba el
+    endpoint con `OperationalError: no such table`. Mismo razonamiento que
+    `_optional_prediction_column`.
+    """
+    fila = con.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=? LIMIT 1",
+        (nombre,),
+    ).fetchone()
+    return fila is not None
+
+
+# Cuánta demora tiene que publicar la aerolínea para que cuente como que
+# reconoció el problema. Quince minutos es el umbral del DOT, el mismo con el
+# que se define el target, así que una revisión de tres minutos no cuenta.
+MIN_DEMORA_PUBLICADA = 15
+
+# El issue pide el porcentaje de veces que avisamos "al menos 60 minutos antes".
+VENTAJA_OBJETIVO_MIN = 60
+
+
+@app.get("/metrics/lead-time")
+def metrics_lead_time(dias: int = 30):
+    """Cuánto antes avisa el modelo que la aerolínea.
+
+    Es el argumento central de la tesis, y hasta ahora no se podía calcular:
+    `flights.estimated_out_utc` guarda el estado actual y cada ciclo lo
+    sobreescribe, así que no había forma de saber CUÁNDO el carrier reconoció la
+    demora. El harvester empezó a registrarlo en `flight_estimate_log` el
+    16/10/2026; **no hay dato hacia atrás de esa fecha**.
+
+    Las dos marcas que se comparan:
+
+    - `modelo`: el primer ciclo en que la predicción quedó marcada
+      (`predicted_delay = 1`). Es cuándo el tablero lo mostró en riesgo, no
+      cuándo cruzó un umbral elegido para la métrica.
+    - `aerolínea`: la primera vez que publicó una hora estimada de salida más de
+      `MIN_DEMORA_PUBLICADA` minutos después de la programada.
+
+    Las dos cantidades NO son la misma cosa y conviene decirlo: el modelo
+    predice demora de LLEGADA y la aerolínea publica su estimación de SALIDA. La
+    comparación es la que enfrenta un pasajero —el tablero dice "a horario"
+    mientras el modelo ya marca riesgo— pero no es una medición del mismo
+    fenómeno, y no debería presentarse como tal.
+
+    Se cuenta solo sobre vuelos que efectivamente se demoraron: la ventaja de
+    haber avisado antes sobre un vuelo que salió bien no es una ventaja.
+    """
+    con = get_db()
+    if not _tabla_existe(con, "flight_estimate_log"):
+        return {
+            "disponible": False,
+            "motivo": "la base servida no tiene flight_estimate_log todavía",
+            "desde_utc": None,
+        }
+
+    desde = con.execute(
+        "SELECT MIN(observed_at_utc) FROM flight_estimate_log"
+    ).fetchone()[0]
+    if not desde:
+        return {
+            "disponible": False,
+            "motivo": "flight_estimate_log existe pero está vacía",
+            "desde_utc": None,
+        }
+
+    filas = con.execute(
+        f"""
+        WITH marcados AS (
+            SELECT p.fa_flight_id, MIN(p.predicted_at_utc) AS modelo_at
+              FROM predictions p
+             WHERE p.predicted_delay = 1
+               AND p.predicted_at_utc >= datetime('now', ?)
+             GROUP BY p.fa_flight_id
+        ),
+        publicadas AS (
+            SELECT l.fa_flight_id, MIN(l.observed_at_utc) AS aerolinea_at
+              FROM flight_estimate_log l
+              JOIN flights f ON f.fa_flight_id = l.fa_flight_id
+             WHERE l.estimated_out_utc IS NOT NULL
+               AND f.scheduled_out_utc IS NOT NULL
+               -- Las dos fechas van envueltas en `datetime()`. Sin eso se
+               -- comparan como texto, y la base mezcla 'T' y espacio como
+               -- separador: la comparación da cualquier cosa. Y restando
+               -- `julianday` el borde queda difuso —exactamente 15 minutos da
+               -- 15,0000000003 y colaba—.
+               AND datetime(l.estimated_out_utc)
+                   > datetime(f.scheduled_out_utc, '+{MIN_DEMORA_PUBLICADA} minutes')
+             GROUP BY l.fa_flight_id
+        ),
+        primeras AS (
+            SELECT p.fa_flight_id, MIN(p.predicted_at_utc) AS primera_at
+              FROM predictions p
+             GROUP BY p.fa_flight_id
+        )
+        SELECT f.fa_flight_id,
+               m.modelo_at,
+               pub.aerolinea_at,
+               CASE WHEN a.arr_delay_min > 15 THEN 1 ELSE 0 END AS demorado
+          FROM flights f
+          JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
+          JOIN primeras pr ON pr.fa_flight_id = f.fa_flight_id
+          LEFT JOIN marcados   m   ON m.fa_flight_id   = f.fa_flight_id
+          LEFT JOIN publicadas pub ON pub.fa_flight_id = f.fa_flight_id
+         WHERE f.origin = 'ATL'
+           AND a.cancelled = 0 AND a.diverted = 0
+           AND a.arr_delay_min IS NOT NULL
+           AND f.scheduled_out_utc >= datetime('now', ?)
+           -- Solo vuelos que el registro pudo haber cubierto enteros.
+           --
+           -- Sin esto, para todo vuelo anterior al 16/10 la aerolínea no tiene
+           -- marca simplemente porque no se estaba registrando, y el conteo de
+           -- puntos ciegos lo cuenta como si el carrier nunca hubiera avisado.
+           -- Medido contra la base real: daba 1.044 puntos ciegos sobre 1.757
+           -- vuelos demorados, un 59% que era puro dato faltante.
+           --
+           -- La condición es exacta: si la primera predicción del vuelo es
+           -- posterior al inicio del registro, cualquier revisión del carrier
+           -- habría quedado capturada.
+           AND datetime(pr.primera_at) >= datetime(?)
+        """,
+        (f"-{int(dias)} days", f"-{int(dias)} days", desde),
+    ).fetchall()
+
+    demorados = [r for r in filas if r["demorado"] == 1]
+    ventajas: list[float] = []
+    ciegos = 0
+    for r in demorados:
+        if not r["modelo_at"]:
+            continue
+        if r["aerolinea_at"]:
+            ventajas.append(
+                (_a_ts(r["aerolinea_at"]) - _a_ts(r["modelo_at"])).total_seconds() / 60.0
+            )
+        else:
+            # El modelo marcó y la aerolínea nunca publicó demora, pero el vuelo
+            # llegó tarde. Es el punto ciego que el issue pide contar.
+            ciegos += 1
+
+    if not ventajas:
+        return {
+            "disponible": False,
+            "motivo": ("todavía no hay vuelos demorados con las dos marcas; "
+                       "el registro empezó el 16/10/2026 y no hay dato anterior"),
+            "desde_utc": desde,
+            "n_vuelos_con_resultado": len(filas),
+            "n_demorados": len(demorados),
+            "n_puntos_ciegos": ciegos,
+        }
+
+    ventajas.sort()
+    n = len(ventajas)
+    ganadas = sum(1 for v in ventajas if v >= VENTAJA_OBJETIVO_MIN)
+    return {
+        "disponible": True,
+        "desde_utc": desde,
+        "dias": int(dias),
+        "n_vuelos_con_resultado": len(filas),
+        "n_demorados": len(demorados),
+        "n_comparables": n,
+        "ventaja_promedio_min": round(sum(ventajas) / n, 1),
+        "ventaja_mediana_min": round(ventajas[n // 2], 1),
+        "win_rate_60min": round(ganadas / n, 4),
+        "n_puntos_ciegos": ciegos,
+        "histograma": _histograma_ventaja(ventajas),
+        # Sin esto el número de arriba se lee como si midiera una sola cosa.
+        "advertencia": ("el modelo predice demora de llegada y la aerolínea "
+                        "publica su estimación de salida; no son la misma "
+                        "cantidad"),
+    }
+
+
+def _a_ts(valor: str):
+    """ISO a datetime con zona. La base mezcla 'T' y espacio como separador."""
+    from datetime import datetime, timezone
+
+    texto = str(valor).strip().replace(" ", "T", 1)
+    try:
+        t = datetime.fromisoformat(texto)
+    except ValueError:
+        t = datetime.fromisoformat(texto[:19])
+    return t if t.tzinfo else t.replace(tzinfo=timezone.utc)
+
+
+# Tramos de la distribución de ventaja. El negativo existe porque la aerolínea
+# puede ganarnos de mano, y esconderlo haría ver la métrica mejor de lo que es.
+TRAMOS_VENTAJA = (
+    (float("-inf"), 0, "la aerolínea avisó primero"),
+    (0, 30, "menos de 30 min"),
+    (30, 60, "30 a 60 min"),
+    (60, 120, "1 a 2 h"),
+    (120, 240, "2 a 4 h"),
+    (240, float("inf"), "más de 4 h"),
+)
+
+
+def _histograma_ventaja(ventajas: list[float]) -> list[dict]:
+    return [
+        {"tramo": etq, "n": sum(1 for v in ventajas if lo <= v < hi)}
+        for lo, hi, etq in TRAMOS_VENTAJA
+    ]
+
+
 @app.get("/metrics/classification")
 def metrics_classification():
     """Precision, recall, F1 y confusion matrix sobre predicciones con actuals (últimos 7 días)."""
