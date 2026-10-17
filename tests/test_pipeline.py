@@ -52,9 +52,20 @@ def test_run_training_multiclass_end_to_end(larger_master: pd.DataFrame, tmp_pat
     assert result.artifact_dir is not None
 
 
-def test_cascade_stub_raises() -> None:
-    from ontimeai.cascade import predict_cascade
-    import pytest
+def test_la_cascada_ya_no_es_un_esqueleto() -> None:
+    """Este test verificaba que `predict_cascade` levantara
+    `NotImplementedError`. La propagación por rotación está implementada desde
+    el 2026-10-17, con la tabla medida sobre 779.777 pares de BTS, así que lo
+    que corresponde comprobar es lo contrario: que proyecte.
 
-    with pytest.raises(NotImplementedError):
-        predict_cascade()
+    Las propiedades del modelo se prueban en `tests/test_cascada.py`.
+    """
+    from ontimeai.cascade import Pierna, proyectar_rotacion
+
+    proyeccion = proyectar_rotacion(
+        [Pierna("B", "ATL", "MIA", 600, 720)],
+        demora_llegada_inicial_min=45,
+        llegada_programada_inicial_min=540,
+    )
+    assert len(proyeccion) == 1
+    assert proyeccion[0].demora_salida_min > 0
