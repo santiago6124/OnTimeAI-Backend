@@ -2542,6 +2542,204 @@ MIN_DEMORA_PUBLICADA = 15
 VENTAJA_OBJETIVO_MIN = 60
 
 
+# De la probabilidad del modelo a minutos de demora esperados.
+#
+# La cascada necesita MINUTOS y el modelo da una probabilidad de cruzar 15
+# minutos, que no es lo mismo. Medido sobre 12.507 vuelos de ATL con resultado
+# real, tomando la última predicción antes de la salida programada:
+#
+#     proba      n       demora media
+#     0-5%     7.442        -13,6 min
+#     5-10%    3.750         -7,5
+#     10-20%     744          1,8
+#     20-35%     384          3,8
+#     35%+       187         26,8
+#
+# Casi todas las bandas dan demora NEGATIVA: con baja probabilidad los vuelos
+# llegan 13 a 16 minutos antes, porque el block time está acolchonado. Sólo la
+# última banda da demora que propaga, y tiene n chico.
+#
+# Se probó la descomposición `proba * E[demora|demorado] + (1-proba) *
+# E[demora|puntual]` y subestima: 11,3 estimado contra 26,1 observado en la
+# banda de 35-60%. E[demora|demorado] no es constante, crece con la
+# probabilidad. Por eso va la tabla medida y no la fórmula.
+BORDES_PROBA_CASCADA = (0.0, 0.05, 0.10, 0.20, 0.35, 1.01)
+DEMORA_ESPERADA_MIN = (-13.6, -7.5, 1.8, 3.8, 26.8)
+
+
+def _demora_esperada_de_proba(proba: float) -> float:
+    for i in range(len(BORDES_PROBA_CASCADA) - 1):
+        if proba < BORDES_PROBA_CASCADA[i + 1]:
+            return DEMORA_ESPERADA_MIN[i]
+    return DEMORA_ESPERADA_MIN[-1]
+
+
+def _a_minutos(valor: str | None) -> float | None:
+    """ISO a minutos de epoch. La base mezcla 'T' y espacio como separador."""
+    if not valor:
+        return None
+    from datetime import datetime, timezone
+
+    texto = str(valor).strip().replace(" ", "T", 1)
+    try:
+        t = datetime.fromisoformat(texto)
+    except ValueError:
+        try:
+            t = datetime.fromisoformat(texto[:19])
+        except ValueError:
+            return None
+    if t.tzinfo is None:
+        t = t.replace(tzinfo=timezone.utc)
+    return t.timestamp() / 60.0
+
+
+def _piernas_siguientes(con, tail: str, desde_llegada_utc: str, limite: int = 8):
+    """Las próximas piernas del mismo avión, en orden.
+
+    Sólo las que salen después de que este vuelo aterriza. La cadena se corta
+    donde el origen deja de coincidir con el destino anterior: ahí el avión
+    hizo algo que no vemos —una pierna que no capturamos, o un cambio de
+    aeronave— y seguir propagando sería inventar.
+    """
+    filas = con.execute(
+        """SELECT fa_flight_id, op_carrier, flight_number, origin, dest,
+                  scheduled_out_utc, scheduled_in_utc
+             FROM flights
+            WHERE tail_num = ?
+              AND scheduled_out_utc > ?
+              AND scheduled_out_utc IS NOT NULL
+              AND scheduled_in_utc IS NOT NULL
+            ORDER BY scheduled_out_utc
+            LIMIT ?""",
+        (tail, desde_llegada_utc, int(limite)),
+    ).fetchall()
+    return [dict(f) for f in filas]
+
+
+@app.get("/cascade/{fa_flight_id}")
+def cascade_de_vuelo(fa_flight_id: str, demora_min: float | None = None,
+                     max_piernas: int = 4):
+    """Efecto cascada: a qué vuelos siguientes les llega esta demora.
+
+    Propaga por la rotación de la aeronave, con la tabla medida sobre 779.777
+    pares de piernas consecutivas de BTS. Ver `ontimeai/cascade.py`.
+
+    Los minutos de demora salen de una de tres fuentes, en orden de solidez:
+
+    1. `real` — el vuelo ya aterrizó y se usa su demora de llegada.
+    2. `simulada` — se pasó `demora_min`. Es el modo que pide el anteproyecto:
+       «dado un vuelo retrasado, propagar el impacto».
+    3. `estimada` — se deriva de la probabilidad del modelo. Es la más floja:
+       la tabla que la convierte en minutos tiene n chico en la banda alta, y
+       es justo la banda que propaga.
+    """
+    from ontimeai.cascade import Pierna, proyectar_rotacion
+
+    con = get_db()
+    vuelo = con.execute(
+        """SELECT f.fa_flight_id, f.op_carrier, f.flight_number, f.tail_num,
+                  f.origin, f.dest, f.scheduled_out_utc, f.scheduled_in_utc,
+                  a.arr_delay_min, a.cancelled, a.diverted,
+                  (SELECT p.proba_delay FROM predictions p
+                    WHERE p.fa_flight_id = f.fa_flight_id
+                    ORDER BY p.predicted_at_utc DESC LIMIT 1) AS proba_delay
+             FROM flights f
+             LEFT JOIN actuals a ON a.fa_flight_id = f.fa_flight_id
+            WHERE f.fa_flight_id = ?""",
+        (fa_flight_id,),
+    ).fetchone()
+    if vuelo is None:
+        raise HTTPException(404, "Vuelo no encontrado")
+    v = dict(vuelo)
+
+    if not v.get("tail_num"):
+        return {
+            "vuelo": v, "piernas": [], "piernas_conocidas": 0,
+            "motivo": "el vuelo no tiene matrícula, así que no se puede seguir "
+                      "la rotación del avión",
+        }
+
+    # ---- de dónde salen los minutos ----
+    if demora_min is not None:
+        demora, origen_demora, aviso = float(demora_min), "simulada", None
+    elif v.get("arr_delay_min") is not None:
+        demora, origen_demora, aviso = float(v["arr_delay_min"]), "real", None
+    elif v.get("proba_delay") is not None:
+        demora = _demora_esperada_de_proba(float(v["proba_delay"]))
+        origen_demora = "estimada"
+        aviso = ("derivada de la probabilidad del modelo; la tabla que la "
+                 "convierte en minutos tiene pocos casos en la banda alta, "
+                 "que es justo la que propaga")
+    else:
+        return {
+            "vuelo": v, "piernas": [], "piernas_conocidas": 0,
+            "motivo": "no hay demora real ni predicción para este vuelo; se "
+                      "puede pasar `demora_min` para simular",
+        }
+
+    crudas = _piernas_siguientes(con, str(v["tail_num"]), str(v["scheduled_in_utc"] or ""))
+
+    # Encadenar sólo mientras el origen siga al destino anterior.
+    piernas, anterior_dest = [], v["dest"]
+    for c in crudas:
+        if c["origin"] != anterior_dest:
+            break
+        sale = _a_minutos(c["scheduled_out_utc"])
+        llega = _a_minutos(c["scheduled_in_utc"])
+        if sale is None or llega is None:
+            break
+        piernas.append(Pierna(
+            id_vuelo=c["fa_flight_id"],
+            origen=c["origin"], destino=c["dest"],
+            salida_programada_min=sale, llegada_programada_min=llega,
+        ))
+        anterior_dest = c["dest"]
+
+    llegada_inicial = _a_minutos(v.get("scheduled_in_utc"))
+    if not piernas or llegada_inicial is None:
+        return {
+            "vuelo": v, "demora_origen": origen_demora,
+            "demora_llegada_min": round(demora, 1), "aviso": aviso,
+            "piernas": [], "piernas_conocidas": 0,
+            "motivo": "no conocemos la próxima pierna de este avión todavía; "
+                      "el harvester las descubre caminando rotaciones y no "
+                      "siempre llega antes de que el vuelo salga",
+        }
+
+    proy = proyectar_rotacion(
+        piernas,
+        demora_llegada_inicial_min=demora,
+        llegada_programada_inicial_min=llegada_inicial,
+        max_piernas=int(max_piernas),
+    )
+    por_id = {c["fa_flight_id"]: c for c in crudas}
+    return {
+        "vuelo": v,
+        "demora_origen": origen_demora,
+        "demora_llegada_min": round(demora, 1),
+        "aviso": aviso,
+        "piernas_conocidas": len(piernas),
+        "piernas": [
+            {
+                "fa_flight_id": x.id_vuelo,
+                "vuelo": (f"{por_id[x.id_vuelo]['op_carrier'] or ''}"
+                          f"{por_id[x.id_vuelo]['flight_number'] or ''}").strip() or None,
+                "origen": x.origen, "destino": x.destino, "orden": x.orden,
+                "salida_programada_utc": por_id[x.id_vuelo]["scheduled_out_utc"],
+                "holgura_min": round(x.holgura_min, 1),
+                "demora_salida_min": round(x.demora_salida_min, 1),
+                "demora_llegada_min": round(x.demora_llegada_min, 1),
+                "demorado": x.demorado,
+                "cadena_rota": x.cadena_rota,
+            }
+            for x in proy
+        ],
+        "nota": ("proyección, no pronóstico: 18 minutos de error absoluto medio "
+                 "por paso, sin sesgo. La demora de salida es gate-out, no "
+                 "comparable con la de FR24"),
+    }
+
+
 @app.get("/metrics/lead-time")
 def metrics_lead_time(dias: int = 30):
     """Cuánto antes avisa el modelo que la aerolínea.
