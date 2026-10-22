@@ -464,7 +464,7 @@ def _record_job_duration() -> None:
         print(f"[job] no se pudo registrar la duracion: {type(exc).__name__}: {exc}")
 
 
-def main() -> int:
+def main() -> int:  # noqa: C901
     print(f"[fase] importar dependencias: {_IMPORTS_READY - _PROCESS_STARTED:.1f} s")
     try:
         _validate_training_store_config()

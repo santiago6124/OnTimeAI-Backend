@@ -139,7 +139,7 @@ def load_gate_departure_delays(
     return dep_delay_map, landed_ids
 
 
-def main() -> int:
+def main() -> int:  # noqa: C901
     p = argparse.ArgumentParser()
     p.add_argument("--artifact", default=ARTIFACTS_DIR / "4year_v9")
     p.add_argument("--airport", default="KATL")

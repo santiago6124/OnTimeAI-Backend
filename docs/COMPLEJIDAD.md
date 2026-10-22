@@ -26,12 +26,14 @@ estándar; radon queda para seguir la evolución y para el informe.
 
 ## Alcance
 
-Sólo el código productivo, definido en `PRODUCTIVO` de
-`scripts/complejidad.py`: `api.py`, `live_pull.py`, `live_job.py`,
-`watchdog.py`, `predict.py`, el paquete `ontimeai/` y los dos scripts que corren
-en producción (`materialize_live_training.py`, `prune_db.py`). Los scripts de
-análisis, `feature_engineering_v7/` y `unbiased_sample_live/` quedan fuera: no
-se despliegan y reescribirlos no reduce ningún riesgo operativo.
+Sólo el código productivo, definido como **lo que copian las tres imágenes**
+(`Dockerfile`, `Dockerfile.job`, `Dockerfile.watchdog`) y listado en
+`PRODUCTIVO` de `scripts/complejidad.py`: `api.py`, `predict.py`,
+`live_pull.py`, `live_job.py`, `watchdog.py`, el paquete `ontimeai/`,
+`feature_engineering_v7/` (el runtime lo importa) y `scripts/prune_db.py`. Los
+scripts de análisis y de entrenamiento de la raíz, `scripts/` y
+`unbiased_sample_live/` quedan fuera: no se despliegan y reescribirlos no
+reduce ningún riesgo operativo.
 
 ## Umbral y baseline
 
@@ -68,6 +70,8 @@ y recién después se parte.
 
 ## Deuda inicial (2026-10-22)
 
+21 funciones, registradas en `.complejidad-baseline.json`:
+
 | Función | CC (ruff) | Archivo |
 |---|---|---|
 | `main` | 72 | `live_pull.py` |
@@ -77,15 +81,19 @@ y recién después se parte.
 | `apply_lineage_fallback` | 23 | `ontimeai/lineage_fallback.py` |
 | `_add_v7_wind_features` | 23 | `ontimeai/live.py` |
 | `prepare_silver_training_data` | 22 | `ontimeai/training_store.py` |
+| `_refresh` | 17 | `feature_engineering_v7/gdp_scraper.py` |
 | `publish_pending_outbox` | 17 | `ontimeai/training_store.py` |
 | `load_master` | 16 | `ontimeai/data.py` |
 | `_coerce_parquet_frame` | 16 | `ontimeai/training_store.py` |
 | `main` | 13 | `live_job.py` |
-| `fetch_iem_obs`, `compute_adsb_holding_min` | 12 | `ontimeai/live.py` |
+| `compute_adsb_holding_min` | 12 | `ontimeai/live.py` |
+| `fetch_iem_obs` | 12 | `ontimeai/live.py` |
 | `prepare_dataset` | 12 | `ontimeai/pipeline.py` |
-| `chain_walk_inbound`, `compute_adsb_eta_delay` | 11 | `ontimeai/live.py` |
-| `enqueue_prediction_snapshots`, `_upload_create_only` | 11 | `ontimeai/training_store.py` |
+| `main` | 11 | `feature_engineering_v7/build_v7_dataset.py` |
+| `chain_walk_inbound` | 11 | `ontimeai/live.py` |
+| `compute_adsb_eta_delay` | 11 | `ontimeai/live.py` |
+| `_upload_create_only` | 11 | `ontimeai/training_store.py` |
+| `enqueue_prediction_snapshots` | 11 | `ontimeai/training_store.py` |
 | `prepare_inference_frame` | 11 | `predict.py` |
-| `_feature_contract_from_bytes`, `main` | 11 | `scripts/materialize_live_training.py` |
 
-Promedio radon del código productivo al instalar el gate: 6,4 (rango B).
+Promedio radon del código productivo al instalar el gate: 6,05 (rango B) sobre 354 bloques; 45 por encima de 10 y 11 por encima de 20 según radon.

@@ -551,7 +551,7 @@ _IEM_CACHE: dict[tuple[str, frozenset[str]], tuple[float, pd.DataFrame]] = {}
 _IEM_CACHE_TTL_S = float(os.environ.get("IEM_CACHE_TTL_S", "600"))
 
 
-def fetch_iem_obs(stations: set[str], start_utc: pd.Timestamp, end_utc: pd.Timestamp) -> pd.DataFrame:
+def fetch_iem_obs(stations: set[str], start_utc: pd.Timestamp, end_utc: pd.Timestamp) -> pd.DataFrame:  # noqa: C901
     """Fetches ASOS observations from IEM, batching all stations per network into one request.
 
     Batching by network reduces ~120 individual requests to ~10-15 network requests,
@@ -787,7 +787,7 @@ def fetch_flight_by_id(fa_flight_id: str, key: str | None = None) -> list[dict]:
     return payload.get("flights") or []
 
 
-def chain_walk_inbound(
+def chain_walk_inbound(  # noqa: C901
     conn: sqlite3.Connection,
     target_rows: list[dict],
     *,
@@ -1079,7 +1079,7 @@ def _haversine_nm(lat: float, lon: float) -> float:
     return R_NM * 2.0 * math.asin(min(1.0, math.sqrt(a)))
 
 
-def compute_adsb_eta_delay(
+def compute_adsb_eta_delay(  # noqa: C901
     conn: sqlite3.Connection,
     tail_num: str | None,
     scheduled_in_utc: str | None,
@@ -1178,7 +1178,7 @@ def adsb_eta_adjust(proba: float, adsb_delay_min: float | None) -> float:
     return min(max(p_adj, 0.0), 0.999)
 
 
-def compute_adsb_holding_min(
+def compute_adsb_holding_min(  # noqa: C901
     conn: sqlite3.Connection,
     tail_num: str | None,
     *,
@@ -1487,7 +1487,7 @@ def upsert_actuals_from_aeroapi(conn: sqlite3.Connection, recs: list[dict]) -> i
 
 # ----------------------------- feature builder ----------------------------
 
-def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
+def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],  # noqa: C901
                           history_days: int = 7) -> pd.DataFrame:
     """Build a master-shaped DataFrame for the given new flights + recent history.
 
@@ -1758,7 +1758,7 @@ def build_inference_frame(conn: sqlite3.Connection, fa_flight_ids: list[str],
 _ERA5_GRIDS: dict | None = None
 
 
-def _add_v7_wind_features(df: pd.DataFrame) -> pd.DataFrame:
+def _add_v7_wind_features(df: pd.DataFrame) -> pd.DataFrame:  # noqa: C901
     """Agrega BEARING_DEG y features ERA5 viento 250hPa al inference frame."""
     global _ERA5_GRIDS
 

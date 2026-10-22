@@ -148,7 +148,7 @@ def _parse_delay_string(s: str) -> float | None:
     return total if total > 0 else None
 
 
-def _parse_nas_xml(xml_bytes: bytes) -> dict:
+def _parse_nas_xml(xml_bytes: bytes) -> dict:  # noqa: C901
     """Parse FAA NAS status XML into a dict keyed by airport IATA.
 
     XML structure:

@@ -9,13 +9,12 @@ filterwarnings = [
 ]
 
 [tool.ruff]
-# Mismo alcance que scripts/complejidad.py: lo que se despliega. ruff no acepta
-# patrones negados, así que los scripts de análisis de la raíz se listan uno por
-# uno y `scripts/` se excluye entero; los dos scripts productivos de esa carpeta
-# (materialize_live_training.py, prune_db.py) los pasa el gate por ruta explícita.
+# Mismo alcance que scripts/complejidad.py: lo que copian los Dockerfiles. ruff
+# no acepta patrones negados, así que los scripts de análisis de la raíz se
+# listan uno por uno y `scripts/` se excluye entero; el único script productivo
+# de esa carpeta (prune_db.py) lo pasa el gate por ruta explícita.
 extend-exclude = [
     "tests",
-    "feature_engineering_v7",
     "unbiased_sample_live",
     "scripts",
     "*.ipynb",

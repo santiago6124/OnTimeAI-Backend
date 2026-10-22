@@ -32,18 +32,19 @@ from pathlib import Path
 
 RAIZ = Path(__file__).resolve().parent.parent
 
-# Sólo lo que corre en producción: el servicio HTTP, el job de inferencia, el
-# vigía y el paquete que comparten. Los scripts de análisis, los notebooks
-# convertidos y las carpetas de experimentos no se despliegan, así que su
-# complejidad no es un riesgo operativo y reescribirlos no lo reduce.
+# Sólo lo que corre en producción, definido por lo que copian las tres imágenes
+# (Dockerfile, Dockerfile.job, Dockerfile.watchdog): el servicio HTTP, el job de
+# inferencia, el vigía, el paquete `ontimeai` y `feature_engineering_v7`, que
+# el runtime importa. Los scripts de análisis y de entrenamiento no se
+# despliegan, así que su complejidad no es un riesgo operativo.
 PRODUCTIVO = [
     "api.py",
+    "predict.py",
     "live_pull.py",
     "live_job.py",
     "watchdog.py",
-    "predict.py",
     "ontimeai",
-    "scripts/materialize_live_training.py",
+    "feature_engineering_v7",
     "scripts/prune_db.py",
 ]
 

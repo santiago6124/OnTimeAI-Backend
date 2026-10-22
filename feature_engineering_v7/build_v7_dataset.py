@@ -57,7 +57,7 @@ def _add_bearing(df: pd.DataFrame) -> pd.DataFrame:
     return df.merge(pairs, on=["ORIGIN", "DEST"], how="left")
 
 
-def main() -> None:
+def main() -> None:  # noqa: C901
     p = argparse.ArgumentParser()
     p.add_argument("--src", default=str(SRC_PARQUET))
     p.add_argument("--out", default=str(PROJECT_ROOT / "dataset_maestro_FULL_US_2022-2025_v7.parquet"))
