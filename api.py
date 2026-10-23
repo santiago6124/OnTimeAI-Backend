@@ -26,7 +26,7 @@ load_dotenv(dotenv_path=".env.local", override=False)
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 import hashlib
 
 import re
@@ -65,7 +65,30 @@ def _require_secret(name: str) -> str:
 GCS_BUCKET = os.getenv("GCS_BUCKET", "")
 _TMP_DB = Path("/tmp/live_data.db")
 _BUNDLED_DB = Path(__file__).parent / "live_data.db"
-DB_PATH = _TMP_DB if GCS_BUCKET else _BUNDLED_DB
+
+
+def _ruta_de_base(entorno: Mapping[str, str], variable: str, por_defecto: Path) -> Path:
+    """La ruta de una base: la de `variable` si está en el entorno, si no la default.
+
+    `DB_PATH_OVERRIDE` y `USERS_DB_PATH_OVERRIDE` existen para levantar la API
+    contra una base fixture —las pruebas de carga con k6, ver
+    docs/STRESS_K6.md— sin tocar el `live_data.db` del repo ni `/tmp`. Sin
+    ellas el comportamiento es el de siempre. No están pensadas para
+    combinarse con `GCS_BUCKET`: el refresh seguiría escribiendo en
+    `/tmp/live_data.db` y las lecturas irían a otro archivo.
+
+    No se reutiliza `DB_PATH` a secas porque `ontimeai/live.py` ya lee esa
+    variable del entorno con otro significado —la base de trabajo del job—, y
+    un despliegue que la tuviera definida habría cambiado la base que sirve la
+    API sin que nada lo avisara.
+    """
+    valor = (entorno.get(variable) or "").strip()
+    return Path(valor) if valor else por_defecto
+
+
+DB_PATH = _ruta_de_base(
+    os.environ, "DB_PATH_OVERRIDE", _TMP_DB if GCS_BUCKET else _BUNDLED_DB
+)
 _DB_REFRESH_INTERVAL = 1000  # refresh from GCS every ~16 min
 # Segundos para bajar el snapshot completo desde GCS.
 #
@@ -89,7 +112,11 @@ _db_last_refresh_ok_utc: str | None = None
 _db_last_refresh_error: str | None = None
 
 # Users DB (separate from live_data.db so live job never overwrites it)
-USERS_DB_PATH = Path("/tmp/users.db") if GCS_BUCKET else Path(__file__).parent / "users.db"
+USERS_DB_PATH = _ruta_de_base(
+    os.environ,
+    "USERS_DB_PATH_OVERRIDE",
+    Path("/tmp/users.db") if GCS_BUCKET else Path(__file__).parent / "users.db",
+)
 
 
 def _hash_password(password: str) -> str:

@@ -1,0 +1,133 @@
+name: Stress (k6)
+
+# Pruebas de carga con k6 contra la API levantada EN EL RUNNER, con una base
+# fixture. Nunca contra producción: el backend de Cloud Run está fijado a una
+# instancia y comparte CPU con el refresco de la base, así que una ráfaga lo
+# tumbaría para los usuarios reales sin medir nada útil. Ver docs/STRESS_K6.md.
+#
+#   pull_request       → smoke + stress (unos 5 minutos), sólo si el PR toca
+#                        la API, los scripts de k6 o este workflow
+#   push a main        → smoke + stress + soak (el soak son 10 minutos más)
+#   workflow_dispatch  → smoke + stress, y el soak si se marca la casilla.
+#                        Se puede disparar sobre una rama:
+#                        gh workflow run stress.yml --ref <rama>
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/stress.yml"
+      - "k6/**"
+      - "scripts/make_fixture_db.py"
+      - "scripts/k6_resumen.py"
+      - "ontimeai/semillas.py"
+      - "api.py"
+      - "requirements-api.txt"
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      soak:
+        description: "Correr también el soak (20 VUs durante 10 minutos)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: stress-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  BASE_URL: http://localhost:8000
+  # Credenciales de prueba, literales a propósito: son las mismas que define
+  # tests/conftest.py y sólo existen en el users.db temporal del runner. No
+  # son secretos y no abren nada fuera de este job.
+  API_USERNAME: test-admin
+  API_PASSWORD: test-only-password
+
+jobs:
+  k6:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          # Misma versión que producción (Dockerfile).
+          python-version: "3.11"
+          cache: pip
+          cache-dependency-path: requirements-api.txt
+
+      - name: Instalar libomp
+        # LightGBM lo enlaza en runtime; sin esto `import api` falla.
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends libomp-dev
+
+      - name: Instalar dependencias de la API
+        # Sólo el runtime del servicio HTTP, como en la imagen.
+        run: pip install -r requirements-api.txt
+
+      - name: Armar la base fixture
+        # Copia el live_data.db del repo y siembra 200 vuelos de hoy: el
+        # snapshot versionado no tiene ninguno y /flights devolvería [].
+        run: python scripts/make_fixture_db.py --destino /tmp/fixture.db --vuelos 200
+
+      - name: Levantar la API
+        env:
+          DB_PATH_OVERRIDE: /tmp/fixture.db
+          USERS_DB_PATH_OVERRIDE: /tmp/users.db
+          JWT_SECRET_KEY: test-only-secret-not-used-in-production
+          API_USERNAME_VIEWER: test-viewer
+          API_PASSWORD_VIEWER: test-only-password-viewer
+        # Un solo proceso uvicorn, igual que el CMD del Dockerfile.
+        run: |
+          nohup uvicorn api:app --host 127.0.0.1 --port 8000 --log-level warning > /tmp/uvicorn.log 2>&1 &
+          echo $! > /tmp/uvicorn.pid
+          for i in $(seq 1 60); do
+            if curl -fsS -o /dev/null http://localhost:8000/docs; then
+              echo "API arriba en ${i} s"
+              exit 0
+            fi
+            sleep 1
+          done
+          echo "La API no levantó en 60 s:"
+          cat /tmp/uvicorn.log
+          exit 1
+
+      - uses: grafana/setup-k6-action@v1
+
+      # Cada script escribe k6/resultados/<escenario>-summary.json y falla el
+      # paso (exit 99) si se cruza un umbral.
+      - name: Smoke (1 VU, 30 s)
+        run: k6 run k6/smoke.js
+
+      - name: Stress (rampa a 50 VUs, 3 min)
+        run: k6 run k6/stress.js
+
+      - name: Soak (20 VUs, 10 min)
+        if: github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.soak)
+        run: k6 run k6/soak.js
+
+      - name: Resumen en el step summary
+        if: always()
+        run: |
+          python scripts/k6_resumen.py \
+            k6/resultados/smoke-summary.json \
+            k6/resultados/stress-summary.json \
+            k6/resultados/soak-summary.json \
+            --salida "$GITHUB_STEP_SUMMARY"
+
+      - name: Apagar la API
+        if: always()
+        run: |
+          kill "$(cat /tmp/uvicorn.pid)" 2>/dev/null || true
+          cp /tmp/uvicorn.log k6/resultados/uvicorn.log 2>/dev/null || true
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: k6-resultados-${{ github.run_number }}
+          path: |
+            k6/resultados/*-summary.json
+            k6/resultados/uvicorn.log
+            !k6/resultados/2*-poc-local-*
+          if-no-files-found: warn
+          retention-days: 30
