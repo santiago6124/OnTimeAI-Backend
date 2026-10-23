@@ -9,6 +9,9 @@ pytest>=7.4
 # una versión nueva de ruff puede contar distinto y mover la baseline sola.
 ruff==0.17.2
 radon==6.0.1
+# Cobertura con ramas y cobertura sobre las líneas cambiadas de cada PR.
+pytest-cov==7.1.0
+diff-cover==10.6.0
 # starlette.testclient lo exige desde su migracion a httpx2; sin esto,
 # cualquier test que use TestClient falla al colectar.
 httpx2
