@@ -45,9 +45,32 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-# Por ahora ruff sólo vigila complejidad (ver docs/COMPLEJIDAD.md). Sumar
-# reglas de estilo es otra decisión, con su propia baseline.
-select = ["C901"]
+# Complejidad (ver docs/COMPLEJIDAD.md) más los "bugs críticos": errores de
+# sintaxis, nombres indefinidos, redefiniciones y comparaciones inválidas, lo
+# que revienta en tiempo de ejecución. Es la misma selección que usa el
+# template de Python de GitHub Actions (E9, F63, F7, F82). Las reglas de
+# estilo son otra decisión, con su propia baseline.
+select = ["C901", "E9", "F63", "F7", "F82"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
+
+[tool.coverage.run]
+branch = true
+# Qué se mide: exactamente lo que se despliega, el mismo alcance que el gate
+# de complejidad (lo que copian los tres Dockerfiles). Sin `source`, coverage
+# sólo cuenta los módulos que los tests importan y el número sale inflado; con
+# `.` entero cuenta dos docenas de scripts de análisis que no se despliegan y
+# sale desinflado. Las herramientas de scripts/ tienen tests propios pero no
+# entran en el número: no corren en producción.
+source = ["api", "predict", "live_pull", "live_job", "watchdog", "ontimeai",
+          "feature_engineering_v7", "scripts.prune_db"]
+omit = ["tests/*"]
+
+[tool.coverage.report]
+# Trinquete de cobertura: el total (sentencias más ramas) no puede bajar de
+# acá. Se sube a mano cada vez que la cobertura crece de verdad. Línea de base
+# del 2026-10-22 sobre el código desplegado (commit 416eef8): 52,6 % de
+# líneas, 42,8 % de ramas, 50,3 % combinado.
+fail_under = 50
+precision = 1

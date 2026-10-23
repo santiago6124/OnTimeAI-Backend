@@ -1,0 +1,60 @@
+name: Defecto
+description: Un comportamiento del sistema distinto del esperado, con los datos completos para reproducirlo y trazarlo.
+title: "bug(ámbito): resumen en minúsculas"
+labels: ["defecto"]
+body:
+  - type: dropdown
+    id: severidad
+    attributes:
+      label: Severidad
+      description: Crítica si rompe producción o corrompe datos; alta si bloquea una función; media si hay rodeo; baja si es cosmético.
+      options: ["crítica", "alta", "media", "baja"]
+    validations:
+      required: true
+  - type: dropdown
+    id: entorno
+    attributes:
+      label: Entorno donde se observó
+      options: ["producción (Cloud Run)", "CI (GitHub Actions)", "local", "app Android", "app iOS"]
+    validations:
+      required: true
+  - type: input
+    id: requisito
+    attributes:
+      label: Requisito afectado
+      description: ID de OnTimeAI-Calidad/docs/TRAZABILIDAD.md, p. ej. RF-03.
+      placeholder: RF-03
+  - type: input
+    id: caso
+    attributes:
+      label: Caso de prueba que lo detecta o lo cubre
+      description: ID de OnTimeAI-Calidad/docs/CASOS_DE_PRUEBA.md, p. ej. CP-API-07. Si no existe, el PR que corrige tiene que crearlo.
+      placeholder: CP-API-07
+  - type: textarea
+    id: pasos
+    attributes:
+      label: Pasos para reproducir
+      placeholder: |
+        1. ...
+        2. ...
+    validations:
+      required: true
+  - type: textarea
+    id: esperado
+    attributes:
+      label: Resultado esperado
+      description: El criterio de aceptación, fijado antes de corregir.
+    validations:
+      required: true
+  - type: textarea
+    id: obtenido
+    attributes:
+      label: Resultado obtenido
+      description: Qué pasó, con el mensaje de error o la captura.
+    validations:
+      required: true
+  - type: textarea
+    id: evidencia
+    attributes:
+      label: Evidencia
+      description: Run de CI, log, commit donde apareció, causa raíz si se conoce.
