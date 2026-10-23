@@ -6,7 +6,6 @@
     "ontimeai/training_store.py::materialize_fixed_horizons": 41,
     "ontimeai/faa_nas.py::_parse_nas_xml": 27,
     "ontimeai/live.py::build_inference_frame": 24,
-    "ontimeai/lineage_fallback.py::apply_lineage_fallback": 23,
     "ontimeai/live.py::_add_v7_wind_features": 23,
     "ontimeai/training_store.py::prepare_silver_training_data": 22,
     "feature_engineering_v7/gdp_scraper.py::_refresh": 17,
