@@ -12,7 +12,6 @@
     "feature_engineering_v7/gdp_scraper.py::_refresh": 17,
     "ontimeai/training_store.py::publish_pending_outbox": 17,
     "ontimeai/data.py::load_master": 16,
-    "ontimeai/training_store.py::_coerce_parquet_frame": 16,
     "live_job.py::main": 13,
     "ontimeai/live.py::compute_adsb_holding_min": 12,
     "ontimeai/live.py::fetch_iem_obs": 12,

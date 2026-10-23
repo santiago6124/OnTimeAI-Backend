@@ -1067,47 +1067,61 @@ _PARQUET_BOOLEAN_COLUMNS = {
 }
 
 
-def _coerce_parquet_frame(frame: pd.DataFrame) -> pd.DataFrame:  # noqa: C901
+_FEATURE_PREFIXES = ("raw__", "model__", "imputed__")
+
+
+def _feature_name(col: str) -> str | None:
+    """Nombre de la feature si la columna es `raw__x`, `model__x` o `imputed__x`."""
+    for prefix in _FEATURE_PREFIXES:
+        if col.startswith(prefix):
+            return col.removeprefix(prefix)
+    return None
+
+
+def _first_json_list(frame: pd.DataFrame, column: str) -> list:
+    """La lista JSON guardada en la primera fila no nula de `column`, o vacía."""
+    if column not in frame:
+        return []
+    values = frame[column].dropna()
+    if values.empty:
+        return []
+    return list(json.loads(str(values.iloc[0])))
+
+
+def _coerce_column(series: pd.Series, col: str, categorical: set[str]) -> pd.Series:
+    """El dtype estable de Arrow para una columna; las desconocidas quedan igual."""
+    feature_name = _feature_name(col)
+    if feature_name is not None:
+        if col.startswith("imputed__"):
+            return series.astype("boolean")
+        if feature_name in categorical:
+            return series.astype("string")
+        return pd.to_numeric(series, errors="coerce").astype("Float64")
+    if col in _PARQUET_STRING_COLUMNS:
+        return series.astype("string")
+    if col in _PARQUET_FLOAT_COLUMNS:
+        return pd.to_numeric(series, errors="coerce").astype("Float64")
+    if col in _PARQUET_INTEGER_COLUMNS:
+        return pd.to_numeric(series, errors="coerce").astype("Int64")
+    if col in _PARQUET_BOOLEAN_COLUMNS:
+        return series.astype("boolean")
+    return series
+
+
+def _coerce_parquet_frame(frame: pd.DataFrame) -> pd.DataFrame:
     """Apply stable Arrow-compatible dtypes, including all-null shards."""
     result = frame.copy()
-    feature_order: list[str] = []
-    categorical: set[str] = set()
-    if "feature_order_json" in result:
-        values = result["feature_order_json"].dropna()
-        if not values.empty:
-            feature_order = list(json.loads(str(values.iloc[0])))
-    if "categorical_features_json" in result:
-        values = result["categorical_features_json"].dropna()
-        if not values.empty:
-            categorical = set(json.loads(str(values.iloc[0])))
+    feature_order = _first_json_list(result, "feature_order_json")
+    categorical = set(_first_json_list(result, "categorical_features_json"))
 
     for col in result.columns:
-        feature_name = None
-        for prefix in ("raw__", "model__", "imputed__"):
-            if col.startswith(prefix):
-                feature_name = col.removeprefix(prefix)
-                break
-        if feature_name is not None:
-            if col.startswith("imputed__"):
-                result[col] = result[col].astype("boolean")
-            elif feature_name in categorical:
-                result[col] = result[col].astype("string")
-            else:
-                result[col] = pd.to_numeric(result[col], errors="coerce").astype("Float64")
-        elif col in _PARQUET_STRING_COLUMNS:
-            result[col] = result[col].astype("string")
-        elif col in _PARQUET_FLOAT_COLUMNS:
-            result[col] = pd.to_numeric(result[col], errors="coerce").astype("Float64")
-        elif col in _PARQUET_INTEGER_COLUMNS:
-            result[col] = pd.to_numeric(result[col], errors="coerce").astype("Int64")
-        elif col in _PARQUET_BOOLEAN_COLUMNS:
-            result[col] = result[col].astype("boolean")
+        result[col] = _coerce_column(result[col], col, categorical)
 
     # A malformed payload should not silently omit a feature from the schema.
     expected = {
         f"{prefix}{name}"
         for name in feature_order
-        for prefix in ("raw__", "model__", "imputed__")
+        for prefix in _FEATURE_PREFIXES
     }
     missing = expected.difference(result.columns)
     if missing:
