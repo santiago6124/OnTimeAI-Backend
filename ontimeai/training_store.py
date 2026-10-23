@@ -1067,47 +1067,61 @@ _PARQUET_BOOLEAN_COLUMNS = {
 }
 
 
-def _coerce_parquet_frame(frame: pd.DataFrame) -> pd.DataFrame:  # noqa: C901
+_FEATURE_PREFIXES = ("raw__", "model__", "imputed__")
+
+
+def _feature_name(col: str) -> str | None:
+    """Nombre de la feature si la columna es `raw__x`, `model__x` o `imputed__x`."""
+    for prefix in _FEATURE_PREFIXES:
+        if col.startswith(prefix):
+            return col.removeprefix(prefix)
+    return None
+
+
+def _first_json_list(frame: pd.DataFrame, column: str) -> list:
+    """La lista JSON guardada en la primera fila no nula de `column`, o vacía."""
+    if column not in frame:
+        return []
+    values = frame[column].dropna()
+    if values.empty:
+        return []
+    return list(json.loads(str(values.iloc[0])))
+
+
+def _coerce_column(series: pd.Series, col: str, categorical: set[str]) -> pd.Series:
+    """El dtype estable de Arrow para una columna; las desconocidas quedan igual."""
+    feature_name = _feature_name(col)
+    if feature_name is not None:
+        if col.startswith("imputed__"):
+            return series.astype("boolean")
+        if feature_name in categorical:
+            return series.astype("string")
+        return pd.to_numeric(series, errors="coerce").astype("Float64")
+    if col in _PARQUET_STRING_COLUMNS:
+        return series.astype("string")
+    if col in _PARQUET_FLOAT_COLUMNS:
+        return pd.to_numeric(series, errors="coerce").astype("Float64")
+    if col in _PARQUET_INTEGER_COLUMNS:
+        return pd.to_numeric(series, errors="coerce").astype("Int64")
+    if col in _PARQUET_BOOLEAN_COLUMNS:
+        return series.astype("boolean")
+    return series
+
+
+def _coerce_parquet_frame(frame: pd.DataFrame) -> pd.DataFrame:
     """Apply stable Arrow-compatible dtypes, including all-null shards."""
     result = frame.copy()
-    feature_order: list[str] = []
-    categorical: set[str] = set()
-    if "feature_order_json" in result:
-        values = result["feature_order_json"].dropna()
-        if not values.empty:
-            feature_order = list(json.loads(str(values.iloc[0])))
-    if "categorical_features_json" in result:
-        values = result["categorical_features_json"].dropna()
-        if not values.empty:
-            categorical = set(json.loads(str(values.iloc[0])))
+    feature_order = _first_json_list(result, "feature_order_json")
+    categorical = set(_first_json_list(result, "categorical_features_json"))
 
     for col in result.columns:
-        feature_name = None
-        for prefix in ("raw__", "model__", "imputed__"):
-            if col.startswith(prefix):
-                feature_name = col.removeprefix(prefix)
-                break
-        if feature_name is not None:
-            if col.startswith("imputed__"):
-                result[col] = result[col].astype("boolean")
-            elif feature_name in categorical:
-                result[col] = result[col].astype("string")
-            else:
-                result[col] = pd.to_numeric(result[col], errors="coerce").astype("Float64")
-        elif col in _PARQUET_STRING_COLUMNS:
-            result[col] = result[col].astype("string")
-        elif col in _PARQUET_FLOAT_COLUMNS:
-            result[col] = pd.to_numeric(result[col], errors="coerce").astype("Float64")
-        elif col in _PARQUET_INTEGER_COLUMNS:
-            result[col] = pd.to_numeric(result[col], errors="coerce").astype("Int64")
-        elif col in _PARQUET_BOOLEAN_COLUMNS:
-            result[col] = result[col].astype("boolean")
+        result[col] = _coerce_column(result[col], col, categorical)
 
     # A malformed payload should not silently omit a feature from the schema.
     expected = {
         f"{prefix}{name}"
         for name in feature_order
-        for prefix in ("raw__", "model__", "imputed__")
+        for prefix in _FEATURE_PREFIXES
     }
     missing = expected.difference(result.columns)
     if missing:
@@ -1115,7 +1129,92 @@ def _coerce_parquet_frame(frame: pd.DataFrame) -> pd.DataFrame:  # noqa: C901
     return result
 
 
-def _upload_create_only(  # noqa: C901
+def _parquet_ledger_matches(existing_body: bytes, expected_metadata: Mapping[str, str],
+                            object_name: str) -> None:
+    """Verifica que el Parquet remoto tenga exactamente los eventos esperados.
+
+    Los bytes de un Parquet pueden cambiar entre versiones de PyArrow aunque
+    representen las mismas filas, así que se compara la identidad lógica
+    (cantidad de eventos, digest de ids y digest de hashes de payload) y no el
+    SHA-256 del archivo. Lanza ValueError si no coincide.
+    """
+    remote_frame = pd.read_parquet(BytesIO(existing_body))
+    _verify_event_frame_integrity(remote_frame, name=f"existing object {object_name}")
+    remote_identity = sorted(
+        (str(event_id), str(payload_sha256))
+        for event_id, payload_sha256 in zip(
+            remote_frame["event_id"], remote_frame["payload_sha256"], strict=False,
+        )
+    )
+    remote_event_digest = sha256(
+        "\n".join(item[0] for item in remote_identity).encode("utf-8")
+    ).hexdigest()
+    remote_logical_digest = sha256(
+        "\n".join(item[1] for item in remote_identity).encode("utf-8")
+    ).hexdigest()
+    if (
+        len(remote_frame) != int(expected_metadata["event_count"])
+        or remote_event_digest != expected_metadata["event_digest"]
+        or remote_logical_digest != expected_metadata["logical_sha256"]
+    ):
+        raise ValueError("remote Parquet logical digest mismatch")
+
+
+def _existing_object_is_identical(
+    blob: Any,
+    body: bytes,
+    *,
+    content_type: str,
+    expected_metadata: Mapping[str, str],
+    object_name: str,
+) -> None:
+    """Confirma que el objeto ya creado es el mismo que se quiso subir.
+
+    Primero los metadatos, después el SHA-256 del contenido y, si difiere, la
+    comparación semántica por tipo (Parquet por identidad lógica, JSON por
+    igualdad de documentos). Cualquier diferencia lanza RuntimeError: un objeto
+    inmutable distinto bajo el mismo nombre es una colisión, nunca se pisa.
+    """
+    blob.reload()
+    existing_metadata = blob.metadata or {}
+    mismatches = {
+        key: (existing_metadata.get(key), expected)
+        for key, expected in expected_metadata.items()
+        if existing_metadata.get(key) != expected
+    }
+    if mismatches:
+        raise RuntimeError(
+            f"immutable training object collision for {object_name}: "
+            f"metadata mismatch {mismatches!r}"
+        )
+    try:
+        existing_body = blob.download_as_bytes(if_generation_match=int(blob.generation))
+    except Exception as verify_exc:
+        raise RuntimeError(
+            f"could not verify immutable training object {object_name}"
+        ) from verify_exc
+    if sha256(existing_body).hexdigest() == sha256(body).hexdigest():
+        return
+    try:
+        if content_type == "application/vnd.apache.parquet":
+            _parquet_ledger_matches(existing_body, expected_metadata, object_name)
+            return
+        if content_type == "application/json":
+            if json.loads(existing_body) == json.loads(body):
+                return
+            raise ValueError("remote JSON content differs")
+    except Exception as semantic_exc:
+        raise RuntimeError(
+            f"immutable training object collision for {object_name}: "
+            "content SHA-256 mismatch; semantic payload mismatch"
+        ) from semantic_exc
+    raise RuntimeError(
+        f"immutable training object collision for {object_name}: "
+        "content SHA-256 mismatch"
+    )
+
+
+def _upload_create_only(
     blob: Any,
     body: bytes,
     *,
@@ -1136,81 +1235,12 @@ def _upload_create_only(  # noqa: C901
 
         if not isinstance(exc, PreconditionFailed):
             raise
-        blob.reload()
-        existing_metadata = blob.metadata or {}
-        mismatches = {
-            key: (existing_metadata.get(key), expected)
-            for key, expected in expected_metadata.items()
-            if existing_metadata.get(key) != expected
-        }
-        if mismatches:
-            raise RuntimeError(
-                f"immutable training object collision for {object_name}: "
-                f"metadata mismatch {mismatches!r}"
-            ) from exc
-        try:
-            generation = int(blob.generation)
-            existing_body = blob.download_as_bytes(
-                if_generation_match=generation,
-            )
-        except Exception as verify_exc:
-            raise RuntimeError(
-                f"could not verify immutable training object {object_name}"
-            ) from verify_exc
-        expected_content_sha256 = sha256(body).hexdigest()
-        existing_content_sha256 = sha256(existing_body).hexdigest()
-        if existing_content_sha256 == expected_content_sha256:
-            return
-
-        # Parquet bytes can legitimately change across PyArrow versions while
-        # representing the exact same ledger rows.  Verify the remote payload
-        # semantically and cryptographically instead of wedging the outbox on an
-        # encoder upgrade.  Invalid/corrupt bodies still fail closed.
-        try:
-            if content_type == "application/vnd.apache.parquet":
-                remote_frame = pd.read_parquet(BytesIO(existing_body))
-                _verify_event_frame_integrity(
-                    remote_frame,
-                    name=f"existing object {object_name}",
-                )
-                remote_identity = sorted(
-                    (
-                        str(event_id), str(payload_sha256),
-                    )
-                    for event_id, payload_sha256 in zip(
-                        remote_frame["event_id"],
-                        remote_frame["payload_sha256"],
-                        strict=False,
-                    )
-                )
-                remote_event_ids = [item[0] for item in remote_identity]
-                remote_payload_hashes = [item[1] for item in remote_identity]
-                remote_event_digest = sha256(
-                    "\n".join(remote_event_ids).encode("utf-8")
-                ).hexdigest()
-                remote_logical_digest = sha256(
-                    "\n".join(remote_payload_hashes).encode("utf-8")
-                ).hexdigest()
-                if (
-                    len(remote_frame) != int(expected_metadata["event_count"])
-                    or remote_event_digest != expected_metadata["event_digest"]
-                    or remote_logical_digest != expected_metadata["logical_sha256"]
-                ):
-                    raise ValueError("remote Parquet logical digest mismatch")
-                return
-            if content_type == "application/json":
-                if json.loads(existing_body) == json.loads(body):
-                    return
-                raise ValueError("remote JSON content differs")
-        except Exception as semantic_exc:
-            raise RuntimeError(
-                f"immutable training object collision for {object_name}: "
-                "content SHA-256 mismatch; semantic payload mismatch"
-            ) from semantic_exc
-        raise RuntimeError(
-            f"immutable training object collision for {object_name}: "
-            "content SHA-256 mismatch"
-        ) from exc
+        # El objeto ya existía: sólo es aceptable si es idéntico. La colisión
+        # se propaga con el PreconditionFailed como contexto.
+        _existing_object_is_identical(
+            blob, body, content_type=content_type,
+            expected_metadata=expected_metadata, object_name=object_name,
+        )
 
 
 def publish_pending_outbox(  # noqa: C901
