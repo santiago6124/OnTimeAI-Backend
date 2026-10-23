@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Fixture sintético con la forma del feed de estado NAS de la FAA
+  (https://nasstatus.faa.gov/api/airport-status-information), recortado a
+  lo que `ontimeai.faa_nas._parse_nas_xml` lee. Los valores son inventados.
+-->
+<AIRPORT_STATUS_INFORMATION>
+  <Update_Time>Thu Oct 23 14:05:12 2026 GMT</Update_Time>
+  <Delay_type>
+    <Name>Ground Stop Programs</Name>
+    <Ground_Stop_List>
+      <Program>
+        <ARPT>DTW</ARPT>
+        <Reason>thunderstorms</Reason>
+        <End_Time>3:30 pm EDT</End_Time>
+      </Program>
+      <Program>
+        <ARPT>ewr</ARPT>
+        <Reason>volume</Reason>
+        <End_Time>4:00 pm EDT</End_Time>
+      </Program>
+    </Ground_Stop_List>
+  </Delay_type>
+  <Delay_type>
+    <Name>Ground Delay Programs</Name>
+    <Ground_Delay_List>
+      <Ground_Delay>
+        <ARPT>BNA</ARPT>
+        <Reason>other</Reason>
+        <Avg>54 minutes</Avg>
+        <Max>1 hour and 46 minutes</Max>
+      </Ground_Delay>
+      <Ground_Delay>
+        <ARPT>ATL</ARPT>
+        <Reason>low ceilings</Reason>
+        <Avg>1 hour and 15 minutes</Avg>
+        <Max>2 hours and 10 minutes</Max>
+      </Ground_Delay>
+    </Ground_Delay_List>
+  </Delay_type>
+  <Delay_type>
+    <Name>Arrival/Departure Delay Information</Name>
+    <Arrival_Departure_Delay_List>
+      <Delay>
+        <ARPT>SFO</ARPT>
+        <Reason>low ceilings</Reason>
+        <Arrival_Departure Type="Arrival">
+          <Min>31 minutes</Min>
+          <Max>45 minutes</Max>
+        </Arrival_Departure>
+      </Delay>
+      <Delay>
+        <ARPT>ATL</ARPT>
+        <Reason>wind</Reason>
+        <Arrival_Departure Type="Departure">
+          <Min>16 minutes</Min>
+          <Max>30 minutes</Max>
+        </Arrival_Departure>
+      </Delay>
+    </Arrival_Departure_Delay_List>
+  </Delay_type>
+  <Delay_type>
+    <Name>Airport Closures</Name>
+    <Airport_Closure_List>
+      <Airport>
+        <ARPT>JFK</ARPT>
+        <Reason>!JFK 10/123 JFK AD AP CLSD</Reason>
+        <Start>Oct 23 at 06:00 UTC</Start>
+        <Reopen>Oct 23 at 22:00 UTC</Reopen>
+      </Airport>
+    </Airport_Closure_List>
+  </Delay_type>
+</AIRPORT_STATUS_INFORMATION>
