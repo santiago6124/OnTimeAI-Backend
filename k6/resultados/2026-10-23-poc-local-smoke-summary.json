@@ -1,0 +1,481 @@
+{
+  "ontimeai": {
+    "escenario": "smoke",
+    "base_url": "http://localhost:8000",
+    "generado_utc": "2026-10-23T18:40:47.227Z",
+    "k6": null
+  },
+  "root_group": {
+    "name": "",
+    "path": "",
+    "id": "d41d8cd98f00b204e9800998ecf8427e",
+    "groups": [],
+    "checks": [
+        {
+          "name": "login: 200",
+          "path": "::login: 200",
+          "id": "d197f3faedc4c064674fc90d1995e47a",
+          "passes": 20,
+          "fails": 0
+        },
+        {
+          "passes": 20,
+          "fails": 0,
+          "name": "login: JSON",
+          "path": "::login: JSON",
+          "id": "7490c3ec26157b366cbb6cfc34ade437"
+        },
+        {
+          "passes": 20,
+          "fails": 0,
+          "name": "flights: 200",
+          "path": "::flights: 200",
+          "id": "25aade32045857942247dd4b98839585"
+        },
+        {
+          "name": "flights: JSON",
+          "path": "::flights: JSON",
+          "id": "90b4e6446c2fb07b943b90b2207cf879",
+          "passes": 20,
+          "fails": 0
+        },
+        {
+          "name": "flights: hay vuelos de hoy",
+          "path": "::flights: hay vuelos de hoy",
+          "id": "30be3398618d1466f170b8042494610b",
+          "passes": 20,
+          "fails": 0
+        },
+        {
+          "name": "flight_detail: 200",
+          "path": "::flight_detail: 200",
+          "id": "9f0313b9f6ac6a602ffe5c85370b9917",
+          "passes": 20,
+          "fails": 0
+        },
+        {
+          "name": "flight_detail: JSON",
+          "path": "::flight_detail: JSON",
+          "id": "0585b4d45c387fb1844fc70c99c0da72",
+          "passes": 20,
+          "fails": 0
+        },
+        {
+          "id": "8530adec70b9d50619424747d91125d3",
+          "passes": 20,
+          "fails": 0,
+          "name": "flight_history: 200",
+          "path": "::flight_history: 200"
+        },
+        {
+          "name": "flight_history: JSON",
+          "path": "::flight_history: JSON",
+          "id": "596eac3b4a5b494b3a88f2be037079f2",
+          "passes": 20,
+          "fails": 0
+        },
+        {
+          "path": "::cascade: 200",
+          "id": "e4a36eaddae66b703614c97261f2d443",
+          "passes": 20,
+          "fails": 0,
+          "name": "cascade: 200"
+        },
+        {
+          "id": "e15cf1cc230a3a3bd7ede9520b4c5caa",
+          "passes": 20,
+          "fails": 0,
+          "name": "cascade: JSON",
+          "path": "::cascade: JSON"
+        },
+        {
+          "fails": 0,
+          "name": "metrics_summary: 200",
+          "path": "::metrics_summary: 200",
+          "id": "ae3b3602df437934aba9a15595267a4a",
+          "passes": 20
+        },
+        {
+          "name": "metrics_summary: JSON",
+          "path": "::metrics_summary: JSON",
+          "id": "dd940c6fb637412c6ae675d87e18f368",
+          "passes": 20,
+          "fails": 0
+        },
+        {
+          "path": "::metrics_hourly: 200",
+          "id": "5cf03d472581866fcabaa29227c922a0",
+          "passes": 20,
+          "fails": 0,
+          "name": "metrics_hourly: 200"
+        },
+        {
+          "name": "metrics_hourly: JSON",
+          "path": "::metrics_hourly: JSON",
+          "id": "c5ab96706f3d1ce5402ed891e495c0ec",
+          "passes": 20,
+          "fails": 0
+        },
+        {
+          "name": "metrics_model: 200",
+          "path": "::metrics_model: 200",
+          "id": "128b5b199b7a34a2318516755aec4fa0",
+          "passes": 20,
+          "fails": 0
+        },
+        {
+          "passes": 20,
+          "fails": 0,
+          "name": "metrics_model: JSON",
+          "path": "::metrics_model: JSON",
+          "id": "958ff4bbfcbb5af30ff503cdb2049e03"
+        },
+        {
+          "fails": 0,
+          "name": "weather_atl: 200",
+          "path": "::weather_atl: 200",
+          "id": "627e650e81bdcc353cd4c5467a9508c3",
+          "passes": 20
+        },
+        {
+          "path": "::weather_atl: JSON",
+          "id": "021bfe866112a9a5024a0104cbac02fd",
+          "passes": 20,
+          "fails": 0,
+          "name": "weather_atl: JSON"
+        }
+      ]
+  },
+  "options": {
+    "summaryTimeUnit": "",
+    "noColor": false,
+    "summaryTrendStats": [
+      "avg",
+      "min",
+      "med",
+      "p(90)",
+      "p(95)",
+      "p(99)",
+      "max"
+    ]
+  },
+  "state": {
+    "isStdOutTTY": false,
+    "isStdErrTTY": false,
+    "testRunDurationMs": 31032.807
+  },
+  "metrics": {
+    "data_received": {
+      "type": "counter",
+      "contains": "data",
+      "values": {
+        "count": 2493524,
+        "rate": 80351.22314265675
+      }
+    },
+    "iteration_duration": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "p(95)": 1999.5505868499995,
+        "p(99)": 2525.97288377,
+        "max": 2657.578458,
+        "avg": 1551.56077495,
+        "min": 1382.259875,
+        "med": 1479.0572710000001,
+        "p(90)": 1606.4625791000003
+      }
+    },
+    "http_req_duration": {
+      "contains": "time",
+      "values": {
+        "p(99)": 325.0579299999999,
+        "max": 1036.913,
+        "avg": 60.90505555555554,
+        "min": 0.63,
+        "med": 36.75,
+        "p(90)": 113.39460000000001,
+        "p(95)": 134.97799999999967
+      },
+      "type": "trend"
+    },
+    "latencia_flight_detail": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "avg": 103.5897,
+        "min": 73.285,
+        "med": 86.48599999999999,
+        "p(90)": 111.2661,
+        "p(95)": 127.76239999999979,
+        "p(99)": 324.8668799999999,
+        "max": 374.143
+      }
+    },
+    "http_req_duration{expected_response:true}": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "avg": 60.90505555555554,
+        "min": 0.63,
+        "med": 36.75,
+        "p(90)": 113.39460000000001,
+        "p(95)": 134.97799999999967,
+        "p(99)": 325.0579299999999,
+        "max": 1036.913
+      }
+    },
+    "vus": {
+      "type": "gauge",
+      "contains": "default",
+      "values": {
+        "value": 1,
+        "min": 1,
+        "max": 1
+      }
+    },
+    "http_reqs": {
+      "type": "counter",
+      "contains": "default",
+      "values": {
+        "count": 180,
+        "rate": 5.8003131975782924
+      }
+    },
+    "http_req_tls_handshaking": {
+      "contains": "time",
+      "values": {
+        "avg": 0,
+        "min": 0,
+        "med": 0,
+        "p(90)": 0,
+        "p(95)": 0,
+        "p(99)": 0,
+        "max": 0
+      },
+      "type": "trend"
+    },
+    "http_req_sending": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "avg": 0.012522222222222197,
+        "min": 0.002,
+        "med": 0.007,
+        "p(90)": 0.02520000000000001,
+        "p(95)": 0.044349999999999945,
+        "p(99)": 0.07992999999999995,
+        "max": 0.21
+      }
+    },
+    "http_req_waiting": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "p(99)": 324.9625399999999,
+        "max": 1036.866,
+        "avg": 60.825827777777775,
+        "min": 0.586,
+        "med": 36.519999999999996,
+        "p(90)": 113.30350000000001,
+        "p(95)": 134.88804999999968
+      }
+    },
+    "vus_max": {
+      "contains": "default",
+      "values": {
+        "value": 1,
+        "min": 1,
+        "max": 1
+      },
+      "type": "gauge"
+    },
+    "latencia_metrics_model": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "p(99)": 858.7982599999999,
+        "max": 1036.913,
+        "avg": 89.20275000000001,
+        "min": 19.948,
+        "med": 23.604,
+        "p(90)": 97.3106,
+        "p(95)": 146.3392999999992
+      }
+    },
+    "http_req_failed": {
+      "type": "rate",
+      "contains": "default",
+      "values": {
+        "fails": 180,
+        "rate": 0,
+        "passes": 0
+      },
+      "thresholds": {
+        "rate<0.01": {
+          "ok": true
+        }
+      }
+    },
+    "iterations": {
+      "type": "counter",
+      "contains": "default",
+      "values": {
+        "count": 20,
+        "rate": 0.6444792441753658
+      }
+    },
+    "http_req_connecting": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "avg": 0.0010611111111111112,
+        "min": 0,
+        "med": 0,
+        "p(90)": 0,
+        "p(95)": 0,
+        "p(99)": 0,
+        "max": 0.191
+      }
+    },
+    "checks": {
+      "contains": "default",
+      "values": {
+        "rate": 1,
+        "passes": 380,
+        "fails": 0
+      },
+      "thresholds": {
+        "rate>0.99": {
+          "ok": true
+        }
+      },
+      "type": "rate"
+    },
+    "latencia_flights": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "max": 312.01,
+        "avg": 136.7584,
+        "min": 88.543,
+        "med": 109.1315,
+        "p(90)": 193.68640000000002,
+        "p(95)": 220.46799999999993,
+        "p(99)": 293.7016
+      }
+    },
+    "latencia_metrics_summary": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "p(95)": 122.95559999999999,
+        "p(99)": 130.88392000000002,
+        "max": 132.866,
+        "avg": 95.2215,
+        "min": 72.572,
+        "med": 88.2715,
+        "p(90)": 119.9635
+      }
+    },
+    "http_req_blocked": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "p(90)": 0.004,
+        "p(95)": 0.01,
+        "p(99)": 0.027409999999999966,
+        "max": 4.553,
+        "avg": 0.02813333333333333,
+        "min": 0,
+        "med": 0.002
+      }
+    },
+    "latencia_flight_history": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "med": 0.987,
+        "p(90)": 1.2986,
+        "p(95)": 1.3200999999999998,
+        "p(99)": 1.5648199999999999,
+        "max": 1.626,
+        "avg": 1.04745,
+        "min": 0.934
+      }
+    },
+    "latencia_weather_atl": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "max": 1.03,
+        "avg": 0.7971499999999999,
+        "min": 0.63,
+        "med": 0.7545,
+        "p(90)": 0.9079,
+        "p(95)": 1.01575,
+        "p(99)": 1.02715
+      }
+    },
+    "data_sent": {
+      "type": "counter",
+      "contains": "data",
+      "values": {
+        "count": 46320,
+        "rate": 1492.6139295101473
+      }
+    },
+    "latencia_cascade": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "med": 0.84,
+        "p(90)": 1.5754,
+        "p(95)": 1.7294999999999996,
+        "p(99)": 2.1018999999999997,
+        "max": 2.195,
+        "avg": 0.9513999999999999,
+        "min": 0.633
+      }
+    },
+    "http_req_receiving": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "p(90)": 0.0961,
+        "p(95)": 0.14339999999999992,
+        "p(99)": 0.46589999999999954,
+        "max": 1.507,
+        "avg": 0.06670555555555559,
+        "min": 0.016,
+        "med": 0.042
+      }
+    },
+    "latencia_login": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "p(90)": 37.0985,
+        "p(95)": 37.43045,
+        "p(99)": 38.03009,
+        "max": 38.18,
+        "avg": 28.954900000000002,
+        "min": 16.624,
+        "med": 29.735999999999997
+      }
+    },
+    "latencia_metrics_hourly": {
+      "type": "trend",
+      "contains": "time",
+      "values": {
+        "p(99)": 165.97490999999997,
+        "max": 179.277,
+        "avg": 91.62225,
+        "min": 73.233,
+        "med": 86.576,
+        "p(90)": 105.603,
+        "p(95)": 112.76654999999994
+      }
+    }
+  }
+}
