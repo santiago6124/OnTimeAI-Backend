@@ -72,6 +72,8 @@ omit = ["tests/*"]
 # acá. Se sube a mano cada vez que la cobertura crece de verdad. Línea de base
 # del 2026-10-22 sobre el código desplegado (commit 416eef8): 52,6 % de
 # líneas, 42,8 % de ramas, 50,3 % combinado. Subido a 59 el 2026-10-23 tras
-# los PRs #93, #94, #95 y #96 (59.0 % combinado en main).
-fail_under = 59
+# los PRs #93, #94, #95 y #96 (59,0 % combinado en main). Queda en 58, un
+# punto por debajo de lo medido: con 59 el margen era de dos centésimas y
+# cualquier test omitido por un artefacto ausente habría bloqueado PRs ajenos.
+fail_under = 58
 precision = 1
