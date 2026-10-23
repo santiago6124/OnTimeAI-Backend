@@ -97,3 +97,28 @@ def test_reporte_radon_corre_sobre_el_alcance_real():
     rep = complejidad.reporte_radon()
     assert rep["bloques"] > 100 and rep["promedio"] > 0
     assert set(rep["por_rango"]) <= set("ABCDEF")
+
+
+def test_violaciones_corre_ruff_sobre_el_alcance_real():
+    # Prueba de humo: ruff lee el alcance productivo y devuelve sólo funciones
+    # por encima del umbral, con su complejidad.
+    v = complejidad.violaciones()
+    assert isinstance(v, dict) and v
+    assert all(cc > complejidad.UMBRAL for cc in v.values())
+    assert all("::" in clave for clave in v)
+
+
+def test_main_check_y_reporte_sobre_el_repo(tmp_path, monkeypatch, capsys):
+    # --check contra la baseline real del repo (tiene que pasar) y los dos
+    # reportes en archivos temporales.
+    reporte = tmp_path / "complejidad.json"
+    resumen = tmp_path / "resumen.md"
+    assert complejidad.main(["--check", "--reporte", str(reporte), "--resumen", str(resumen)]) == 0
+    assert json.loads(reporte.read_text())["bloques"] > 100
+    assert "### Complejidad ciclomática" in resumen.read_text()
+    assert "sin deuda nueva" in capsys.readouterr().out
+
+
+def test_main_sin_argumentos_muestra_la_ayuda(capsys):
+    assert complejidad.main([]) == 0
+    assert "--check" in capsys.readouterr().out

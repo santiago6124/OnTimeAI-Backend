@@ -354,7 +354,8 @@ def add_adsb_lineage_features(
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--setup", action="store_true",
-                   help="Descarga FAA registry y construye mapa TAIL→ICAO24, luego sale")
+                   help="Descarga la base de aeronaves de OpenSky y construye el mapa "
+                        "TAIL→ICAO24, luego sale")
     p.add_argument("--sample", type=int, default=1000,
                    help="Vuelos a procesar con API OpenSky para verificación")
     p.add_argument("--parquet",
@@ -364,8 +365,12 @@ def main() -> None:
 
     DATA_DIR.mkdir(parents=True, exist_ok=True)
 
-    faa_path = download_faa_registry()
-    tail_map = build_tail_icao24_map(faa_path)
+    # Antes llamaba a `download_faa_registry`, que nunca existió en el módulo:
+    # la descarga es la base de OpenSky (#90). `build_tail_icao24_map` la
+    # descargaría sola si falta, pero el setup la pide explícitamente para que
+    # el error de red aparezca acá y no en medio de la construcción del mapa.
+    db_path = download_aircraft_db()
+    tail_map = build_tail_icao24_map(db_path)
     print(f"\nMapeo construido: {len(tail_map):,} aviones con ICAO24")
 
     if args.setup:
