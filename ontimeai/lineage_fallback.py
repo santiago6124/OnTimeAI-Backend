@@ -152,28 +152,42 @@ def _hierarchical_lookup(
     return imputed
 
 
-def apply_lineage_fallback(df: pd.DataFrame, lookups: dict[str, Any]) -> pd.DataFrame:  # noqa: C901
+_CARRIER_RATE_COLS = ("carrier_delay_rate_yday", "carrier_delay_rate_24h", "carrier_delay_rate_7d")
+_ORIGIN_RATE_COLS = ("origin_delay_rate_yday", "origin_delay_rate_1h",
+                     "origin_delay_rate_6h", "origin_delay_rate_24h")
+_DEST_RATE_COLS = ("dest_delay_rate_1h", "dest_delay_rate_6h", "dest_delay_rate_24h")
+
+
+def _scheduled_hour(out: pd.DataFrame) -> pd.Series:
+    """Hora programada de salida (0-23) desde CRS_DEP_MIN o CRS_DEP_TIME; 0 si falta."""
+    if "CRS_DEP_MIN" in out.columns:
+        return (pd.to_numeric(out["CRS_DEP_MIN"], errors="coerce").fillna(0) // 60).astype(int)
+    if "CRS_DEP_TIME" in out.columns:
+        return (pd.to_numeric(out["CRS_DEP_TIME"], errors="coerce").fillna(0) // 100).astype(int)
+    return pd.Series([0] * len(out), index=out.index, dtype=int)
+
+
+def _fill_columns(out: pd.DataFrame, cols: tuple[str, ...], layers: list, default: float) -> None:
+    """Imputa los NaN de las columnas presentes con el lookup jerárquico (in place)."""
+    presentes = [c for c in cols if c in out.columns]
+    if not presentes:
+        return
+    imputed = _hierarchical_lookup(layers, out.index, default)
+    for c in presentes:
+        out[c] = out[c].fillna(imputed)
+
+
+def apply_lineage_fallback(df: pd.DataFrame, lookups: dict[str, Any]) -> pd.DataFrame:
     """Fill NaN values in lineage / rolling features using cold-deck lookups.
 
     Non-destructive: leaves non-NaN values untouched. Tolerates missing
     feature columns and partial lookup tables.
     """
     out = df.copy()
-    n = len(out)
-    if n == 0:
+    if len(out) == 0:
         return out
 
-    if "CRS_DEP_MIN" in out.columns:
-        hour = (
-            pd.to_numeric(out["CRS_DEP_MIN"], errors="coerce").fillna(0) // 60
-        ).astype(int)
-    elif "CRS_DEP_TIME" in out.columns:
-        hour = (
-            pd.to_numeric(out["CRS_DEP_TIME"], errors="coerce").fillna(0) // 100
-        ).astype(int)
-    else:
-        hour = pd.Series([0] * n, index=out.index, dtype=int)
-
+    hour = _scheduled_hour(out)
     carrier = _series_or_str(out, "OP_CARRIER")
     origin = _series_or_str(out, "ORIGIN")
     dest = _series_or_str(out, "DEST")
@@ -183,14 +197,11 @@ def apply_lineage_fallback(df: pd.DataFrame, lookups: dict[str, Any]) -> pd.Data
     g_late = float(lookups.get("global_late_rate", 0.2))
 
     # ---- prev_arr_delay_tail: hierarchical mean ARR_DELAY ----
-    if "prev_arr_delay_tail" in out.columns:
-        layers = [
-            ([carrier, hour], lookups.get("carrier_hour_mean_delay")),
-            ([carrier, origin, hour], lookups.get("carrier_origin_hour_mean_delay")),
-            ([carrier, origin, dest, hour], lookups.get("carrier_route_hour_mean_delay")),
-        ]
-        imputed = _hierarchical_lookup(layers, out.index, g_mean)
-        out["prev_arr_delay_tail"] = out["prev_arr_delay_tail"].fillna(imputed)
+    _fill_columns(out, ("prev_arr_delay_tail",), [
+        ([carrier, hour], lookups.get("carrier_hour_mean_delay")),
+        ([carrier, origin, hour], lookups.get("carrier_origin_hour_mean_delay")),
+        ([carrier, origin, dest, hour], lookups.get("carrier_route_hour_mean_delay")),
+    ], g_mean)
 
     # ---- defaults for non-rate lineage features ----
     if "tail_flights_today_prior" in out.columns:
@@ -202,97 +213,59 @@ def apply_lineage_fallback(df: pd.DataFrame, lookups: dict[str, Any]) -> pd.Data
     # carrier -> hour -> global -> 60.0 default. The lookups come from the live
     # `flights` table via build_live_turnaround_lookups (loaded at runtime), so
     # the model gets a more informed prior than the constant 60.0.
-    if "prev_turnaround_tail_min" in out.columns:
-        layers = [
-            ([carrier], lookups.get("turnaround_carrier_mean")),
-            ([hour], lookups.get("turnaround_hour_mean")),
-            ([carrier, hour], lookups.get("turnaround_carrier_hour_mean")),
-            ([carrier, origin, dest], lookups.get("turnaround_carrier_route_mean")),
-            ([carrier, origin, dest, hour],
-             lookups.get("turnaround_carrier_route_hour_mean")),
-        ]
-        g_turnaround = float(lookups.get("global_turnaround_mean", 60.0))
-        imputed = _hierarchical_lookup(layers, out.index, g_turnaround)
-        out["prev_turnaround_tail_min"] = out["prev_turnaround_tail_min"].fillna(imputed)
+    _fill_columns(out, ("prev_turnaround_tail_min",), [
+        ([carrier], lookups.get("turnaround_carrier_mean")),
+        ([hour], lookups.get("turnaround_hour_mean")),
+        ([carrier, hour], lookups.get("turnaround_carrier_hour_mean")),
+        ([carrier, origin, dest], lookups.get("turnaround_carrier_route_mean")),
+        ([carrier, origin, dest, hour], lookups.get("turnaround_carrier_route_hour_mean")),
+    ], float(lookups.get("global_turnaround_mean", 60.0)))
 
-    # ---- carrier rate features ----
-    carrier_rate_cols = [
-        "carrier_delay_rate_yday",
-        "carrier_delay_rate_24h",
-        "carrier_delay_rate_7d",
-    ]
-    if any(c in out.columns for c in carrier_rate_cols):
-        layers = [
-            ([carrier], lookups.get("carrier_late_rate")),
-            ([carrier, dow], lookups.get("carrier_dow_late_rate")),
-        ]
-        imputed = _hierarchical_lookup(layers, out.index, g_late)
-        for c in carrier_rate_cols:
-            if c in out.columns:
-                out[c] = out[c].fillna(imputed)
-
-    # ---- origin rate features ----
-    origin_rate_cols = [
-        "origin_delay_rate_yday",
-        "origin_delay_rate_1h",
-        "origin_delay_rate_6h",
-        "origin_delay_rate_24h",
-    ]
-    if any(c in out.columns for c in origin_rate_cols):
-        layers = [
-            ([origin], lookups.get("origin_late_rate")),
-            ([origin, hour], lookups.get("origin_hour_late_rate")),
-        ]
-        imputed = _hierarchical_lookup(layers, out.index, g_late)
-        for c in origin_rate_cols:
-            if c in out.columns:
-                out[c] = out[c].fillna(imputed)
-
-    # ---- dest rate features ----
-    dest_rate_cols = [
-        "dest_delay_rate_1h",
-        "dest_delay_rate_6h",
-        "dest_delay_rate_24h",
-    ]
-    if any(c in out.columns for c in dest_rate_cols):
-        layers = [
-            ([dest], lookups.get("dest_late_rate")),
-            ([dest, hour], lookups.get("dest_hour_late_rate")),
-        ]
-        imputed_dest = _hierarchical_lookup(layers, out.index, g_late)
-        for c in dest_rate_cols:
-            if c in out.columns:
-                out[c] = out[c].fillna(imputed_dest)
+    # ---- carrier, origin and dest rate features ----
+    _fill_columns(out, _CARRIER_RATE_COLS, [
+        ([carrier], lookups.get("carrier_late_rate")),
+        ([carrier, dow], lookups.get("carrier_dow_late_rate")),
+    ], g_late)
+    _fill_columns(out, _ORIGIN_RATE_COLS, [
+        ([origin], lookups.get("origin_late_rate")),
+        ([origin, hour], lookups.get("origin_hour_late_rate")),
+    ], g_late)
+    _fill_columns(out, _DEST_RATE_COLS, [
+        ([dest], lookups.get("dest_late_rate")),
+        ([dest, hour], lookups.get("dest_hour_late_rate")),
+    ], g_late)
 
     # ---- absorb_score_origin: 1 - origin inbound late rate ----
     if "absorb_score_origin" in out.columns:
-        g_on_time = float(lookups.get("global_on_time_rate", 1.0 - g_late))
         layers = [
             ([origin], lookups.get("origin_late_rate")),
             ([origin, hour], lookups.get("origin_hour_late_rate")),
         ]
         imputed_late = _hierarchical_lookup(layers, out.index, g_late)
-        imputed_absorb = 1.0 - imputed_late
-        out["absorb_score_origin"] = out["absorb_score_origin"].fillna(imputed_absorb)
+        out["absorb_score_origin"] = out["absorb_score_origin"].fillna(1.0 - imputed_late)
 
-    # ADS-B prev-leg features: always 100% NaN in prod (no live ADS-B tracking).
-    # Fill with neutral defaults so the model receives a value in its learned range
-    # rather than going to the NaN branch (trained on very few/no examples).
-    for _c in ("PREV_BLOCK_DELTA_MIN", "PREV_HOLDING_MIN", "PREV_ROUTE_DEVIATION_PCT"):
-        if _c in out.columns:
-            out[_c] = out[_c].fillna(0.0)
-
-    if "PREV_ADSB_AVAILABLE" in out.columns:
-        out["PREV_ADSB_AVAILABLE"] = out["PREV_ADSB_AVAILABLE"].fillna(0)
-
-    # PREV block times: use CRS_ELAPSED_TIME as a same-aircraft-type proxy
-    if "CRS_ELAPSED_TIME" in out.columns:
-        for _c in ("PREV_ACTUAL_BLOCK_MIN", "PREV_SCHED_BLOCK_MIN"):
-            if _c in out.columns:
-                out[_c] = out[_c].fillna(out["CRS_ELAPSED_TIME"])
-
+    _fill_adsb_defaults(out)
     return out
 
+
+def _fill_adsb_defaults(out: pd.DataFrame) -> None:
+    """Valores neutros para las features ADS-B del tramo anterior (in place).
+
+    Siempre 100 % NaN en producción (no hay seguimiento ADS-B en vivo): se
+    rellenan con el valor neutro para que el modelo reciba algo dentro del
+    rango aprendido y no caiga en la rama NaN, entrenada con muy pocos
+    ejemplos. Los tiempos de bloque usan CRS_ELAPSED_TIME como proxy del mismo
+    tipo de aeronave.
+    """
+    for c in ("PREV_BLOCK_DELTA_MIN", "PREV_HOLDING_MIN", "PREV_ROUTE_DEVIATION_PCT"):
+        if c in out.columns:
+            out[c] = out[c].fillna(0.0)
+    if "PREV_ADSB_AVAILABLE" in out.columns:
+        out["PREV_ADSB_AVAILABLE"] = out["PREV_ADSB_AVAILABLE"].fillna(0)
+    if "CRS_ELAPSED_TIME" in out.columns:
+        for c in ("PREV_ACTUAL_BLOCK_MIN", "PREV_SCHED_BLOCK_MIN"):
+            if c in out.columns:
+                out[c] = out[c].fillna(out["CRS_ELAPSED_TIME"])
 
 def build_live_turnaround_lookups(conn, days: int = 14,
                                   min_count: int = MIN_GROUP_COUNT) -> dict[str, Any]:
