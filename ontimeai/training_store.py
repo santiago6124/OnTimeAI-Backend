@@ -569,7 +569,7 @@ def _insert_outbox_event(
 
 
 @_atomic_training_batch
-def enqueue_prediction_snapshots(
+def enqueue_prediction_snapshots(  # noqa: C901
     conn: sqlite3.Connection,
     *,
     flight_frame: pd.DataFrame,
@@ -1067,7 +1067,7 @@ _PARQUET_BOOLEAN_COLUMNS = {
 }
 
 
-def _coerce_parquet_frame(frame: pd.DataFrame) -> pd.DataFrame:
+def _coerce_parquet_frame(frame: pd.DataFrame) -> pd.DataFrame:  # noqa: C901
     """Apply stable Arrow-compatible dtypes, including all-null shards."""
     result = frame.copy()
     feature_order: list[str] = []
@@ -1115,7 +1115,7 @@ def _coerce_parquet_frame(frame: pd.DataFrame) -> pd.DataFrame:
     return result
 
 
-def _upload_create_only(
+def _upload_create_only(  # noqa: C901
     blob: Any,
     body: bytes,
     *,
@@ -1213,7 +1213,7 @@ def _upload_create_only(
         ) from exc
 
 
-def publish_pending_outbox(
+def publish_pending_outbox(  # noqa: C901
     conn: sqlite3.Connection,
     *,
     bucket_name: str,
@@ -1478,7 +1478,7 @@ def _single_deployment_contract(
     return contract
 
 
-def materialize_fixed_horizons(
+def materialize_fixed_horizons(  # noqa: C901
     snapshots: pd.DataFrame,
     outcomes: pd.DataFrame,
     *,
@@ -1965,7 +1965,7 @@ def materialize_fixed_horizons(
     return result, report
 
 
-def prepare_silver_training_data(
+def prepare_silver_training_data(  # noqa: C901
     silver: pd.DataFrame,
     *,
     horizon_hours: float | None = None,

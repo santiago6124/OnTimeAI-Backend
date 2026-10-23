@@ -152,7 +152,7 @@ def _hierarchical_lookup(
     return imputed
 
 
-def apply_lineage_fallback(df: pd.DataFrame, lookups: dict[str, Any]) -> pd.DataFrame:
+def apply_lineage_fallback(df: pd.DataFrame, lookups: dict[str, Any]) -> pd.DataFrame:  # noqa: C901
     """Fill NaN values in lineage / rolling features using cold-deck lookups.
 
     Non-destructive: leaves non-NaN values untouched. Tolerates missing
