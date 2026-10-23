@@ -1,0 +1,84 @@
+name: Smoke
+
+# Prueba de humo contra el servicio desplegado, después de cada Deploy exitoso.
+#
+# No reemplaza a los tests: verifica en un minuto que la revisión nueva de Cloud
+# Run arranca, autentica, lee la base y responde las rutas que el Frontend y las
+# apps usan al abrir. Si falla, el deploy quedó roto aunque el build haya sido
+# verde, y hay que volver a la revisión anterior (ver docs/SMOKE.md).
+#
+# Corre con `workflow_run` para no tocar deploy.yml, con `workflow_dispatch`
+# para repetirlo a mano, y en los PR que cambian el propio smoke, como
+# autoprueba: GitHub sólo permite despachar workflows que ya están en main,
+# así que sin esto no habría forma de verlo correr antes de mergearlo. Es de
+# sólo lectura, así que correrlo contra producción desde un PR no tiene
+# efectos.
+on:
+  workflow_run:
+    workflows: [Deploy]
+    types: [completed]
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/smoke.yml
+      - scripts/smoke.sh
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  PROJECT_ID: ontimeai-prod
+  REGION: us-central1
+
+jobs:
+  smoke:
+    # Tras un Deploy, sólo si terminó bien: un deploy fallido ya es rojo por sí
+    # mismo y no hay revisión nueva que verificar.
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: google-github-actions/auth@v2
+        with:
+          project_id: ontimeai-prod
+          workload_identity_provider: projects/871707213932/locations/global/workloadIdentityPools/github/providers/github
+          service_account: github-deployer@ontimeai-prod.iam.gserviceaccount.com
+
+      - uses: google-github-actions/setup-gcloud@v2
+
+      - name: Resolver el servicio y la credencial del viewer
+        # La URL se lee del servicio (ya cambió con la migración de proyecto).
+        # La contraseña del viewer sale de Secret Manager, la misma que usa el
+        # servicio; se enmascara en el log antes de usarla. Es el usuario de
+        # sólo lectura: el smoke no escribe nada.
+        run: |
+          URL=$(gcloud run services describe ontimeai-backend --region "$REGION" \
+                  --project "$PROJECT_ID" --format='value(status.url)')
+          REV=$(gcloud run services describe ontimeai-backend --region "$REGION" \
+                  --project "$PROJECT_ID" --format='value(status.latestReadyRevisionName)')
+          VIEWER_USER=$(gcloud run services describe ontimeai-backend --region "$REGION" \
+                  --project "$PROJECT_ID" --format=json \
+                  | jq -r '.spec.template.spec.containers[0].env[]? | select(.name=="API_USERNAME_VIEWER") | .value')
+          VIEWER_PASS=$(gcloud secrets versions access latest --secret=api-password-viewer --project "$PROJECT_ID")
+          echo "::add-mask::$VIEWER_PASS"
+          echo "BASE_URL=$URL" >> "$GITHUB_ENV"
+          echo "REVISION=$REV" >> "$GITHUB_ENV"
+          echo "VIEWER_USER=$VIEWER_USER" >> "$GITHUB_ENV"
+          echo "VIEWER_PASS=$VIEWER_PASS" >> "$GITHUB_ENV"
+          echo "Servicio: $URL (revisión $REV, viewer presente: $([ -n "$VIEWER_PASS" ] && echo sí || echo no))"
+
+      - name: Smoke
+        run: bash scripts/smoke.sh
+
+      - name: Resumen
+        if: always()
+        run: |
+          {
+            echo "### Smoke contra $BASE_URL"
+            echo ""
+            echo "Revisión: \`$REVISION\` · disparado por: ${{ github.event_name }}"
+            echo ""
+            cat smoke-resumen.md 2>/dev/null || echo "(sin resumen)"
+          } >> "$GITHUB_STEP_SUMMARY"
