@@ -19,7 +19,6 @@
     "feature_engineering_v7/build_v7_dataset.py::main": 11,
     "ontimeai/live.py::chain_walk_inbound": 11,
     "ontimeai/live.py::compute_adsb_eta_delay": 11,
-    "ontimeai/training_store.py::_upload_create_only": 11,
     "ontimeai/training_store.py::enqueue_prediction_snapshots": 11,
     "predict.py::prepare_inference_frame": 11
   }
