@@ -28,59 +28,12 @@ import shutil
 import pytest
 from fastapi.testclient import TestClient
 
-
-def _sembrar_vuelo_de_hoy(db) -> None:
-    """Un vuelo dentro de la ventana activa, con prediccion, SHAP y resultado.
-
-    El `live_data.db` bundleado es un snapshot fijo: no tiene vuelos de hoy, asi
-    que los tests que verifican el esquema de /flights se saltaban con "No
-    flights in DB today". Eran justamente los que comprueban que cada campo
-    llegue, que es lo que se rompe en una regresion.
-
-    Se siembra en la copia temporal, nunca en el archivo del repo.
-    """
-    import sqlite3
-    from datetime import datetime, timedelta, timezone
-
-    ahora = datetime.now(timezone.utc)
-    sale = (ahora + timedelta(hours=2)).isoformat()
-    llega = (ahora + timedelta(hours=4)).isoformat()
-    predicho = (ahora - timedelta(minutes=10)).isoformat()
-    fid = "TEST-SEED-0001"
-
-    con = sqlite3.connect(db)
-    try:
-        con.execute(
-            """INSERT OR REPLACE INTO flights
-               (fa_flight_id, stable_id, ident_iata, op_carrier, flight_number,
-                tail_num, origin, dest, fl_date, scheduled_out_utc,
-                scheduled_in_utc, aircraft_type, cancelled, diverted,
-                first_seen_utc, last_updated_utc)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-            (fid, fid, "DL9999", "DL", "9999", "N999DL", "ATL", "MIA",
-             sale[:10], sale, llega, "B738", 0, 0, predicho, predicho),
-        )
-        con.execute(
-            """INSERT OR REPLACE INTO predictions
-               (fa_flight_id, stable_id, predicted_at_utc, proba_delay,
-                predicted_delay, threshold_used, threshold_strategy,
-                prediction_phase)
-               VALUES (?,?,?,?,?,?,?,?)""",
-            (fid, fid, predicho, 0.42, 1, 0.10, "quantile@0.22", "PRE_DEPARTURE"),
-        )
-        for rank, (feature, valor) in enumerate(
-            (("DEP_HOUR", 0.21), ("ORIG_WX_SKNT", -0.08), ("CARRIER", 0.05)), start=1
-        ):
-            con.execute(
-                """INSERT OR REPLACE INTO prediction_shap
-                   (fa_flight_id, predicted_at_utc, feature_name, shap_value,
-                    feature_value, rank)
-                   VALUES (?,?,?,?,?,?)""",
-                (fid, predicho, feature, valor, "12", rank),
-            )
-        con.commit()
-    finally:
-        con.close()
+# El `live_data.db` bundleado es un snapshot fijo: no tiene vuelos de hoy, asi
+# que los tests que verifican el esquema de /flights se saltaban con "No
+# flights in DB today". Eran justamente los que comprueban que cada campo
+# llegue, que es lo que se rompe en una regresion. La siembra vive en
+# `ontimeai.semillas` porque tambien la usa `scripts/make_fixture_db.py`.
+from ontimeai.semillas import sembrar_vuelo_de_hoy
 
 
 @pytest.fixture(scope="module")
@@ -100,7 +53,8 @@ def client(tmp_path_factory):
     # los tests dejarian el archivo del repo modificado.
     db = tmp / "live_data.db"
     shutil.copy(api.DB_PATH, db)
-    _sembrar_vuelo_de_hoy(db)
+    # Se siembra en la copia temporal, nunca en el archivo del repo.
+    sembrar_vuelo_de_hoy(db)
     api.DB_PATH = db
     api.USERS_DB_PATH = tmp / "users.db"
 
