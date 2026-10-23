@@ -45,9 +45,23 @@ extend-exclude = [
 ]
 
 [tool.ruff.lint]
-# Por ahora ruff sólo vigila complejidad (ver docs/COMPLEJIDAD.md). Sumar
-# reglas de estilo es otra decisión, con su propia baseline.
-select = ["C901"]
+# Complejidad (ver docs/COMPLEJIDAD.md) más los "bugs críticos": errores de
+# sintaxis, nombres indefinidos, redefiniciones y comparaciones inválidas, lo
+# que revienta en tiempo de ejecución. Es la misma selección que usa el
+# template de Python de GitHub Actions (E9, F63, F7, F82). Las reglas de
+# estilo son otra decisión, con su propia baseline.
+select = ["C901", "E9", "F63", "F7", "F82"]
 
 [tool.ruff.lint.mccabe]
 max-complexity = 10
+
+[tool.coverage.run]
+branch = true
+omit = ["tests/*"]
+
+[tool.coverage.report]
+# Trinquete de cobertura: el total (sentencias más ramas) no puede bajar de
+# acá. Se sube a mano cada vez que la cobertura crece de verdad. Línea de base
+# del 2026-10-22: 38 % combinado (39,5 % de líneas, 33,6 % de ramas).
+fail_under = 38
+precision = 1
