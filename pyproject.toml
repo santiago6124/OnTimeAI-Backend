@@ -71,6 +71,7 @@ omit = ["tests/*"]
 # Trinquete de cobertura: el total (sentencias más ramas) no puede bajar de
 # acá. Se sube a mano cada vez que la cobertura crece de verdad. Línea de base
 # del 2026-10-22 sobre el código desplegado (commit 416eef8): 52,6 % de
-# líneas, 42,8 % de ramas, 50,3 % combinado.
-fail_under = 50
+# líneas, 42,8 % de ramas, 50,3 % combinado. Subido a 59 el 2026-10-23 tras
+# los PRs #93, #94, #95 y #96 (59.0 % combinado en main).
+fail_under = 59
 precision = 1
