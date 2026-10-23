@@ -15,6 +15,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # diff-cover compara contra la rama base: necesita el historial.
+          fetch-depth: 0
 
       - uses: actions/setup-python@v5
         with:
@@ -69,8 +72,52 @@ jobs:
           name: complejidad
           path: complejidad.json
 
-      - name: Tests
+      - name: Bugs críticos (análisis estático)
+        # Errores de sintaxis, nombres indefinidos, redefiniciones y
+        # comparaciones inválidas: lo que revienta en tiempo de ejecución, no
+        # estilo. Selección E9, F63, F7, F82 (la del template de Python de
+        # GitHub Actions) sobre el alcance de pyproject.toml.
+        run: ruff check --output-format github .
+
+      - name: Duplicación
+        # Quality gate: más de 5 % de líneas duplicadas en el código productivo
+        # corta el pipeline. jscpd corre con npx porque no hay un equivalente
+        # en Python que dé el porcentaje; el runner ya trae Node.
+        run: |
+          npx --yes jscpd@4 --min-tokens 50 --min-lines 5 --threshold 5 \
+            --format python --reporters console,json --output jscpd \
+            api.py predict.py live_pull.py live_job.py watchdog.py \
+            ontimeai feature_engineering_v7 scripts/prune_db.py
+
+      - name: Tests con cobertura
         # Corren todos. `test_api.py` estuvo excluido hasta el 15/09 porque
         # fallaba al colectar; ahora levanta su propio TestClient con bases
-        # temporales. Ver #20.
-        run: pytest
+        # temporales. Ver #20. La cobertura mide líneas y ramas (cobertura de
+        # decisión) y falla por debajo del trinquete de pyproject.toml.
+        run: pytest --cov --cov-report=xml --cov-report=term-missing:skip-covered --junitxml=junit.xml
+
+      - name: Cobertura sobre el código nuevo
+        # Quality gate: las líneas que cambia el PR tienen que estar cubiertas
+        # al 80 %. Sólo en PR, porque en main no hay contra qué comparar.
+        if: github.event_name == 'pull_request'
+        run: |
+          diff-cover coverage.xml --compare-branch="origin/${{ github.base_ref }}" \
+            --fail-under=80 --markdown-report diff-cover.md
+
+      - name: Resumen de calidad
+        if: always()
+        run: |
+          python scripts/calidad_resumen.py --cobertura coverage.xml \
+            --jscpd jscpd/jscpd-report.json --diff-cover diff-cover.md \
+            --salida "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: calidad
+          path: |
+            coverage.xml
+            junit.xml
+            jscpd/
+            diff-cover.md
+          if-no-files-found: ignore
