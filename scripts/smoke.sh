@@ -49,7 +49,9 @@ check_json "GET /metrics/model" "/metrics/model" 'type=="object" and length>0' "
 check_json "GET /metrics/hourly" "/metrics/hourly" 'type=="array"' "lista"
 
 # 5. Un id inexistente devuelve 404 con cuerpo JSON (la lógica de la app corre, no es un 404 del proxy).
-resp=$(curl -s --max-time 30 -w '\n%{http_code}' "$BASE_URL/cascade/NO-EXISTE-0000")
+#    Con token: /cascade exige autenticación en producción (sin token devuelve 401,
+#    que fue lo que encontró el primer run del smoke y corrigió este check).
+resp=$(curl -s --max-time 30 -w '\n%{http_code}' "${AUTH[@]}" "$BASE_URL/cascade/NO-EXISTE-0000")
 code=${resp##*$'\n'}; body=${resp%$'\n'*}
 es_json=$(printf '%s' "$body" | jq -e 'type=="object"' >/dev/null 2>&1 && echo 0 || echo 1)
 registrar "GET /cascade/{id inexistente}" "404 JSON" "$code$([ "$es_json" -eq 0 ] && echo ' JSON' || echo ' no JSON')" $([ "$code" = 404 ] && [ "$es_json" -eq 0 ]; echo $?)
