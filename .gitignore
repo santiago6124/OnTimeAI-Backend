@@ -62,3 +62,7 @@ Thumbs.db
 logs/
 dataset_prepared_v4.parquet
 *.crlf.bak
+
+# Salidas locales de k6. Sólo se versionan las PoC fechadas (docs/STRESS_K6.md).
+k6/resultados/*
+!k6/resultados/2*-poc-local-*-summary.json

@@ -87,3 +87,6 @@ AnteProyecto-OnTimeAI.md
 # requirements de dev
 requirements.txt
 pyproject.toml
+
+# Pruebas de carga con k6: corren en CI contra la API del runner, no en la imagen.
+k6/
