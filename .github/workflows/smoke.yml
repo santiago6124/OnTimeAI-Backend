@@ -7,13 +7,21 @@ name: Smoke
 # apps usan al abrir. Si falla, el deploy quedó roto aunque el build haya sido
 # verde, y hay que volver a la revisión anterior (ver docs/SMOKE.md).
 #
-# Corre con `workflow_run` para no tocar deploy.yml, y con `workflow_dispatch`
-# para poder probarlo desde una rama antes de mergearlo.
+# Corre con `workflow_run` para no tocar deploy.yml, con `workflow_dispatch`
+# para repetirlo a mano, y en los PR que cambian el propio smoke, como
+# autoprueba: GitHub sólo permite despachar workflows que ya están en main,
+# así que sin esto no habría forma de verlo correr antes de mergearlo. Es de
+# sólo lectura, así que correrlo contra producción desde un PR no tiene
+# efectos.
 on:
   workflow_run:
     workflows: [Deploy]
     types: [completed]
   workflow_dispatch:
+  pull_request:
+    paths:
+      - .github/workflows/smoke.yml
+      - scripts/smoke.sh
 
 permissions:
   id-token: write
@@ -27,7 +35,7 @@ jobs:
   smoke:
     # Tras un Deploy, sólo si terminó bien: un deploy fallido ya es rojo por sí
     # mismo y no hay revisión nueva que verificar.
-    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
