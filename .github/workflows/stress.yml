@@ -8,10 +8,9 @@ name: Stress (k6)
 #   pull_request       → smoke + stress (unos 5 minutos), sólo si el PR toca
 #                        la API, los scripts de k6 o este workflow
 #   push a main        → smoke + stress + soak (el soak son 10 minutos más)
-#   workflow_dispatch  → smoke + stress, y el soak si se marca la casilla
-#
-# `workflow_dispatch` sólo funciona cuando el workflow ya está en main; en un
-# PR que lo agrega, lo que lo ejecuta es el trigger de pull_request.
+#   workflow_dispatch  → smoke + stress, y el soak si se marca la casilla.
+#                        Se puede disparar sobre una rama:
+#                        gh workflow run stress.yml --ref <rama>
 
 on:
   pull_request:

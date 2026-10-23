@@ -205,13 +205,51 @@ cachear la ventana activa unos segundos (los datos cambian cada 10-30 min),
 no recalcularla en `/flights/{id}`, y evaluar varios workers de uvicorn (hoy
 lo complica `users.db` en `/tmp` y el refresh de la base dentro del proceso).
 
+## Corridas en CI — 2026-10-23
+
+Runner `ubuntu-latest` (4 vCPU), Python 3.11, un proceso de uvicorn, misma
+fixture de 200 vuelos. Las tablas salen del step summary de cada run; los JSON
+están en el artifact `k6-resultados-<n>`.
+
+Run del `pull_request` del PR #95 (smoke + stress):
+<https://github.com/santiago6124/OnTimeAI-Backend/actions/runs/40011348475>
+
+| Escenario | VUs máx | Iteraciones | req/s | p50 ms | p95 ms | p99 ms | Errores HTTP | Checks | Umbrales |
+|---|---|---|---|---|---|---|---|---|---|
+| smoke | 1 | 16 | 4.7 | 60 | 190 | 197 | 0.00 % | 100.00 % | OK (2/2) |
+| stress | 50 | 502 | 22.5 | 473 | 3299 | 4017 | 0.00 % | 100.00 % | OK (3/3) |
+
+Run disparado a mano desde la rama (`gh workflow run stress.yml --ref
+feat/stress-k6`), con el soak completo de 10 minutos:
+<https://github.com/santiago6124/OnTimeAI-Backend/actions/runs/40011382323>
+
+| Escenario | VUs máx | Iteraciones | req/s | p50 ms | p95 ms | p99 ms | Errores HTTP | Checks | Umbrales |
+|---|---|---|---|---|---|---|---|---|---|
+| smoke | 1 | 16 | 4.7 | 60 | 190 | 200 | 0.00 % | 100.00 % | OK (2/2) |
+| stress | 50 | 496 | 22.2 | 518 | 3231 | 3814 | 0.00 % | 100.00 % | OK (3/3) |
+| soak | 20 | 1788 | 23.7 | 607 | 1685 | 1918 | 0.00 % | 100.00 % | OK (3/3) |
+
+Deriva del soak en el runner: p95 de la iteración completa de **6,7 s en el
+primer minuto y 7,4 s en el último** (+10 %) a lo largo de 10 minutos y 1.788
+iteraciones, sin errores. No hay señal de fuga ni de degradación acumulativa.
+
+El runner dio **3× más throughput y un p95 3,4× menor** que la Mac en el
+stress (22,5 contra 7,1 req/s; 3,3 contra 11,1 s), y en el soak a 20 VUs
+23,7 req/s con p95 de 1,7 s contra 6,7 req/s y 6,8 s, con la misma API y la
+misma fixture. La hipótesis es que en Linux los hilos del pool aprovechan los
+núcleos mientras SQLite tiene el GIL liberado y en macOS no; no se investigó
+más porque la prueba mide la API en el entorno donde corre el gate. La
+consecuencia práctica es que los umbrales de p95 —fijados sobre la peor
+medición local— quedan a ~9× el p95 del runner. Son seguros como gate de
+"no empeoró al doble"; si con más corridas acumuladas se quiere uno más fino
+para CI, bajar `P95_MAX_MS` a ~2× el p95 del runner y anotarlo acá.
+
 ## Limitaciones conocidas
 
 - El soak **no corre en los PR** (sumaría 10 minutos a cada uno); corre en
-  cada push a `main` y por `workflow_dispatch`. Como `workflow_dispatch` sólo
-  está disponible una vez que el workflow existe en `main`, el soak en CI se
-  verifica por primera vez al mergear. Si su p95 en el runner supera los 35 s,
-  aplicar la regla de arriba y anotarlo.
+  cada push a `main` y por `workflow_dispatch`, que también se puede disparar
+  sobre una rama (`gh workflow run stress.yml --ref <rama>`). Si su p95 en el
+  runner supera los 35 s, aplicar la regla de arriba y anotarlo.
 - Los números del runner y los de la Mac no son comparables entre sí; lo
   comparable es cada entorno consigo mismo entre corridas.
 - La fixture es el snapshot del repo (67.559 vuelos, 45.741 predicciones);
