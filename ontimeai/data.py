@@ -84,7 +84,7 @@ def optimize_dtypes(df: pd.DataFrame, *, verbose: bool = True, in_place: bool = 
     return out
 
 
-def load_master(
+def load_master(  # noqa: C901
     path: Path | str = DATA_PATH,
     *,
     optimize: bool = True,

@@ -7,3 +7,47 @@ filterwarnings = [
     "ignore::DeprecationWarning",
     "ignore::FutureWarning",
 ]
+
+[tool.ruff]
+# Mismo alcance que scripts/complejidad.py: lo que copian los Dockerfiles. ruff
+# no acepta patrones negados, así que los scripts de análisis de la raíz se
+# listan uno por uno y `scripts/` se excluye entero; el único script productivo
+# de esa carpeta (prune_db.py) lo pasa el gate por ruta explícita.
+extend-exclude = [
+    "tests",
+    "unbiased_sample_live",
+    "scripts",
+    "*.ipynb",
+    "adversarial_validation.py",
+    "batch_predict_v7.py",
+    "build_airports_universe.py",
+    "build_lineage_fallback.py",
+    "compare_v6_v7.py",
+    "concatenar_masters.py",
+    "construir_dataset_maestro_full_us.py",
+    "construir_dataset_maestro_multi.py",
+    "descarga_aviationstack.py",
+    "descarga_bts.py",
+    "descarga_data_iem.py",
+    "descarga_data_iem_full.py",
+    "descarga_data_iem_multi.py",
+    "eval_live.py",
+    "eval_predictions.py",
+    "evaluar_recalibrado.py",
+    "live_backfill.py",
+    "live_backfill_aeroapi.py",
+    "live_metrics.py",
+    "recalibrate_live.py",
+    "seed_demo.py",
+    "shift_db.py",
+    "train.py",
+    "tune.py",
+]
+
+[tool.ruff.lint]
+# Por ahora ruff sólo vigila complejidad (ver docs/COMPLEJIDAD.md). Sumar
+# reglas de estilo es otra decisión, con su propia baseline.
+select = ["C901"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 10

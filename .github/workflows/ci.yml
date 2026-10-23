@@ -52,6 +52,23 @@ jobs:
           /tmp/venv-job/bin/pip install --quiet -r requirements-job.txt
           /tmp/venv-job/bin/python -c "import live_job, live_pull, predict; print('el job importa con requirements-job.txt')"
 
+      - name: Complejidad ciclomática
+        # Gate: ninguna función del código productivo por encima de 10 (McCabe,
+        # ruff C901) fuera de las exentas en .complejidad-baseline.json, y esa
+        # lista sólo puede achicarse. Corre antes que los tests porque tarda
+        # segundos y un fallo acá no necesita la suite entera. El reporte de
+        # radon va al resumen del job y como artifact. Ver docs/COMPLEJIDAD.md.
+        run: |
+          python scripts/complejidad.py --check \
+            --reporte complejidad.json \
+            --resumen "$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: complejidad
+          path: complejidad.json
+
       - name: Tests
         # Corren todos. `test_api.py` estuvo excluido hasta el 15/09 porque
         # fallaba al colectar; ahora levanta su propio TestClient con bases

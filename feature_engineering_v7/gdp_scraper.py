@@ -166,7 +166,7 @@ class GdpClient:
         # casos—, y quien quiera distinguirlos no tiene de donde agarrarse.
         self.last_refresh_ok: bool = False
 
-    def _refresh(self) -> None:
+    def _refresh(self) -> None:  # noqa: C901
         """Fetch and parse FAA NAS status. Silently degrades on error."""
         import ssl
         import urllib.request

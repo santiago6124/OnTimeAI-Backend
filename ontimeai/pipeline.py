@@ -51,7 +51,7 @@ class PipelineResult:
     calibrator: Calibrator | None = None
 
 
-def prepare_dataset(
+def prepare_dataset(  # noqa: C901
     df_raw: pd.DataFrame,
     cfg: TrainConfig,
     *,

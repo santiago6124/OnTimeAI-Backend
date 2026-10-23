@@ -5,6 +5,10 @@ numpy>=1.24
 shap>=0.44
 joblib>=1.3
 pytest>=7.4
+# Gate y reporte de complejidad ciclomática (scripts/complejidad.py). Fijadas:
+# una versión nueva de ruff puede contar distinto y mover la baseline sola.
+ruff==0.17.2
+radon==6.0.1
 # starlette.testclient lo exige desde su migracion a httpx2; sin esto,
 # cualquier test que use TestClient falla al colectar.
 httpx2

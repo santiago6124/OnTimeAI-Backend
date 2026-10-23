@@ -31,7 +31,7 @@ from ontimeai.model import load_artifact, predict_label, predict_proba
 _PAGERANK_PATH = Path(__file__).resolve().parent / "artifacts" / "airport_pagerank.json"
 
 
-def prepare_inference_frame(
+def prepare_inference_frame(  # noqa: C901
     df_raw: pd.DataFrame,
     feature_cols: list[str],
     cat_mapping: dict[str, list],
